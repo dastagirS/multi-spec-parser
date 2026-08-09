@@ -209,6 +209,118 @@ describe("compileSpecToTools", () => {
     assert.ok(desc.includes("DEPRECATED"));
   });
 
+  it("keeps __proto__-named schemas, params, and properties (N1)", () => {
+    const spec = JSON.parse(`{
+      "openapi": "3.0.0", "info": {"title":"t","version":"1"},
+      "components": { "schemas": {
+        "__proto__": { "type": "string" },
+        "Holder": { "type": "object", "properties": { "__proto__": { "type": "string" } } }
+      } },
+      "paths": { "/a": { "get": { "operationId": "a",
+        "parameters": [{ "name": "__proto__", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Holder" } } } } } } } }
+    }`);
+    const { tools, defs } = compileSpecToTools(parseSpec(spec));
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(defs, "__proto__"),
+      "defs keeps the __proto__ schema",
+    );
+    const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
+    assert.ok(Object.prototype.hasOwnProperty.call(props, "__proto__"), "param __proto__ kept");
+    assert.deepEqual(props["__proto__"], { type: "string" });
+    const holderProps = (defs.Holder as { properties?: Record<string, unknown> }).properties!;
+    assert.ok(Object.prototype.hasOwnProperty.call(holderProps, "__proto__"));
+  });
+
+  it("does not clobber a param named body with the request body (N2)", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      paths: {
+        "/a": {
+          post: {
+            operationId: "a",
+            parameters: [{ name: "body", in: "query", schema: { type: "string" } }],
+            requestBody: {
+              content: {
+                "application/json": {
+                  schema: { type: "object", properties: { x: { type: "string" } } },
+                },
+              },
+            },
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    });
+    const { tools } = compileSpecToTools(parsed);
+    const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
+    assert.deepEqual(props.body, { type: "string" }); // the param wins; body not exposed
+  });
+
+  it("prunes def-internal dangling refs once and reports them per tool (P1)", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      components: {
+        schemas: {
+          A: {
+            type: "object",
+            properties: { gone: { $ref: "#/components/schemas/Missing" } },
+          },
+        },
+      },
+      paths: {
+        "/a": {
+          get: {
+            operationId: "usesA",
+            responses: {
+              "200": {
+                description: "ok",
+                content: {
+                  "application/json": { schema: { $ref: "#/components/schemas/A" } },
+                },
+              },
+            },
+          },
+        },
+        "/b": {
+          get: { operationId: "usesNothing", responses: { "200": { description: "ok" } } },
+        },
+      },
+    });
+    const { tools } = compileSpecToTools(parsed);
+    const usesA = tools.find((t) => t.name === "usesA")!;
+    const usesNothing = tools.find((t) => t.name === "usesNothing")!;
+    assert.ok(!JSON.stringify(usesA.inputSchema).includes("Missing"), "no dangling ref survives");
+    assert.ok(
+      usesA.unresolvedRefs?.includes("#/$defs/Missing"),
+      "tool that uses A reports the pruned ref",
+    );
+    assert.equal(usesNothing.unresolvedRefs, undefined, "unrelated tool stays clean");
+  });
+
+  it("dedupes concurrent loads of the same URL (PR6)", async () => {
+    clearSpecCache();
+    let hits = 0;
+    const server = createServer((req, res) => {
+      hits += 1;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ openapi: "3.0.0", info: { title: "t", version: "1" }, paths: {} }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const url = `http://127.0.0.1:${port}/spec`;
+    try {
+      const results = await Promise.all(Array.from({ length: 5 }, () => loadSpecSource(url)));
+      assert.equal(results.length, 5);
+      assert.equal(hits, 1, "concurrent loads share one fetch");
+    } finally {
+      clearSpecCache();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("exposes outputSchema per tool for the LLM contract", () => {
     const parsed = parseSpec(fixture("petstore3.json"));
     const { tools } = compileSpecToTools(parsed);

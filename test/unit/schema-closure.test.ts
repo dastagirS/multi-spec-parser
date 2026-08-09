@@ -77,6 +77,63 @@ describe("collectReachableDefs", () => {
   });
 });
 
+describe("nullable conversion (PR4)", () => {
+  it("converts nullable:true with a type to a type array", () => {
+    assert.deepEqual(normalizeSchemaRefs({ type: "string", nullable: true }), {
+      type: ["string", "null"],
+    });
+  });
+
+  it("wraps nullable $ref in anyOf (draft-07-valid)", () => {
+    const out = normalizeSchemaRefs({
+      $ref: "#/components/schemas/X",
+      nullable: true,
+      description: "d",
+    }) as Record<string, unknown>;
+    assert.deepEqual(out, {
+      anyOf: [{ $ref: "#/$defs/X", description: "d" }, { type: "null" }],
+    });
+  });
+
+  it("appends null to enum and drops nullable:false", () => {
+    assert.deepEqual(normalizeSchemaRefs({ enum: ["a"], nullable: true }), {
+      enum: ["a", null],
+    });
+    assert.deepEqual(normalizeSchemaRefs({ type: "string", nullable: false }), {
+      type: "string",
+    });
+  });
+});
+
+describe("__proto__ key handling (N1)", () => {
+  it("preserves a __proto__ property as an own key", () => {
+    // Computed key, not a literal `__proto__:` (a literal sets the prototype).
+    const out = normalizeSchemaRefs({
+      type: "object",
+      properties: { ["__proto__"]: { type: "string" } },
+    }) as Record<string, unknown>;
+    const props = out.properties as Record<string, unknown>;
+    assert.equal(Object.prototype.hasOwnProperty.call(props, "__proto__"), true);
+    assert.deepEqual(props["__proto__"], { type: "string" });
+  });
+});
+
+describe("removeDanglingRefs skipKey (P1)", () => {
+  it("keeps the skipped subtree by reference", () => {
+    const pruned = new Set<string>();
+    const defs = { ok: { $ref: "#/$defs/Present" } };
+    const out = removeDanglingRefs(
+      { $defs: defs, properties: { x: { $ref: "#/$defs/Missing" } } },
+      new Set(["Present"]),
+      pruned,
+      "$defs",
+    ) as Record<string, unknown>;
+    assert.equal(out.$defs, defs); // kept by reference, not re-walked
+    assert.deepEqual(out.properties, { x: {} });
+    assert.deepEqual([...pruned], ["#/$defs/Missing"]);
+  });
+});
+
 describe("normalizeDefs", () => {
   it("normalizes every entry once, preserving keys", () => {
     const schemas: Record<string, SchemaObject> = {

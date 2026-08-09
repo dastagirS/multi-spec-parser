@@ -7,6 +7,7 @@
 import { load as yamlLoad } from "js-yaml";
 
 import { DocResolver, isRef } from "./ref-resolver.js";
+import { setOwn } from "./schema-closure.js";
 import type {
   ExtractedOperation,
   GoogleDiscoveryDoc,
@@ -151,7 +152,7 @@ function parseOpenApi3(spec: OpenApi3Spec): ParsedSpec {
   const servers = extractServers(spec.servers);
   const schemas: Record<string, SchemaObject> = {};
   for (const [name, schema] of Object.entries(spec.components?.schemas ?? {})) {
-    schemas[name] = schema;
+    setOwn(schemas, name, schema);
   }
 
   const operations: ExtractedOperation[] = [];
@@ -341,7 +342,7 @@ function parseSwagger2(spec: Swagger2Spec): ParsedSpec {
 
   const schemas: Record<string, SchemaObject> = {};
   for (const [name, schema] of Object.entries(spec.definitions ?? {})) {
-    schemas[name] = schema;
+    setOwn(schemas, name, schema);
   }
 
   const operations: ExtractedOperation[] = [];
@@ -526,7 +527,7 @@ function parseGoogleDiscovery(doc: GoogleDiscoveryDoc): ParsedSpec {
 
   const schemas: Record<string, SchemaObject> = {};
   for (const [name, gs] of Object.entries(doc.schemas ?? {})) {
-    schemas[name] = googleSchemaToSchema(gs);
+    setOwn(schemas, name, googleSchemaToSchema(gs));
   }
 
   const operations: ExtractedOperation[] = [];
@@ -665,7 +666,7 @@ function googleSchemaToSchema(gs: GoogleSchemaObject): SchemaObject {
   if (gs.properties) {
     result.properties = {};
     for (const [key, val] of Object.entries(gs.properties)) {
-      result.properties[key] = googleSchemaToSchema(val);
+      setOwn(result.properties, key, googleSchemaToSchema(val));
     }
   }
   if (gs.items) result.items = googleSchemaToSchema(gs.items);

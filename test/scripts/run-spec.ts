@@ -103,9 +103,9 @@ for (const tool of compiled.tools) {
   refRewriteFailures += checkRefRewrite(tool.inputSchema, tool.name, failures);
 
   try {
-    // nullable is an OAS-3.0-dialect keyword, not JSON Schema: Ajv rejects
-    // `nullable: true` on a $ref sibling (GitHub's pattern). Strip it for the
-    // compile gate — the LLM-facing schema keeps it for description.
+    // Belt-and-braces: the library converts OAS `nullable` to type-arrays /
+    // anyOf at compile time (PR4), so nothing should remain — but if a schema
+    // slips one through, strip it so the Ajv gate measures real failures.
     ajv.compile(stripNullable(tool.inputSchema) as object);
   } catch (err) {
     ajvCompileFailures += 1;

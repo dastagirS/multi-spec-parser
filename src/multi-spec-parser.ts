@@ -94,9 +94,10 @@ export class MultiSpecParser {
     return this.requireCompiled().defs;
   }
 
-  /** All compiled tools (per-tool $defs closures, Ajv-compilable). */
+  /** All compiled tools (per-tool $defs closures, Ajv-compilable). Returns a
+   *  copy — mutating the result can't corrupt the parser's internal list. */
   tools(): CompiledTool[] {
-    return this.requireCompiled().tools;
+    return [...this.requireCompiled().tools];
   }
 
   /** The tool with the given name, or undefined. */

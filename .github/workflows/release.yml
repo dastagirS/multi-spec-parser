@@ -63,7 +63,11 @@ jobs:
               process.exit(1);
             }
             console.log("Publishing v" + pkg.version);
-          ' "${{ inputs.version }}"
+          ' "$VERSION_INPUT"
+        env:
+          # Pass via env, not inline interpolation — the semver gate makes it
+          # safe either way, but env passing makes that structural (PR5).
+          VERSION_INPUT: ${{ inputs.version }}
 
       - name: Fetch battle fixtures
         run: npm run fixtures
@@ -78,10 +82,11 @@ jobs:
 
       - name: Tag and create GitHub Release
         run: |
-          VERSION="v$(echo '${{ inputs.version }}' | sed 's/^v//')"
+          VERSION="v$(echo "$VERSION_INPUT" | sed 's/^v//')"
           git tag "$VERSION" || true # may already exist from `npm version`
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push origin "$VERSION" || true # already on remote? fine
           gh release create "$VERSION" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_INPUT: ${{ inputs.version }}

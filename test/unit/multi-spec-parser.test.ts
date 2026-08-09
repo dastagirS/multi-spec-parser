@@ -213,6 +213,14 @@ paths:
     assert.equal(overridden.headers["X-Extra"], "1");
   });
 
+  it("tools() returns a copy — mutating it can't corrupt the parser", async () => {
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    await parser.parse();
+    const first = parser.tools();
+    first.length = 0;
+    assert.equal(parser.tools().length, 3);
+  });
+
   it("executes against a live local server: success and error shapes", async () => {
     server = await startServer();
     const parser = new MultiSpecParser({

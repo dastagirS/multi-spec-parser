@@ -17,7 +17,19 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dastagirS/multi-spec-parser.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dastagirS/multi-spec-parser/issues"
+  },
+  "homepage": "https://github.com/dastagirS/multi-spec-parser#readme",
+  "author": "dastagirS <shroud464@gmail.com>",
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

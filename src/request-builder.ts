@@ -13,6 +13,7 @@ import type {
   NormalizedRequestBody,
   ServerInfo,
 } from "./types.js";
+import { setOwn } from "./schema-closure.js";
 
 export interface BuiltRequest {
   url: string;
@@ -376,10 +377,10 @@ function resolveBaseUrl(
   url = chosen.url;
   const values: Record<string, string> = {};
   for (const [name, v] of Object.entries(chosen.variables ?? {})) {
-    values[name] = v.default;
+    setOwn(values, name, v.default);
   }
   for (const [name, value] of Object.entries(arg.variables ?? {})) {
-    if (value != null && value !== "") values[name] = String(value);
+    if (value != null && value !== "") setOwn(values, name, String(value));
   }
   for (const [name, value] of Object.entries(values)) {
     url = url.replaceAll(`{${name}}`, value);

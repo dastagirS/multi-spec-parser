@@ -11,7 +11,7 @@
  *     shared $defs across tools are safe).
  */
 
-import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs } from "./schema-closure.js";
+import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
 import { fetchSpecText, parseSpec, parseSpecText } from "./parse-spec.js";
 import type {
   ExtractedOperation,
@@ -62,7 +62,30 @@ export function compileSpecToTools(
   options: CompileOptions = {},
 ): CompileResult {
   const maxDefsBytes = options.maxDefsBytes ?? DEFAULT_MAX_DEFS_BYTES;
-  const defs = normalizeDefs(parsed.schemas) as unknown as Record<string, unknown>;
+
+  // P1: prune the shared defs ONCE per compile. Transitivity means a ref
+  // inside a def can only dangle if its name is missing from the WHOLE defs
+  // map (the closure BFS includes everything reachable), so one global pass —
+  // memoized per def object since defs are shared across tools — replaces the
+  // old per-tool walk of the attached $defs subtree (Stripe: 1.2s → 3.0s).
+  const rawDefs = normalizeDefs(parsed.schemas) as unknown as Record<string, unknown>;
+  const allDefNames = new Set(Object.keys(rawDefs));
+  const defPruneMemo = new WeakMap<object, unknown>();
+  const prunedRefsByDef = new Map<string, Set<string>>();
+  const defs: Record<string, unknown> = {};
+  for (const [name, def] of Object.entries(rawDefs)) {
+    const cached = defPruneMemo.get(def as object);
+    if (cached !== undefined) {
+      setOwn(defs, name, cached);
+      continue;
+    }
+    const prunedHere = new Set<string>();
+    const prunedDef = removeDanglingRefs(def, allDefNames, prunedHere);
+    defPruneMemo.set(def as object, prunedDef);
+    if (prunedHere.size > 0) prunedRefsByDef.set(name, prunedHere);
+    setOwn(defs, name, prunedDef);
+  }
+
   const tools: CompiledTool[] = [];
   const seen = new Map<string, number>();
   const used = new Set<string>();
@@ -94,14 +117,15 @@ export function compileSpecToTools(
       (inputSchema.$defs as Record<string, unknown>) = reachable;
     }
 
-    // Dangling refs (specs that $ref missing schemas) would break Ajv with no
-    // signal — replace them with `{}` and surface the names (B1).
+    // Per-tool pruning covers ONLY the input/output graphs — the attached
+    // $defs subtree was already pruned globally (P1), so it is skipped.
     const pruned = new Set<string>();
     const valid = new Set(Object.keys(reachable));
     const prunedInput = removeDanglingRefs(
       inputSchema,
       valid,
       pruned,
+      "$defs",
     ) as Record<string, unknown>;
     const prunedOutput = outputSchema
       ? (removeDanglingRefs(outputSchema, valid, pruned) as Record<string, unknown>)
@@ -111,8 +135,15 @@ export function compileSpecToTools(
       (prunedInput as Record<string, unknown>).$defs = inputSchema.$defs;
     }
 
+    // Defs that were globally pruned AND are in this tool's closure surface
+    // their dangling refs here too (B1 + B3 discipline: per-tool reporting).
     const unresolvedRefs = new Set<string>(op.unresolvedRefs ?? []);
     for (const ref of pruned) unresolvedRefs.add(ref);
+    for (const [defName, refs] of prunedRefsByDef) {
+      if (defName in reachable) {
+        for (const ref of refs) unresolvedRefs.add(ref);
+      }
+    }
 
     tools.push({
       name,
@@ -138,7 +169,7 @@ function buildInputSchema(
   const required: string[] = [];
 
   for (const param of op.parameters) {
-    properties[param.name] = param.schema;
+    setOwn(properties, param.name, param.schema);
     if (param.required) required.push(param.name);
   }
 
@@ -167,29 +198,36 @@ function buildInputSchema(
       formProps !== undefined &&
       Object.keys(formProps).length > 0 &&
       !Object.keys(formProps).some((name) => reserved.includes(name));
+    // A param named body/bodyBase64/contentType would be clobbered by the body
+    // property — params are declared explicitly, so they win; the body input
+    // is simply not exposed (N2, spec is ambiguous).
+    let bodyAdded = false;
+    let bodyBase64Added = false;
     if (canFlatten) {
       for (const [name, schema] of Object.entries(formProps)) {
-        properties[name] = schema;
+        setOwn(properties, name, schema);
       }
       for (const name of rb.schema!.required ?? []) {
         if (!required.includes(name)) required.push(name);
       }
-    } else if (rb.schema) {
+    } else if (rb.schema && !("body" in properties)) {
       properties.body = rb.schema;
+      bodyAdded = true;
     }
-    if (isOctet) {
+    if (isOctet && !("bodyBase64" in properties)) {
       properties.bodyBase64 = {
         type: "string",
         contentEncoding: "base64",
         contentMediaType: "application/octet-stream",
         description: "Base64-encoded bytes for application/octet-stream bodies.",
       };
+      bodyBase64Added = true;
     }
     if (rb.required) {
-      if (isOctet && rb.schema) required.push("bodyBase64");
-      else if (properties.body !== undefined) required.push("body");
+      if (isOctet && bodyBase64Added) required.push("bodyBase64");
+      else if (bodyAdded) required.push("body");
     }
-    if (contents && contents.length > 1) {
+    if (contents && contents.length > 1 && !("contentType" in properties)) {
       properties.contentType = {
         type: "string",
         enum: contents.map((c) => c.contentType),
@@ -214,7 +252,7 @@ function buildServerInput(servers: ServerInfo[]): Record<string, unknown> | unde
   const variableDefs: Record<string, { default: string; enum?: string[]; description?: string }> = {};
   for (const server of servers) {
     for (const [name, v] of Object.entries(server.variables ?? {})) {
-      if (!(name in variableDefs)) variableDefs[name] = v;
+      if (!(name in variableDefs)) setOwn(variableDefs, name, v);
     }
   }
   const variableNames = Object.keys(variableDefs);
@@ -293,6 +331,9 @@ function ensureUniqueName(
 
 const textCache = new Map<string, ParsedSpec>();
 let objectCache = new WeakMap<object, ParsedSpec>();
+// In-flight string-source loads: two concurrent loads of the same URL must
+// fetch + parse once, not twice (PR6).
+const inflightText = new Map<string, Promise<ParsedSpec>>();
 
 // Bounded LRU: a long-lived process loading many distinct specs shouldn't
 // retain every raw text + parsed model forever (G2). Re-insert on hit.
@@ -335,13 +376,26 @@ export async function loadSpecSource(
     return { parsed, compiled: compileSpecToTools(parsed, options) };
   }
   let parsed = textCacheGet(source);
-  if (!parsed) {
+  if (parsed) return { parsed, compiled: compileSpecToTools(parsed, options) };
+  const existing = inflightText.get(source);
+  if (existing) {
+    const shared = await existing;
+    return { parsed: shared, compiled: compileSpecToTools(shared, options) };
+  }
+  const promise = (async (): Promise<ParsedSpec> => {
     const text =
       source.startsWith("http://") || source.startsWith("https://")
         ? await fetchSpecText(source)
         : source;
-    parsed = parseSpec(parseSpecText(text));
-    textCacheSet(source, parsed);
+    const parsedSpec = parseSpec(parseSpecText(text));
+    textCacheSet(source, parsedSpec);
+    return parsedSpec;
+  })();
+  inflightText.set(source, promise);
+  try {
+    parsed = await promise;
+  } finally {
+    inflightText.delete(source);
   }
   return { parsed, compiled: compileSpecToTools(parsed, options) };
 }
@@ -360,5 +414,6 @@ export async function compileSpecSource(
 /** Test-only: drop cached entries so tests observe cold-cache behavior. */
 export function clearSpecCache(): void {
   textCache.clear();
+  inflightText.clear();
   objectCache = new WeakMap();
 }

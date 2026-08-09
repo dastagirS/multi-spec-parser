@@ -10,7 +10,7 @@ jobs:
   test:
     strategy:
       matrix:
-        node: [20, 22]
+        node: [22, 24]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

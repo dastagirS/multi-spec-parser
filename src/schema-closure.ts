@@ -12,8 +12,31 @@ import type { SchemaObject } from "./types.js";
 
 const SCHEMA_REF_RE = /^#\/(?:components\/schemas|\$defs|definitions)\/(.+)$/;
 
-/** Rewrite schema refs to #/$defs/X. One pass; returns the same object when
- *  nothing changed (no clone on the common no-ref path). */
+/**
+ * Own-property write that survives the __proto__ prototype trap: assigning
+ * `obj["__proto__"] = value` on a plain object triggers the prototype setter
+ * and silently DROPS the key. Spec content (schema names, property names, param
+ * names) can legitimately be "__proto__" (N1).
+ */
+export function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === "__proto__") {
+    Object.defineProperty(obj, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  } else {
+    obj[key] = value;
+  }
+}
+
+/**
+ * Rewrite schema refs to #/$defs/X AND convert OAS 3.0 `nullable` into
+ * draft-07-valid shapes (PR4): `type` → [type, "null"], `$ref` → anyOf with
+ * {type:"null"}, `enum` → append null. One pass; returns the same object when
+ * nothing changed (no clone on the common no-ref/no-nullable path).
+ */
 export function normalizeSchemaRefs(node: unknown): unknown {
   if (Array.isArray(node)) {
     let changed = false;
@@ -36,9 +59,10 @@ export function normalizeSchemaRefs(node: unknown): unknown {
       for (const [k, v] of Object.entries(obj)) {
         const n = k === "$ref" ? `#/$defs/${m[1]}` : normalizeSchemaRefs(v);
         if (n !== v) changed = true;
-        out[k] = n;
+        setOwn(out, k, n);
       }
-      return changed ? out : obj;
+      const converted = applyNullable(out);
+      return converted !== out || changed ? converted : obj;
     }
     return obj;
   }
@@ -47,9 +71,39 @@ export function normalizeSchemaRefs(node: unknown): unknown {
   for (const [k, v] of Object.entries(obj)) {
     const n = normalizeSchemaRefs(v);
     if (n !== v) changed = true;
-    out[k] = n;
+    setOwn(out, k, n);
   }
-  return changed ? out : obj;
+  const converted = applyNullable(out);
+  return converted !== out || changed ? converted : obj;
+}
+
+/**
+ * OAS 3.0 `nullable: true` → draft-07-valid shape. Always returns a NEW object
+ * when `nullable` is present (never mutates the shared input), so the
+ * no-clone-on-no-change path stays intact. `nullable: false` → dropped.
+ */
+function applyNullable(node: Record<string, unknown>): Record<string, unknown> {
+  if (typeof node.nullable !== "boolean") return node;
+  // Destructuring out `nullable` creates a fresh object via CreateDataProperty
+  // (safe for __proto__ keys, unlike bracket assignment).
+  const { nullable, ...rest } = node;
+  if (!nullable) return rest;
+  if (typeof rest.type === "string") {
+    return { ...rest, type: [rest.type, "null"] };
+  }
+  if (Array.isArray(rest.type)) {
+    return rest.type.includes("null") ? rest : { ...rest, type: [...rest.type, "null"] };
+  }
+  if (typeof rest.$ref === "string") {
+    // $ref siblings are ignored by draft-07, so wrap: ref-or-null. The $ref
+    // node keeps its description etc. for the LLM.
+    return { anyOf: [rest, { type: "null" }] };
+  }
+  if (Array.isArray(rest.enum)) {
+    return rest.enum.includes(null) ? rest : { ...rest, enum: [...rest.enum, null] };
+  }
+  // No type/ref/enum: unconstrained already admits null — drop the keyword.
+  return rest;
 }
 
 /** Hoist + normalize every component schema once per spec. */
@@ -58,7 +112,7 @@ export function normalizeDefs(
 ): Record<string, SchemaObject> {
   const out: Record<string, SchemaObject> = {};
   for (const [name, schema] of Object.entries(schemas)) {
-    out[name] = normalizeSchemaRefs(schema) as SchemaObject;
+    setOwn(out, name, normalizeSchemaRefs(schema) as SchemaObject);
   }
   return out;
 }
@@ -83,7 +137,7 @@ export function collectReachableDefs(
     if (name in result) continue;
     const def = defs[name];
     if (!def) continue;
-    result[name] = def;
+    setOwn(result, name, def);
     const next = new Set<string>();
     collectRefNames(def, next);
     for (const ref of next) {
@@ -121,16 +175,21 @@ export function collectRefNames(node: unknown, into: Set<string>): void {
  * stays Ajv-compilable. Returns a NEW graph when anything changed, else the
  * same node (mirrors normalizeSchemaRefs' no-clone-on-no-change path — the
  * memory model depends on it). Pruned names are collected into `pruned`.
+ *
+ * `skipKey` (e.g. "$defs") stops recursion into one subtree, keeping it by
+ * reference — used by the per-tool pass, which relies on the shared defs
+ * having been pruned once globally (P1).
  */
 export function removeDanglingRefs(
   node: unknown,
   valid: ReadonlySet<string>,
   pruned: Set<string>,
+  skipKey?: string,
 ): unknown {
   if (Array.isArray(node)) {
     let changed = false;
     const out = node.map((item) => {
-      const n = removeDanglingRefs(item, valid, pruned);
+      const n = removeDanglingRefs(item, valid, pruned, skipKey);
       if (n !== item) changed = true;
       return n;
     });
@@ -149,9 +208,13 @@ export function removeDanglingRefs(
   let changed = false;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
-    const n = removeDanglingRefs(v, valid, pruned);
+    if (k === skipKey) {
+      setOwn(out, k, v);
+      continue;
+    }
+    const n = removeDanglingRefs(v, valid, pruned, skipKey);
     if (n !== v) changed = true;
-    out[k] = n;
+    setOwn(out, k, n);
   }
   return changed ? out : obj;
 }

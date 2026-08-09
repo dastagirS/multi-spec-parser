@@ -94,18 +94,11 @@ as flat top-level fields and serialized accordingly. A relative spec server
 (e.g. petstore3's `/api/v3`) resolves against the `baseUrl` override as
 origin; absolute servers are replaced outright.
 
-Output contracts come from **success responses only** (exact `2xx`, then
-`2XX` wildcard). The `default` response is deliberately excluded — it usually
-carries the error shape, and advertising that as the output contract misleads
-LLM callers. Dangling `$ref`s (missing schemas) are pruned to unconstrained
-`{}` so every tool stays Ajv-compilable, and the dropped refs are surfaced on
-the tool as `unresolvedRefs`.
-
 ## Formats
 
 | Format | Detection | Notes |
 |---|---|---|
-| OpenAPI 3.0.x | `openapi: "3.0.x"` | `nullable`, boolean `exclusiveMinimum` |
+| OpenAPI 3.0.x | `openapi: "3.0.x"` | `nullable` converted to type-arrays/anyOf at compile time; boolean `exclusiveMinimum` |
 | OpenAPI 3.1.x | `openapi: "3.1.x"` | `type` arrays pass through; numeric `exclusiveMinimum` |
 | Swagger 2.0 | `swagger: "2.0"` | `in:body`/`in:formData` → requestBody, `collectionFormat` → style/explode |
 | Google Discovery | `kind: "discovery#restDescription"` | `flatPath`, `repeated`, global params, `rootUrl+servicePath`, `type:"any"` filtered |
@@ -130,6 +123,19 @@ JSON-variant URL).
 > is the *same object* as `parser.defs.X` — mutating one tool's schema
 > corrupts every other tool (that sharing is the memory win). Treat compiled
 > schemas as read-only, or deep-copy before editing.
+
+## Behavioral notes
+
+- **`nullable` (OAS 3.0) is compiled away** — `type` becomes `[type, "null"]`,
+  `$ref` becomes `anyOf: [$ref, {type: "null"}]`, `enum` gains `null`. Tool
+  schemas are draft-07-clean for strict Ajv consumers.
+- **Output contracts** come from success responses only (exact `2xx`, then
+  `2XX` wildcard); `default` is excluded (it usually carries the error shape).
+- **Dangling `$ref`s** (missing schemas) are pruned to unconstrained `{}` so
+  every tool stays Ajv-compilable, and the dropped refs are surfaced on the
+  tool as `unresolvedRefs`.
+- **`__proto__` keys** (schema/property/param names) are preserved as own
+  properties — the parser never trips the prototype trap.
 
 ## Releasing
 
