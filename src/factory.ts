@@ -11,7 +11,7 @@
  *     shared $defs across tools are safe).
  */
 
-import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs } from "./schema-closure.js";
+import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs } from "./schema-closure.js";
 import { fetchSpecText, parseSpec, parseSpecText } from "./parse-spec.js";
 import type {
   ExtractedOperation,
@@ -30,6 +30,10 @@ export interface CompiledTool {
   /** Success-response schema; $refs resolve against inputSchema.$defs. */
   outputSchema: Record<string, unknown> | undefined;
   operation: ExtractedOperation;
+  /** Refs that could not be resolved: top-level refs dropped at parse time
+   *  (original form, e.g. #/components/parameters/X) + schema refs pruned at
+   *  compile time (rewritten #/$defs/ form). Absent when none. */
+  unresolvedRefs?: string[];
 }
 
 export interface CompileResult {
@@ -61,9 +65,10 @@ export function compileSpecToTools(
   const defs = normalizeDefs(parsed.schemas) as unknown as Record<string, unknown>;
   const tools: CompiledTool[] = [];
   const seen = new Map<string, number>();
+  const used = new Set<string>();
 
   for (const op of parsed.operations) {
-    const name = ensureUniqueName(op.toolName, seen);
+    const name = ensureUniqueName(op.toolName, seen, used);
     // Op-level schemas carry native refs (#/components/schemas, #/definitions);
     // rewrite them at the boundary so $refs resolve against the hoisted $defs.
     const inputSchema = normalizeSchemaRefs(
@@ -89,14 +94,35 @@ export function compileSpecToTools(
       (inputSchema.$defs as Record<string, unknown>) = reachable;
     }
 
+    // Dangling refs (specs that $ref missing schemas) would break Ajv with no
+    // signal — replace them with `{}` and surface the names (B1).
+    const pruned = new Set<string>();
+    const valid = new Set(Object.keys(reachable));
+    const prunedInput = removeDanglingRefs(
+      inputSchema,
+      valid,
+      pruned,
+    ) as Record<string, unknown>;
+    const prunedOutput = outputSchema
+      ? (removeDanglingRefs(outputSchema, valid, pruned) as Record<string, unknown>)
+      : undefined;
+    if (prunedInput !== inputSchema) {
+      // Pruning returned a new graph — carry the $defs attachment over.
+      (prunedInput as Record<string, unknown>).$defs = inputSchema.$defs;
+    }
+
+    const unresolvedRefs = new Set<string>(op.unresolvedRefs ?? []);
+    for (const ref of pruned) unresolvedRefs.add(ref);
+
     tools.push({
       name,
       description: buildDescription(op),
       method: op.method,
       path: op.path,
-      inputSchema,
-      outputSchema,
+      inputSchema: prunedInput,
+      outputSchema: prunedOutput,
       operation: op,
+      ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
     });
   }
 
@@ -241,10 +267,24 @@ function buildDescription(op: ExtractedOperation): string {
   return parts.join("\n\n");
 }
 
-function ensureUniqueName(candidate: string, seen: Map<string, number>): string {
-  const count = seen.get(candidate) ?? 0;
-  seen.set(candidate, count + 1);
-  return count === 0 ? candidate : `${candidate}_${count}`;
+function ensureUniqueName(
+  candidate: string,
+  seen: Map<string, number>,
+  used: Set<string>,
+): string {
+  // Occurrence k of a candidate is named `candidate` (k=0) else `candidate_k`;
+  // a real operationId may already occupy that name (getPet_1) — keep bumping
+  // the suffix until the name is free (B4).
+  const prior = seen.get(candidate) ?? 0;
+  let name = prior === 0 ? candidate : `${candidate}_${prior}`;
+  let n = prior;
+  while (used.has(name)) {
+    n += 1;
+    name = `${candidate}_${n}`;
+  }
+  seen.set(candidate, n + 1);
+  used.add(name);
+  return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +293,28 @@ function ensureUniqueName(candidate: string, seen: Map<string, number>): string 
 
 const textCache = new Map<string, ParsedSpec>();
 let objectCache = new WeakMap<object, ParsedSpec>();
+
+// Bounded LRU: a long-lived process loading many distinct specs shouldn't
+// retain every raw text + parsed model forever (G2). Re-insert on hit.
+const TEXT_CACHE_MAX = 32;
+
+function textCacheGet(key: string): ParsedSpec | undefined {
+  const hit = textCache.get(key);
+  if (hit !== undefined) {
+    textCache.delete(key);
+    textCache.set(key, hit);
+  }
+  return hit;
+}
+
+function textCacheSet(key: string, parsed: ParsedSpec): void {
+  textCache.delete(key);
+  textCache.set(key, parsed);
+  if (textCache.size > TEXT_CACHE_MAX) {
+    const oldest = textCache.keys().next().value;
+    if (oldest !== undefined) textCache.delete(oldest);
+  }
+}
 
 /**
  * Load a spec source (URL, raw text, or pre-parsed object) into a parsed
@@ -272,13 +334,14 @@ export async function loadSpecSource(
     }
     return { parsed, compiled: compileSpecToTools(parsed, options) };
   }
-  let parsed = textCache.get(source);
+  let parsed = textCacheGet(source);
   if (!parsed) {
-    const text = source.startsWith("http://") || source.startsWith("https://")
-      ? await fetchSpecText(source)
-      : source;
+    const text =
+      source.startsWith("http://") || source.startsWith("https://")
+        ? await fetchSpecText(source)
+        : source;
     parsed = parseSpec(parseSpecText(text));
-    textCache.set(source, parsed);
+    textCacheSet(source, parsed);
   }
   return { parsed, compiled: compileSpecToTools(parsed, options) };
 }

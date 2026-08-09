@@ -294,6 +294,40 @@ describe("buildRequest", () => {
     assert.equal(request.body, "<x/>");
   });
 
+  it("sets Accept on every request, not just body-bearing ones", () => {
+    const request = buildRequest(op({ path: "/pets" }), {}, { baseUrl: "https://api.example.com" });
+    assert.equal(request.headers.Accept, "application/json");
+  });
+
+  it("does not treat an undocumented `input` arg as the body", () => {
+    const request = buildRequest(
+      op({
+        method: "POST",
+        path: "/pets",
+        requestBody: {
+          required: false,
+          contentType: "application/json",
+          schema: { type: "object" },
+        },
+      }),
+      { input: { name: "Rex" } },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.equal(request.body, undefined);
+  });
+
+  it("percent-encodes cookie names and values", () => {
+    const request = buildRequest(
+      op({
+        path: "/x",
+        parameters: [{ name: "session id", in: "cookie", required: false, schema: {} }],
+      }),
+      { "session id": "a b;c" },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.equal(request.headers.Cookie, "session%20id=a%20b%3Bc");
+  });
+
   it("substitutes server URL variables with defaults and overrides", () => {
     const request = buildRequest(
       op({

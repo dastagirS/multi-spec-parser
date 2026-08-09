@@ -26,7 +26,9 @@ export class DocResolver {
 
   /**
    * Resolve an internal JSON Pointer (#/a/b/c). External refs (other files,
-   * http://...) return null and are collected as unresolved instead.
+   * http://...) return null and are collected as unresolved instead. A miss
+   * on the FINAL segment returns null too (a pointer walking into undefined
+   * is a dangling ref, not a value).
    */
   resolvePointer(ref: string): unknown {
     if (!ref.startsWith("#/")) return null;
@@ -34,6 +36,7 @@ export class DocResolver {
     for (const segment of ref.slice(2).split("/")) {
       if (typeof current !== "object" || current === null) return null;
       current = (current as Record<string, unknown>)[decodePointerSegment(segment)];
+      if (current === undefined) return null;
     }
     return current;
   }

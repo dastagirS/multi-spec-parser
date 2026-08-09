@@ -190,14 +190,50 @@ function validateConfig(config: MultiSpecParserConfig): void {
   }
   // Runtime guards for JS consumers (TS already enforces these statically).
   if ("url" in source) {
-    if (typeof source.url !== "string") {
-      throw new TypeError("MultiSpecParser: spec.url must be a string.");
+    if (typeof source.url !== "string" || source.url.length === 0) {
+      throw new TypeError("MultiSpecParser: spec.url must be a non-empty string.");
     }
   } else if ("text" in source) {
-    if (typeof source.text !== "string") {
-      throw new TypeError("MultiSpecParser: spec.text must be a string.");
+    if (typeof source.text !== "string" || source.text.length === 0) {
+      throw new TypeError("MultiSpecParser: spec.text must be a non-empty string.");
     }
   } else if (typeof source.spec !== "object" || source.spec === null || Array.isArray(source.spec)) {
     throw new TypeError("MultiSpecParser: spec.spec must be a plain object.");
+  }
+
+  validateOptions(config.options);
+}
+
+/** Runtime guards for options (I3) — JS consumers can't rely on TS types. */
+function validateOptions(options: MultiSpecParserOptions | undefined): void {
+  if (options === undefined) return;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new TypeError("MultiSpecParser: options must be an object.");
+  }
+  const { maxDefsBytes, baseUrl, headers, executeTimeoutMs } = options;
+  if (
+    maxDefsBytes !== undefined &&
+    (typeof maxDefsBytes !== "number" || !Number.isFinite(maxDefsBytes) || maxDefsBytes <= 0)
+  ) {
+    throw new TypeError("MultiSpecParser: options.maxDefsBytes must be a positive number.");
+  }
+  if (baseUrl !== undefined && typeof baseUrl !== "string") {
+    throw new TypeError("MultiSpecParser: options.baseUrl must be a string.");
+  }
+  if (
+    headers !== undefined &&
+    (typeof headers !== "object" || headers === null || Array.isArray(headers))
+  ) {
+    throw new TypeError("MultiSpecParser: options.headers must be an object.");
+  }
+  if (
+    executeTimeoutMs !== undefined &&
+    (typeof executeTimeoutMs !== "number" ||
+      !Number.isFinite(executeTimeoutMs) ||
+      executeTimeoutMs <= 0)
+  ) {
+    throw new TypeError(
+      "MultiSpecParser: options.executeTimeoutMs must be a positive number.",
+    );
   }
 }

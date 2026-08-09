@@ -44,6 +44,10 @@ describe("parseSpecText", () => {
     assert.throws(() => parseSpecText("- a\n- b\n"));
   });
 
+  it("wraps invalid JSON+YAML with a helpful error", () => {
+    assert.throws(() => parseSpecText("a: [unclosed"), /not valid JSON or YAML/);
+  });
+
   it("parses the real Booking.com YAML spec (the documented download)", () => {
     const path = fileURLToPath(
       new URL("../../../test/fixtures/booking.yaml", import.meta.url),

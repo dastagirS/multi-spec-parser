@@ -21,6 +21,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "test": "npm run build && node --test \"dist/test/unit/*.test.js\"",
     "battle": "npm run build && node dist/test/battle.js",
     "fixtures": "npm run build && node dist/test/scripts/fetch-fixtures.js",

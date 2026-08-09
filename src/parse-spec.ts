@@ -50,6 +50,10 @@ const VALID_SCHEMA_TYPES = new Set([
 /** NDJSON media types: the body is one JSON doc per line (e.g. Vercel logs). */
 const NDJSON_MEDIA_TYPES = new Set(["application/stream+json", "application/x-ndjson", "application/jsonl"]);
 
+/** Guard against hung/failed fetches: parse() must not hang forever (G6). */
+const FETCH_TIMEOUT_MS = 60_000;
+const MAX_SPEC_BYTES = 200 * 1024 * 1024;
+
 function isNdjsonMediaType(mediaType: string): boolean {
   return NDJSON_MEDIA_TYPES.has(mediaType.split(";")[0]!.trim().toLowerCase());
 }
@@ -62,9 +66,16 @@ function isNdjsonMediaType(mediaType: string): boolean {
 export async function fetchSpecText(url: string): Promise<string> {
   const res = await fetch(url, {
     headers: { Accept: "application/json, application/yaml, text/yaml, */*" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`Failed to fetch spec: ${res.status} ${res.statusText}`);
+  }
+  const contentLength = Number(res.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_SPEC_BYTES) {
+    throw new Error(
+      `Spec too large: content-length ${contentLength} bytes exceeds ${MAX_SPEC_BYTES} byte limit`,
+    );
   }
   return await res.text();
 }
@@ -80,7 +91,18 @@ export function parseSpecText(text: string): Record<string, unknown> {
       // Not valid JSON — fall through to YAML (JSON is a YAML subset).
     }
   }
-  const parsed = yamlLoad(trimmed, { json: true }) as unknown;
+  const parsed = (() => {
+    try {
+      return yamlLoad(trimmed, { json: true }) as unknown;
+    } catch (err) {
+      // Not JSON and not YAML — surface both attempts (I5).
+      throw new Error(
+        `Spec document is not valid JSON or YAML: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  })();
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Spec document must parse to an object");
   }
@@ -133,13 +155,18 @@ function parseOpenApi3(spec: OpenApi3Spec): ParsedSpec {
   }
 
   const operations: ExtractedOperation[] = [];
-  const unresolved = new Set<string>();
-  for (const [path, pathItem] of Object.entries(spec.paths ?? {})) {
-    if (!pathItem) continue;
+  for (const [path, rawPathItem] of Object.entries(spec.paths ?? {})) {
+    if (!rawPathItem) continue;
+    // Path items may be $refs (OAS 3.0 "#/paths/~1pets") — resolve once per
+    // path; misses feed into every op derived from it (G7).
+    const pathUnresolved = new Set<string>();
+    const pathItem = resolvePathItemRef(rawPathItem, r, pathUnresolved);
     for (const method of HTTP_METHODS) {
       const op = pathItem[method];
       if (!op) continue;
-      operations.push(openApi3Operation(path, pathItem, method, op, spec, r, servers, unresolved));
+      operations.push(
+        openApi3Operation(path, pathItem, method, op, spec, r, servers, pathUnresolved),
+      );
     }
   }
 
@@ -163,9 +190,12 @@ function openApi3Operation(
   spec: OpenApi3Spec,
   r: DocResolver,
   docServers: ServerInfo[],
-  unresolved: Set<string>,
+  pathUnresolved: Set<string>,
 ): ExtractedOperation {
   const toolName = deriveToolName(op, method, path);
+  // Per-op tracking: an op must only report refs IT touched, not refs other
+  // ops left dangling (B3). Path-level misses (a $ref path item) carry over.
+  const unresolved = new Set<string>(pathUnresolved);
   const parameters = extractOpenApi3Parameters(pathItem, op, r, unresolved);
   const requestBody = extractRequestBody(op, r, unresolved);
   const outputSchema = extractOutputSchema(op, r, unresolved);
@@ -212,11 +242,22 @@ function extractOpenApi3Parameters(
       in: p.in,
       required: p.in === "path" ? true : (p.required ?? false),
       description: p.description,
-      schema: p.schema ?? { type: "string" },
+      schema: p.schema ?? firstContentSchema(p) ?? { type: "string" },
       ...(p.style ? { style: p.style } : {}),
       ...(p.explode !== undefined ? { explode: p.explode } : {}),
       ...(p.allowReserved !== undefined ? { allowReserved: p.allowReserved } : {}),
     }));
+}
+
+/** OAS 3.0 params may carry `content` instead of `schema` (rare) — take the
+ *  first media type's schema rather than silently typing the param as string. */
+function firstContentSchema(p: ParameterObject): SchemaObject | undefined {
+  const content = p.content;
+  if (!content) return undefined;
+  for (const media of Object.values(content)) {
+    if (media?.schema) return media.schema;
+  }
+  return undefined;
 }
 
 function extractRequestBody(
@@ -244,8 +285,10 @@ function extractRequestBody(
 
 /**
  * Output schema from success responses: exact 2xx codes (sorted), then 2XX
- * wildcard (Microsoft Graph declares every success this way), then default.
- * The server picks the response media type, so prefer JSON among declared.
+ * wildcard (Microsoft Graph declares every success this way). `default` is
+ * deliberately EXCLUDED — it usually carries the error shape, and advertising
+ * that as the output contract misleads LLM callers (G5). The server picks the
+ * response media type, so prefer JSON among declared.
  */
 function extractOutputSchema(
   op: OperationObject,
@@ -256,7 +299,6 @@ function extractOutputSchema(
   const preferred = [
     ...entries.filter(([s]) => /^2\d\d$/.test(s)).sort(([a], [b]) => a.localeCompare(b)),
     ...entries.filter(([s]) => /^2xx$/i.test(s)),
-    ...entries.filter(([s]) => s === "default"),
   ];
   for (const [, raw] of preferred) {
     const resp = resolveOrTrack(r, raw as ResponseObject | RefObject, unresolved) as
@@ -303,13 +345,12 @@ function parseSwagger2(spec: Swagger2Spec): ParsedSpec {
   }
 
   const operations: ExtractedOperation[] = [];
-  const unresolved = new Set<string>();
   for (const [path, pathItem] of Object.entries(spec.paths ?? {})) {
     if (!pathItem) continue;
     for (const method of ["get", "put", "post", "patch", "delete", "head", "options"] as const) {
       const op = pathItem[method];
       if (!op) continue;
-      operations.push(swagger2Operation(path, pathItem, method, op, spec, r, servers, unresolved));
+      operations.push(swagger2Operation(path, pathItem, method, op, spec, r, servers));
     }
   }
 
@@ -333,9 +374,10 @@ function swagger2Operation(
   spec: Swagger2Spec,
   r: DocResolver,
   docServers: ServerInfo[],
-  unresolved: Set<string>,
 ): ExtractedOperation {
   const toolName = deriveToolName(op as OperationObject, method, path);
+  // Per-op unresolved tracking (B3) — same discipline as the OAS3 adapter.
+  const unresolved = new Set<string>();
   const bodyParams: Swagger2Parameter[] = [];
   const parameters: NormalizedParameter[] = [];
   for (const raw of [...(pathItem.parameters ?? []), ...(op.parameters ?? [])]) {
@@ -463,7 +505,6 @@ function swagger2OutputSchema(
   const entries = Object.entries(op.responses ?? {});
   const preferred = [
     ...entries.filter(([s]) => /^2\d\d$/.test(s)).sort(([a], [b]) => a.localeCompare(b)),
-    ...entries.filter(([s]) => s === "default"),
   ];
   for (const [, raw] of preferred) {
     const resp = resolveOrTrack(r, raw as Swagger2Response | RefObject, unresolved) as
@@ -683,6 +724,18 @@ function resolveOrTrack<T>(
     return resolved as T | null;
   }
   return value as T;
+}
+
+/** Resolve a $ref path item; a miss falls back to the raw item (no ops derived
+ *  from it) and is recorded so the caller can report it. */
+function resolvePathItemRef(
+  raw: OpenApi3PathItem | RefObject,
+  r: DocResolver,
+  unresolved: Set<string>,
+): OpenApi3PathItem {
+  if (!isRef(raw)) return raw;
+  const resolved = resolveOrTrack(r, raw, unresolved);
+  return (resolved ?? raw) as OpenApi3PathItem;
 }
 
 function extractServers(

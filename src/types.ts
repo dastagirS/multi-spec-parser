@@ -196,6 +196,8 @@ export interface ParameterObject {
   required?: boolean;
   description?: string;
   schema?: SchemaObject;
+  /** OAS 3.0 allows `content` instead of `schema` (rare) — first media schema wins. */
+  content?: Record<string, { schema?: SchemaObject }>;
   style?: string;
   explode?: boolean;
   allowReserved?: boolean;

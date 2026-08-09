@@ -20,12 +20,14 @@ const fixturePath = (name: string): string =>
 
 const args = process.argv.slice(2);
 if (args.length < 1) {
-  console.error("usage: run-spec.js <fixture.json> [expectedOps]");
+  console.error("usage: run-spec.js <fixture.json> [expectedOps] [maxDefsBytes]");
   process.exit(2);
 }
 const fixtureName = args[0]!;
 const expectedOpsRaw = args[1];
 const expectedOps = expectedOpsRaw !== undefined ? Number(expectedOpsRaw) : undefined;
+const maxDefsBytesRaw = args[2];
+const maxDefsBytes = maxDefsBytesRaw !== undefined ? Number(maxDefsBytesRaw) : undefined;
 
 const text = readFileSync(fixturePath(fixtureName), "utf8");
 // Sniff content, never extension: booking.yaml is YAML, others are JSON —
@@ -60,7 +62,7 @@ if (expectedOps !== undefined && parsed.operations.length !== expectedOps) {
 const t1 = performance.now();
 let compiled;
 try {
-  compiled = compileSpecToTools(parsed);
+  compiled = compileSpecToTools(parsed, maxDefsBytes !== undefined ? { maxDefsBytes } : {});
 } catch (err) {
   console.log(`RESULT_JSON: ${JSON.stringify({ fatal: "compile", error: String(err) })}`);
   process.exit(1);
@@ -93,7 +95,7 @@ for (const tool of compiled.tools) {
   defsCountTotal += Object.keys(defs).length;
 
   if (tool.outputSchema) outputSchemaCount += 1;
-  unresolvedRefsTotal += tool.operation.unresolvedRefs?.length ?? 0;
+  unresolvedRefsTotal += tool.unresolvedRefs?.length ?? 0;
 
   // Every #/ ref in input + output + defs must be a #/$defs/X that exists locally.
   const schema = { ...tool.inputSchema, ...(tool.outputSchema ? { out: tool.outputSchema } : {}) };

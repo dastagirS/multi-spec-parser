@@ -5,6 +5,7 @@ import {
   collectReachableDefs,
   normalizeDefs,
   normalizeSchemaRefs,
+  removeDanglingRefs,
 } from "../../src/schema-closure.js";
 import type { SchemaObject } from "../../src/types.js";
 
@@ -85,5 +86,54 @@ describe("normalizeDefs", () => {
     const defs = normalizeDefs(schemas);
     assert.equal((defs.Pet!.properties!.tag as SchemaObject).$ref, "#/$defs/Tag");
     assert.deepEqual(Object.keys(defs).sort(), ["Pet", "Tag"]);
+  });
+});
+
+describe("collectRefNames (G10)", () => {
+  it("does not treat lookalike strings (description/enum) as refs", () => {
+    const defs: Record<string, SchemaObject> = {
+      A: { type: "object" },
+      B: { type: "string" },
+    };
+    const root = {
+      type: "object",
+      description: "see #/components/schemas/A for details",
+      enum: ["#/components/schemas/B"],
+      properties: { a: { $ref: "#/components/schemas/A" } },
+    };
+    const closure = collectReachableDefs([root], defs);
+    // Only the REAL ref pulls A in; the description/enum strings must not.
+    assert.deepEqual(Object.keys(closure), ["A"]);
+  });
+});
+
+describe("removeDanglingRefs (B1)", () => {
+  it("replaces missing refs with {} and records them", () => {
+    const pruned = new Set<string>();
+    const out = removeDanglingRefs(
+      { $ref: "#/$defs/Missing", properties: { ok: { $ref: "#/$defs/Present" } } },
+      new Set(["Present"]),
+      pruned,
+    ) as Record<string, unknown>;
+    assert.deepEqual(out, {});
+    assert.deepEqual([...pruned], ["#/$defs/Missing"]);
+  });
+
+  it("keeps present refs and returns the same object when nothing dangles", () => {
+    const node = { $ref: "#/$defs/Ok" };
+    const pruned = new Set<string>();
+    assert.equal(removeDanglingRefs(node, new Set(["Ok"]), pruned), node);
+    assert.equal(pruned.size, 0);
+  });
+
+  it("replaces nested dangling refs deep in combinators", () => {
+    const pruned = new Set<string>();
+    const out = removeDanglingRefs(
+      { anyOf: [{ $ref: "#/$defs/Gone" }, { $ref: "#/$defs/Here" }] },
+      new Set(["Here"]),
+      pruned,
+    ) as Record<string, unknown>;
+    assert.deepEqual(out.anyOf, [{}, { $ref: "#/$defs/Here" }]);
+    assert.deepEqual([...pruned], ["#/$defs/Gone"]);
   });
 });

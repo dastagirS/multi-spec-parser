@@ -94,6 +94,13 @@ as flat top-level fields and serialized accordingly. A relative spec server
 (e.g. petstore3's `/api/v3`) resolves against the `baseUrl` override as
 origin; absolute servers are replaced outright.
 
+Output contracts come from **success responses only** (exact `2xx`, then
+`2XX` wildcard). The `default` response is deliberately excluded — it usually
+carries the error shape, and advertising that as the output contract misleads
+LLM callers. Dangling `$ref`s (missing schemas) are pruned to unconstrained
+`{}` so every tool stays Ajv-compilable, and the dropped refs are surfaced on
+the tool as `unresolvedRefs`.
+
 ## Formats
 
 | Format | Detection | Notes |
@@ -114,9 +121,15 @@ JSON-variant URL).
   output schemas (`collectReachableDefs`).
 - Tools whose closure exceeds `maxDefsBytes` (default 1MB) share the hoisted
   defs map by reference instead — Ajv compiles against it without mutating.
-- `parse` content-addresses parsed results (WeakMap for objects, Map for
-text/URLs), so a multi-MB spec (GitHub 12.9MB) parses once per process even
-across MultiSpecParser instances.
+- `parse` content-addresses parsed results (WeakMap for objects, a bounded
+  32-entry LRU for text/URLs), so a multi-MB spec (GitHub 12.9MB) parses once
+  per process even across MultiSpecParser instances, and long-lived processes
+  don't retain every spec forever.
+
+> ⚠️ **Shared `$defs` are live references.** Every tool's `inputSchema.$defs.X`
+> is the *same object* as `parser.defs.X` — mutating one tool's schema
+> corrupts every other tool (that sharing is the memory win). Treat compiled
+> schemas as read-only, or deep-copy before editing.
 
 ## Releasing
 
@@ -141,11 +154,11 @@ push/PR to `master`.
 
 ```sh
 npm test     # unit tests (node:test)
-npm run battle  # battle suite: 7 real specs in heap-capped child processes
+npm run battle  # battle suite: 7 real specs + 8 synthetic, best → worst
 ```
 
 The battle suite is the gate: GitHub (1220 ops) must parse + compile under a
-**1GB heap cap** (the old pipeline OOM'd at 4GB), all 7 specs must hit exact op
+**1GB heap cap** (the old pipeline OOM'd at 4GB), every spec must hit exact op
 counts (incl. Slack's official Swagger 2.0 Web API spec and the Booking.com
 YAML download), every tool's input schema must compile under Ajv with all
 `$ref`s resolvable, and the parent process stays light (children own the heavy

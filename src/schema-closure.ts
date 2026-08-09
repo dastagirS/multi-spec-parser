@@ -93,22 +93,67 @@ export function collectReachableDefs(
   return result;
 }
 
-/** Collect the names of every schema ref reachable in `node`, without resolving. */
+/** Collect the names of every schema ref reachable in `node`, without resolving.
+ *  Only `$ref` KEY values count — a description/enum/example string that merely
+ *  looks like a ref must not pull defs into a tool's closure (G10). Bare
+ *  strings are never refs (a `$ref` value is always reached via its key). */
 export function collectRefNames(node: unknown, into: Set<string>): void {
-  if (typeof node === "string") {
-    const m = node.match(SCHEMA_REF_RE);
-    if (m) into.add(decodeRefSegment(m[1]!));
-    return;
-  }
   if (Array.isArray(node)) {
     for (const item of node) collectRefNames(item, into);
     return;
   }
-  if (node !== null && typeof node === "object") {
-    for (const value of Object.values(node as Record<string, unknown>)) {
+  if (node === null || typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (key === "$ref") {
+      if (typeof value === "string") {
+        const m = value.match(SCHEMA_REF_RE);
+        if (m) into.add(decodeRefSegment(m[1]!));
+      }
+    } else {
       collectRefNames(value, into);
     }
   }
+}
+
+/**
+ * Remove dangling $refs (pointing at names missing from `valid`) from a
+ * schema graph, replacing them with `{}` (anything allowed) so the schema
+ * stays Ajv-compilable. Returns a NEW graph when anything changed, else the
+ * same node (mirrors normalizeSchemaRefs' no-clone-on-no-change path — the
+ * memory model depends on it). Pruned names are collected into `pruned`.
+ */
+export function removeDanglingRefs(
+  node: unknown,
+  valid: ReadonlySet<string>,
+  pruned: Set<string>,
+): unknown {
+  if (Array.isArray(node)) {
+    let changed = false;
+    const out = node.map((item) => {
+      const n = removeDanglingRefs(item, valid, pruned);
+      if (n !== item) changed = true;
+      return n;
+    });
+    return changed ? out : node;
+  }
+  if (node === null || typeof node !== "object") return node;
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.$ref === "string" && obj.$ref.startsWith("#/$defs/")) {
+    const name = decodeRefSegment(obj.$ref.slice("#/$defs/".length));
+    if (!valid.has(name)) {
+      pruned.add(obj.$ref);
+      return {}; // dangling ref → unconstrained rather than broken
+    }
+    return obj;
+  }
+  let changed = false;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const n = removeDanglingRefs(v, valid, pruned);
+    if (n !== v) changed = true;
+    out[k] = n;
+  }
+  return changed ? out : obj;
 }
 
 /** JSON Pointer tilde-unescape for schema names embedded in refs. */

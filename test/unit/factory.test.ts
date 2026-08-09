@@ -1,9 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 
-import { compileSpecToTools } from "../../src/factory.js";
+import { compileSpecToTools, clearSpecCache, loadSpecSource } from "../../src/factory.js";
 import { parseSpec } from "../../src/parse-spec.js";
 
 const fixture = (name: string): Record<string, unknown> =>
@@ -128,6 +130,64 @@ describe("compileSpecToTools", () => {
     assert.deepEqual(tools.map((t) => t.name), ["dup", "dup_1"]);
   });
 
+  it("bumps duplicate names past real suffixed ids (no shadowing)", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      paths: {
+        "/a": { get: { operationId: "getPet", responses: { "200": { description: "ok" } } } },
+        "/b": { get: { operationId: "getPet_1", responses: { "200": { description: "ok" } } } },
+        "/c": { get: { operationId: "getPet", responses: { "200": { description: "ok" } } } },
+      },
+    });
+    const { tools } = compileSpecToTools(parsed);
+    const names = tools.map((t) => t.name);
+    assert.deepEqual(names, ["getPet", "getPet_1", "getPet_2"]);
+    assert.equal(new Set(names).size, names.length);
+  });
+
+  it("prunes dangling refs (input + output) and records them on the tool", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      components: { schemas: { Real: { type: "object" } } },
+      paths: {
+        "/a": {
+          get: {
+            operationId: "danglingInput",
+            parameters: [
+              { name: "x", in: "query", schema: { $ref: "#/components/schemas/Missing" } },
+            ],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+        "/b": {
+          get: {
+            operationId: "danglingOutput",
+            responses: {
+              "200": {
+                description: "ok",
+                content: {
+                  "application/json": { schema: { $ref: "#/components/schemas/Missing" } },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const { tools } = compileSpecToTools(parsed);
+    const input = tools.find((t) => t.name === "danglingInput")!;
+    const output = tools.find((t) => t.name === "danglingOutput")!;
+    const inputProps = input.inputSchema.properties as Record<string, unknown>;
+    assert.deepEqual(inputProps.x, {}); // dangling ref replaced with unconstrained
+    assert.deepEqual(output.outputSchema, {});
+    assert.ok(input.unresolvedRefs?.some((r) => r.includes("Missing")));
+    assert.ok(output.unresolvedRefs?.some((r) => r.includes("Missing")));
+    // The good tool is untouched and reports nothing.
+    assert.ok(tools.every((t) => t.name !== "danglingInput" || t.inputSchema.$defs === undefined));
+  });
+
   it("includes OAuth scopes and deprecation in descriptions", () => {
     const parsed = parseSpec({
       openapi: "3.0.0",
@@ -154,6 +214,30 @@ describe("compileSpecToTools", () => {
     const { tools } = compileSpecToTools(parsed);
     const withOutput = tools.filter((t) => t.outputSchema);
     assert.ok(withOutput.length > 10);
+  });
+
+  it("bounds the text/URL cache (LRU eviction beyond 32 entries)", async () => {
+    clearSpecCache();
+    let hits = 0;
+    const server = createServer((req, res) => {
+      hits += 1;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ openapi: "3.0.0", info: { title: "t", version: "1" }, paths: {} }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}/spec`;
+    try {
+      for (let i = 0; i < 33; i += 1) await loadSpecSource(`${base}${i}`);
+      assert.equal(hits, 33);
+      await loadSpecSource(`${base}0`); // oldest entry evicted → refetch
+      assert.equal(hits, 34);
+      await loadSpecSource(`${base}32`); // most recent still cached
+      assert.equal(hits, 34);
+    } finally {
+      clearSpecCache();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 

@@ -197,4 +197,85 @@ describe("OpenAPI 3.x adapter", () => {
     const defs = (tools[0]!.inputSchema.$defs ?? {}) as Record<string, unknown>;
     assert.equal(Object.keys(defs).length, 0);
   });
+
+  it("tracks unresolved refs per operation only (no cross-op bleed)", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      components: {
+        parameters: { Good: { name: "g", in: "query", schema: { type: "string" } } },
+      },
+      paths: {
+        "/a": {
+          get: {
+            operationId: "opA",
+            parameters: [{ $ref: "#/components/parameters/Missing" }],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+        "/b": {
+          get: { operationId: "opB", responses: { "200": { description: "ok" } } },
+        },
+      },
+    });
+    const a = parsed.operations.find((o) => o.toolName === "opA")!;
+    const b = parsed.operations.find((o) => o.toolName === "opB")!;
+    // Final-segment miss on a $ref must be recorded (not silently dropped).
+    assert.deepEqual(a.unresolvedRefs, ["#/components/parameters/Missing"]);
+    assert.equal(b.unresolvedRefs, undefined);
+  });
+
+  it("resolves $ref path items (OAS 3.0 path-level refs)", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      paths: {
+        "/pets": { $ref: "#/paths/~1shared" },
+        "/shared": {
+          get: {
+            operationId: "sharedGet",
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    });
+    // The ref target is itself a declared path, so BOTH yield ops: /pets via
+    // the $ref, /shared directly. Previously the $ref path yielded ZERO.
+    assert.equal(parsed.operations.length, 2);
+    assert.equal(parsed.operations[0]!.toolName, "sharedGet");
+    assert.equal(parsed.operations[0]!.path, "/pets");
+    assert.equal(parsed.operations[1]!.path, "/shared");
+  });
+
+  it("supports params declared with content instead of schema", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      paths: {
+        "/x": {
+          get: {
+            operationId: "contentParam",
+            parameters: [
+              {
+                name: "filter",
+                in: "query",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: { q: { type: "string" } },
+                    },
+                  },
+                },
+              },
+            ],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    });
+    const param = parsed.operations[0]!.parameters[0]!;
+    assert.equal((param.schema as { type?: string }).type, "object");
+    assert.ok((param.schema as { properties?: unknown }).properties);
+  });
 });

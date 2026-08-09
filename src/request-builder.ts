@@ -80,11 +80,17 @@ export function buildRequest(
     if (param.in !== "cookie") continue;
     const value = readParamValue(args, param);
     if (value === undefined || value === null) continue;
-    cookieValues.push(`${param.name}=${primitiveToString(value)}`);
+    // Percent-encode: cookie values with spaces/semicolons would corrupt the
+    // Cookie header framing otherwise (I6).
+    cookieValues.push(
+      `${encodeURIComponent(param.name)}=${encodeURIComponent(primitiveToString(value))}`,
+    );
   }
   if (cookieValues.length > 0) {
     headers.Cookie = cookieValues.join("; ");
   }
+
+  headers.Accept = "application/json"; // every request, not just body-bearing ones (G4)
 
   let body: string | FormData | Uint8Array | undefined;
   if (op.requestBody) {
@@ -93,7 +99,6 @@ export function buildRequest(
       body = encoded.body;
       headers["Content-Type"] = encoded.contentType;
     }
-    headers.Accept = "application/json";
   }
 
   return { url, method: op.method, headers, ...(body !== undefined ? { body } : {}) };
@@ -218,7 +223,9 @@ function encodeBody(
     base === "application/x-www-form-urlencoded" || base === "multipart/form-data";
   const formFieldNames = isForm ? formFieldNamesOf(rb) : [];
   const pickedForm = formFieldNames.length > 0 ? pickKeys(args, formFieldNames) : undefined;
-  const bodyValue = args.body ?? pickedForm ?? args.input;
+  // args.body only — `input` was an undocumented backdoor that silently became
+  // the body for consumers guessing at naming (G3).
+  const bodyValue = args.body ?? pickedForm;
 
   // Media upload (Google uploadType=media): bytes via bodyBase64 or raw string.
   if (op.mediaUpload && base === "application/octet-stream") {
@@ -391,7 +398,9 @@ export interface ExecuteResult {
   error?: string;
 }
 
-/** Execute a built request with a timeout; JSON body parsed, text fallback. */
+/** Execute a built request with a timeout; JSON body parsed, text fallback.
+ *  The timeout covers the body read too — clearing right after fetch() resolves
+ *  would leave a slow download unbounded (G8). */
 export async function executeRequest(
   request: BuiltRequest,
   options: ExecuteOptions = {},
@@ -405,8 +414,8 @@ export async function executeRequest(
       body: toBodyInit(request.body),
       signal: controller.signal,
     });
-    clearTimeout(timer);
     if (res.status === 204) {
+      clearTimeout(timer);
       return { status: "success", data: null, httpStatus: 204 };
     }
     const contentType = res.headers.get("content-type") ?? "";
@@ -420,6 +429,7 @@ export async function executeRequest(
     } else {
       data = await res.text();
     }
+    clearTimeout(timer);
     if (!res.ok) {
       return {
         status: "error",

@@ -107,9 +107,35 @@ describe("MultiSpecParser", () => {
       () => new MultiSpecParser({ spec: { url: "x", text: "y" } as never }),
       /exactly one/,
     );
-    assert.throws(() => new MultiSpecParser({ spec: { url: 42 } as never }), /spec\.url must be a string/);
+    assert.throws(() => new MultiSpecParser({ spec: { url: 42 } as never }), /spec\.url must be a non-empty string/);
     assert.throws(() => new MultiSpecParser({ spec: { spec: "nope" } as never }), /spec\.spec must be a plain object/);
     assert.throws(() => new MultiSpecParser(undefined as never), /config object required/);
+  });
+
+  it("validates empty source strings and options (JS consumers)", () => {
+    assert.throws(() => new MultiSpecParser({ spec: { url: "" } }), /non-empty/);
+    assert.throws(() => new MultiSpecParser({ spec: { text: "" } }), /non-empty/);
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { maxDefsBytes: -1 } }),
+      /maxDefsBytes/,
+    );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { baseUrl: 42 } as never }),
+      /baseUrl/,
+    );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { headers: "x" } as never }),
+      /headers/,
+    );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { executeTimeoutMs: 0 } }),
+      /executeTimeoutMs/,
+    );
+    // Valid options pass.
+    new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: { maxDefsBytes: 1000, baseUrl: "https://x", headers: { a: "b" }, executeTimeoutMs: 1000 },
+    });
   });
 
   it("parses from a pre-parsed spec object", async () => {

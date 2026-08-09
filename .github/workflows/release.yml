@@ -68,7 +68,7 @@ jobs:
       - name: Fetch battle fixtures
         run: npm run fixtures
 
-      - name: Test gate (build + 81 unit tests + 7-spec battle suite)
+      - name: Test gate (build + unit tests + battle suite)
         run: npm run check
 
       - name: Publish to npm
