@@ -118,6 +118,25 @@ JSON-variant URL).
 text/URLs), so a multi-MB spec (GitHub 12.9MB) parses once per process even
 across MultiSpecParser instances.
 
+## Releasing
+
+Releases are **manual** (Actions → *Release to npm* → Run workflow) so you
+control exactly what ships. Setup once: generate a publish-scoped automation
+token on npmjs.org and add it as the `NPM_TOKEN` repo secret (Settings →
+Secrets and variables → Actions).
+
+```sh
+npm version 0.2.0          # bump + commit + tag
+npm run check              # sanity, locally
+npm run examples           # sanity, live
+# then run the release workflow with version: 0.2.0
+```
+
+The workflow validates the input against `package.json`, runs the full test
+gate (build + unit + battle suite), publishes to npm, and creates a GitHub
+Release with an auto-generated changelog. CI runs the same gate on every
+push/PR to `master`.
+
 ## Tests
 
 ```sh

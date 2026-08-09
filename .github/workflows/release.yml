@@ -1,0 +1,87 @@
+name: Release to npm
+
+# Manual release: you pick the version (after `npm version x.y.z` locally).
+# The workflow validates the input against package.json, runs the full test
+# gate, publishes to npmjs.org, then creates a GitHub Release with changelog.
+#
+# Setup (once):
+#   npmjs.org → Access Tokens → generate a publish-scoped automation token →
+#   add it as a repo secret named NPM_TOKEN (Settings → Secrets and variables
+#   → Actions). The default GITHUB_TOKEN covers the GitHub Release.
+#
+# Usage:
+#   npm version 0.2.0
+#   git push origin master --tags
+#   Actions → "Release to npm" → Run workflow → version: 0.2.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.0) — must match package.json"
+        required: true
+        type: string
+
+permissions:
+  contents: write # tag push + GitHub Release
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags for the changelog
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Validate version input
+        run: |
+          node -e '
+            const input = process.argv[1];
+            const semver = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+            if (!semver.test(input)) {
+              console.error("Invalid version: " + input);
+              process.exit(1);
+            }
+            const want = input.replace(/^v/, "");
+            const pkg = require("./package.json");
+            if (pkg.version !== want) {
+              console.error("Input " + want + " does not match package.json " + pkg.version + " — run `npm version " + want + "` and commit first.");
+              process.exit(1);
+            }
+            console.log("Publishing v" + pkg.version);
+          ' "${{ inputs.version }}"
+
+      - name: Fetch battle fixtures
+        run: npm run fixtures
+
+      - name: Test gate (build + 81 unit tests + 7-spec battle suite)
+        run: npm run check
+
+      - name: Publish to npm
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag and create GitHub Release
+        run: |
+          VERSION="v$(echo '${{ inputs.version }}' | sed 's/^v//')"
+          git tag "$VERSION" || true # may already exist from `npm version`
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin "$VERSION" || true # already on remote? fine
+          gh release create "$VERSION" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
