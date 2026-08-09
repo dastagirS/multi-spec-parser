@@ -165,20 +165,22 @@ const parser = new MultiSpecParser({
 
     // LLM-side schema budget for describeTools().
     describeMaxBytes: 20_000,
-  },
-  // Per-tool response post-processors (S3 upload, PII strip, …).
-  processors: {
-    gmail_users_messages_attachments_get: async (result, { args }) => {
-      if (result.status !== "success" || !result.data?.data) return result;
-      const s3Url = await s3.upload(`attachments/${args.userId}/${args.id}`, result.data.data);
-      return { status: "success", data: { s3Url }, httpStatus: 200 };
+
+    // Per-tool response post-processors (S3 upload, PII strip, …).
+    processors: {
+      gmail_users_messages_attachments_get: async (result, { args }) => {
+        if (result.status !== "success" || !result.data?.data) return result;
+        const s3Url = await s3.upload(`attachments/${args.userId}/${args.id}`, result.data.data);
+        return { status: "success", data: { s3Url }, httpStatus: 200 };
+      },
     },
-  },
-  // Extra LLM-visible inputs that buildRequest ignores (processor metadata).
-  extraParameters: {
-    gmail_users_messages_attachments_get: [
-      { name: "fileName", schema: { type: "string" }, description: "Original filename." },
-    ],
+
+    // Extra LLM-visible inputs that buildRequest ignores (processor metadata).
+    extraParameters: {
+      gmail_users_messages_attachments_get: [
+        { name: "fileName", schema: { type: "string" }, description: "Original filename." },
+      ],
+    },
   },
 });
 ```

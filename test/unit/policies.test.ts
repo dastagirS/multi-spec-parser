@@ -570,6 +570,22 @@ describe("option validation guards", () => {
       );
     }
   });
+
+  it("rejects top-level config keys that belong inside options (fail loud, not silent)", () => {
+    // The report.md bug: README once placed processors/extraParameters at the
+    // top level; they'd be silently dropped. The guard turns that into an
+    // immediate TypeError with a hint.
+    for (const config of [
+      { spec: { spec: SPEC }, processors: { x: async () => ({ status: "success" as const, data: null, httpStatus: 200 }) } },
+      { spec: { spec: SPEC }, extraParameters: { x: [] } },
+    ] as never[]) {
+      assert.throws(
+        () => new MultiSpecParser(config),
+        /unknown config key "(processors|extraParameters)".*put it inside options/,
+        `expected unknown-key guard for ${JSON.stringify(config)}`,
+      );
+    }
+  });
 });
 
 describe("compile-time helpers stay coherent", () => {

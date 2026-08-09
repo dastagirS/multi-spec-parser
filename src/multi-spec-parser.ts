@@ -384,6 +384,17 @@ function validateConfig(config: MultiSpecParserConfig): void {
   if (!config || typeof config !== "object") {
     throw new TypeError("MultiSpecParser: config object required.");
   }
+  // Fail loud on unknown top-level keys: a key that the implementation
+  // never reads (e.g. processors/extraParameters at the top level instead of
+  // inside options) would otherwise no-op forever with zero signal.
+  const knownConfigKeys = ["spec", "options"];
+  for (const key of Object.keys(config)) {
+    if (!knownConfigKeys.includes(key)) {
+      throw new TypeError(
+        `MultiSpecParser: unknown config key "${key}" — config takes { spec, options }, so put it inside options.`,
+      );
+    }
+  }
   const source = config.spec;
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     throw new TypeError(
