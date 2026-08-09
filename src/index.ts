@@ -7,11 +7,19 @@
  */
 export { MultiSpecParser } from "./multi-spec-parser.js";
 export type {
+  ExecuteProcessor,
   MultiSpecParserConfig,
   MultiSpecParserOptions,
   SpecSource,
+  ToolDescription,
+  ValidationResult,
 } from "./multi-spec-parser.js";
-export type { CompiledTool, CompileResult, CompileOptions } from "./factory.js";
+export type {
+  CompileOptions,
+  CompiledTool,
+  CompileResult,
+  ExtraParameter,
+} from "./factory.js";
 export type {
   BuiltRequest,
   ExecuteOptions,

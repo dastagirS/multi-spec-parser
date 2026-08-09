@@ -51,13 +51,21 @@ export function buildRequest(
   const headers: Record<string, string> = { ...(options.headers ?? {}) };
   const baseUrl = resolveBaseUrl(options.baseUrl, op.servers, args.server);
 
-  const resolvedPath = resolvePath(op.path, args, op.parameters);
+  // Item 9: Google media uploads target the media simplePath with an
+  // uploadType query — NOT the regular op path (which 404s/400s). The
+  // consumer opts in via the request content type (octet-stream → media,
+  // multipart/related → multipart); the spec's default (JSON metadata)
+  // keeps normal calls on the regular path.
+  const uploadType = mediaUploadTypeOf(op, args);
+  const targetTemplate = uploadType ? op.mediaUpload!.simplePath ?? op.path : op.path;
+  const resolvedPath = resolvePath(targetTemplate, args, op.parameters);
   const path = resolvedPath.startsWith("/") ? resolvedPath : `/${resolvedPath}`;
 
   const queryParams = new URLSearchParams();
   for (const [name, value] of Object.entries(options.queryParams ?? {})) {
     queryParams.set(name, value);
   }
+  if (uploadType) queryParams.set("uploadType", uploadType);
   for (const param of op.parameters) {
     if (param.in !== "query") continue;
     const value = readParamValue(args, param);
@@ -103,6 +111,47 @@ export function buildRequest(
   }
 
   return { url, method: op.method, headers, ...(body !== undefined ? { body } : {}) };
+}
+
+/** Item 9: media-upload flavor when the caller opts in via content type.
+ *  undefined → regular op path. */
+function mediaUploadTypeOf(
+  op: ExtractedOperation,
+  args: Record<string, unknown>,
+): "media" | "multipart" | undefined {
+  if (!op.mediaUpload?.simplePath || !op.requestBody) return undefined;
+  const contentType = (args.contentType as string | undefined) ?? op.requestBody.contentType;
+  const base = baseContentType(contentType);
+  if (base === "application/octet-stream") return "media";
+  if (base === "multipart/related") return "multipart";
+  return undefined;
+}
+
+/** Item 9: serialize a Google multipart upload — multipart/related framing
+ *  with anonymous parts (metadata JSON + media bytes). FormData can't do
+ *  this (it forces multipart/form-data + part names), so it's hand-built:
+ *  head + raw media bytes + tail, with a random boundary. */
+function buildMultipartRelated(
+  metadata: unknown,
+  media: Uint8Array,
+  mediaType: string,
+): { body: Uint8Array; contentType: string } {
+  const boundary = `msp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const encoder = new TextEncoder();
+  const head = encoder.encode(
+    `--${boundary}\r\n` +
+      `Content-Type: application/json\r\n\r\n` +
+      `${JSON.stringify(metadata)}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Type: ${mediaType}\r\n` +
+      `Content-Transfer-Encoding: binary\r\n\r\n`,
+  );
+  const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+  const body = new Uint8Array(head.length + media.length + tail.length);
+  body.set(head, 0);
+  body.set(media, head.length);
+  body.set(tail, head.length + media.length);
+  return { body, contentType: `multipart/related; boundary=${boundary}` };
 }
 
 /** Read a param from args — direct name, or nested in a container key. */
@@ -234,6 +283,21 @@ function encodeBody(
     if (typeof raw === "string") {
       const bytes = base64ToUint8Array(raw);
       if (bytes) return { body: bytes, contentType };
+    }
+  }
+  // Item 9: Google multipart upload (uploadType=multipart): body = { metadata, media }.
+  if (base === "multipart/related" && isRecord(bodyValue)) {
+    const record = bodyValue as { metadata?: unknown; media?: unknown };
+    const mediaValue = record.media;
+    const bytes =
+      typeof mediaValue === "string"
+        ? base64ToUint8Array(mediaValue)
+        : mediaValue instanceof Uint8Array
+          ? mediaValue
+          : null;
+    if (bytes) {
+      const mediaType = op.mediaUpload?.accept?.[0] ?? "application/octet-stream";
+      return buildMultipartRelated(record.metadata ?? {}, bytes, mediaType);
     }
   }
   if (base === "application/octet-stream") {
@@ -393,10 +457,16 @@ export interface ExecuteOptions {
 }
 
 export interface ExecuteResult {
-  status: "success" | "error";
+  status: "success" | "error" | "truncated";
   data: unknown;
   httpStatus: number;
   error?: string;
+  /** Item 4: serialized size that exceeded maxResponseBytes (truncated only). */
+  size?: number;
+  /** Item 4: tool whose result was truncated (truncated only). */
+  toolName?: string;
+  /** Item 4: what the LLM/storage layer sees instead of the blob. */
+  message?: string;
 }
 
 /** Execute a built request with a timeout; JSON body parsed, text fallback.

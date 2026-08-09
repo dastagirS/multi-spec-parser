@@ -30,6 +30,10 @@ export interface CompiledTool {
   /** Success-response schema; $refs resolve against inputSchema.$defs. */
   outputSchema: Record<string, unknown> | undefined;
   operation: ExtractedOperation;
+  /** Item 7: true when the op mutates server state (POST/PUT/PATCH/DELETE). */
+  mutating: boolean;
+  /** Item 9: surfaced Google media-upload surface (was operation.mediaUpload only). */
+  mediaUpload?: ExtractedOperation["mediaUpload"];
   /** Refs that could not be resolved: top-level refs dropped at parse time
    *  (original form, e.g. #/components/parameters/X) + schema refs pruned at
    *  compile time (rewritten #/$defs/ form). Absent when none. */
@@ -53,6 +57,23 @@ export interface CompileOptions {
    * far below this and proves the closure works.
    */
   maxDefsBytes?: number;
+  /** Open compile-time filter: return true to keep an op. A filtered op never
+   *  becomes a tool — it can't be listed, described, or executed (the safety
+   *  boundary). Runs pre-dedup, so kept ops' names are unaffected by dropped
+   *  ones. Examples: readOnly → op => !op.mutating; denylist → op =>
+   *  !BLOCKED.has(op.toolName); scope-gate → op => op.requiredScopes?.includes(x). */
+  filterOps?: (op: ExtractedOperation) => boolean;
+  /** Item 5: per-tool extra input-schema properties (LLM-visible, ignored by
+   *  buildRequest, readable by processors via ctx.args). */
+  extraParameters?: Record<string, ExtraParameter[]>;
+}
+
+/** Item 5: a consumer-supplied input property merged into a tool's schema. */
+export interface ExtraParameter {
+  name: string;
+  schema: SchemaObject;
+  description?: string;
+  required?: boolean;
 }
 
 const DEFAULT_MAX_DEFS_BYTES = 1_000_000;
@@ -91,12 +112,19 @@ export function compileSpecToTools(
   const used = new Set<string>();
 
   for (const op of parsed.operations) {
+    // Open compile-time filter: return true to keep. A filtered op never
+    // becomes a tool — invisible to the LLM AND un-callable (execute() by
+    // name throws "unknown tool"). Runs before ensureUniqueName, so dropped
+    // ops consume no name slots (blocking "get" never suffixes a kept dup).
+    if (options.filterOps && !options.filterOps(op)) continue;
     const name = ensureUniqueName(op.toolName, seen, used);
+    // Item 5: merge consumer extras into the RAW input (before normalization)
+    // so their $refs get rewritten, closed over, and pruned like any other.
+    const rawInput = buildInputSchema(op, parsed.servers);
+    mergeExtraParameters(rawInput, options.extraParameters?.[op.toolName]);
     // Op-level schemas carry native refs (#/components/schemas, #/definitions);
     // rewrite them at the boundary so $refs resolve against the hoisted $defs.
-    const inputSchema = normalizeSchemaRefs(
-      buildInputSchema(op, parsed.servers),
-    ) as Record<string, unknown>;
+    const inputSchema = normalizeSchemaRefs(rawInput) as Record<string, unknown>;
     const outputSchema = op.outputSchema
       ? (normalizeSchemaRefs(op.outputSchema) as Record<string, unknown>)
       : undefined;
@@ -150,9 +178,11 @@ export function compileSpecToTools(
       description: buildDescription(op),
       method: op.method,
       path: op.path,
+      mutating: op.mutating,
       inputSchema: prunedInput,
       outputSchema: prunedOutput,
       operation: op,
+      ...(op.mediaUpload ? { mediaUpload: op.mediaUpload } : {}),
       ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
     });
   }
@@ -171,6 +201,36 @@ function buildInputSchema(
   for (const param of op.parameters) {
     setOwn(properties, param.name, param.schema);
     if (param.required) required.push(param.name);
+  }
+
+  // Item 9: media-capable ops advertise the content-type switch + raw-bytes
+  // input so an LLM can actually opt into uploadType=media / multipart. The
+  // spec's default (JSON metadata) stays, so normal calls are unchanged.
+  if (op.mediaUpload?.simplePath && op.requestBody) {
+    if (!("contentType" in properties)) {
+      const declared = op.requestBody.contentType.split(";")[0]!.trim().toLowerCase();
+      const options = [declared];
+      if (declared !== "application/octet-stream") options.push("application/octet-stream");
+      if (declared !== "multipart/related") options.push("multipart/related");
+      properties.contentType = {
+        type: "string",
+        enum: options,
+        default: op.requestBody.contentType,
+        description:
+          "Content type for the request: the spec default (metadata JSON) or a " +
+          "media upload (application/octet-stream for uploadType=media; " +
+          "multipart/related for uploadType=multipart with body { metadata, media }).",
+      };
+    }
+    if (!("bodyBase64" in properties)) {
+      properties.bodyBase64 = {
+        type: "string",
+        contentEncoding: "base64",
+        contentMediaType: op.mediaUpload.accept?.[0] ?? "application/octet-stream",
+        description:
+          "Base64-encoded raw bytes for media uploads (uploadType=media / the media part of multipart).",
+      };
+    }
   }
 
   const servers = op.servers ?? docServers;
@@ -303,6 +363,43 @@ function buildDescription(op: ExtractedOperation): string {
   }
   if (op.deprecated) parts.push("⚠️ DEPRECATED");
   return parts.join("\n\n");
+}
+
+/** Item 5: merge consumer-supplied input properties into a tool's schema. */
+function mergeExtraParameters(
+  input: Record<string, unknown>,
+  extras: ExtraParameter[] | undefined,
+): void {
+  if (!extras || extras.length === 0) return;
+  const properties = (input.properties ??= {}) as Record<string, unknown>;
+  for (const extra of extras) {
+    if (
+      !extra ||
+      typeof extra.name !== "string" ||
+      extra.name.length === 0 ||
+      typeof extra.schema !== "object" ||
+      extra.schema === null ||
+      Array.isArray(extra.schema)
+    ) {
+      throw new TypeError(
+        `compileSpecToTools: extraParameter must be { name, schema } — got ${JSON.stringify(extra)}.`,
+      );
+    }
+    if (extra.name in properties) {
+      throw new TypeError(
+        `compileSpecToTools: extraParameter "${extra.name}" collides with a spec-declared input.`,
+      );
+    }
+    setOwn(properties, extra.name, {
+      ...extra.schema,
+      ...(extra.description ? { description: extra.description } : {}),
+    });
+    if (extra.required) {
+      const required = (input.required as string[] | undefined) ?? [];
+      if (!required.includes(extra.name)) required.push(extra.name);
+      (input as Record<string, unknown>).required = required;
+    }
+  }
 }
 
 function ensureUniqueName(

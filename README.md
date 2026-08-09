@@ -2,8 +2,8 @@
 
 Parse **OpenAPI 3.0/3.1**, **Swagger 2.0**, and **Google Discovery** API specs
 into one normalized model, then compile memory-safe JSON-Schema tool
-definitions for LLM tool sets. TypeScript, zero runtime deps beyond `js-yaml`,
-no framework coupling.
+definitions for LLM tool sets. TypeScript, two tiny runtime deps
+(`js-yaml`, `ajv`), no framework coupling.
 
 ## Why
 
@@ -67,11 +67,12 @@ the public API — the exports map blocks them; everything hangs off the class.
 Runnable, copy-pasteable usage lives in [`examples/`](examples/) (also shipped in the npm tarball):
 
 ```sh
-npm run examples            # run all four
+npm run examples            # run all five
 node examples/basic.mjs     # text → model → per-tool schemas
 node examples/multi-format.mjs  # OpenAPI 3.0/3.1 + Swagger 2.0 + Google Discovery
 node examples/requests.mjs  # build + execute live requests (needs network)
 node examples/llm-tools.mjs # OpenAI-style tool definitions from a real spec
+node examples/policies.mjs  # filterOps, processors, 401 retry, truncation, validate, Standard Schema
 ```
 
 ### Build a request
@@ -136,6 +137,103 @@ JSON-variant URL).
   tool as `unresolvedRefs`.
 - **`__proto__` keys** (schema/property/param names) are preserved as own
   properties — the parser never trips the prototype trap.
+- Every tool carries a **`mutating`** flag (POST/PUT/PATCH/DELETE → true) so
+  approval/gating layers don't re-derive it from the method.
+
+## Policies & hooks
+
+All optional, all additive — the defaults behave exactly like the bare parser.
+Whatever is stack-specific (S3, OAuth, storage budgets) lives in **your**
+closure; the package only calls the hooks.
+
+```ts
+const parser = new MultiSpecParser({
+  spec: { url: GMAIL_DISCOVERY_URL },
+  options: {
+    // Open compile-time filter: return true to keep an op. A filtered op
+    // never becomes a tool — it can't be listed, described, or executed.
+    // "Read-only" is one predicate on the derived mutating flag.
+    filterOps: (op) => !op.mutating && !DESTRUCTIVE.has(op.toolName),
+
+    // 401 → refresh → retry once (or maxAuthRetries times).
+    onUnauthorized: async () => `Bearer ${await refreshToken()}`,
+    maxAuthRetries: 1,
+
+    // Uniform result-size guarantee for storage layers (e.g. DynamoDB).
+    maxResponseBytes: 250_000,
+    onTruncate: (size, toolName) => logger.warn(`${toolName}: ${size} bytes`),
+
+    // LLM-side schema budget for describeTools().
+    describeMaxBytes: 20_000,
+  },
+  // Per-tool response post-processors (S3 upload, PII strip, …).
+  processors: {
+    gmail_users_messages_attachments_get: async (result, { args }) => {
+      if (result.status !== "success" || !result.data?.data) return result;
+      const s3Url = await s3.upload(`attachments/${args.userId}/${args.id}`, result.data.data);
+      return { status: "success", data: { s3Url }, httpStatus: 200 };
+    },
+  },
+  // Extra LLM-visible inputs that buildRequest ignores (processor metadata).
+  extraParameters: {
+    gmail_users_messages_attachments_get: [
+      { name: "fileName", schema: { type: "string" }, description: "Original filename." },
+    ],
+  },
+});
+```
+
+Semantics:
+
+- **`filterOps(op) → boolean`** filters at compile time, before name dedup —
+  a filtered op consumes no name slot, it never appears in `tools()` /
+  `describeTools()`, and `execute()`/`tool()` by its name throws "unknown
+tool" (the safety boundary: a tool that doesn't exist can't be called).
+  Match on anything in the operation model: `toolName`, `method`,
+  `requiredScopes`, `tags`, `mediaUpload`.
+- **`processors`** run after fetch, before truncation; they see every result
+  (success and error) and may return any `ExecuteResult`. A throwing
+  processor — or one returning a non-`ExecuteResult` — degrades to
+  `{ status: "error", error: "Processor …" }`; `execute()` never throws.
+- **`onUnauthorized`** replaces the `Authorization` header on the retried
+  request (per-call headers win over config). A failing refresher degrades to
+  an explicit error result — no retry loop.
+- **`maxResponseBytes`** truncates *after* processors (a processor can shrink
+  the result) to `{ status: "truncated", size, toolName, message }`.
+- **`describeTools()`** is the LLM/prompt projection: full `$defs` stay on
+  `tool.inputSchema` (Ajv side); over-budget schemas drop `$defs` and expose
+  the closure's ref names as `$refs` instead. Includes the bounded
+  `outputSchema` contract per tool.
+- **`parser.validate(tool, args)`** returns `{ valid: true }` or
+  `{ valid: false, issues }` — never throws. Ajv is loaded lazily on first
+  call, so the core module stays free of a static ajv import.
+- **`toStandardSchema(tool)`** wraps a tool as the open Standard Schema
+  protocol (`~standard`) — drop-in for Mastra/Zod/Valibot/ArkType adapters,
+  with a real Ajv-backed `validate`. Imported from the **subpath**
+  `multi-spec-parser/standard-schema` (ajv is an optional dependency, so the
+  main entry never loads it).
+- **Google media uploads** are exposed on the tool as `mediaUpload`
+  (`simplePath`, `accept`), and `buildRequest` routes `contentType:
+  "application/octet-stream"` → `uploadType=media` and `"multipart/related"`
+  with `body: { metadata, media }` → `uploadType=multipart` against the
+  simple upload path.
+
+## Options reference
+
+| Option | Applies at | Default |
+|---|---|---|
+| `maxDefsBytes` | `parse()` (compile) | 1MB |
+| `filterOps` | `parse()` (compile) | keep all ops |
+| `extraParameters` | `parse()` (compile) | none |
+| `baseUrl` | `buildRequest()` / `execute()` | spec server |
+| `headers` | `buildRequest()` / `execute()` | none |
+| `executeTimeoutMs` | `execute()` | 30s |
+| `processors` | `execute()` (after fetch) | none |
+| `onUnauthorized` | `execute()` (on 401) | disabled |
+| `maxAuthRetries` | `execute()` (on 401) | 1 |
+| `maxResponseBytes` | `execute()` (after processors) | no cap |
+| `onTruncate` | `execute()` (on truncate) | none |
+| `describeMaxBytes` | `describeTools()` | 64KB |
 
 ## Releasing
 

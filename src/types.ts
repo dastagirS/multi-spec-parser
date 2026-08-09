@@ -95,6 +95,8 @@ export interface MediaUploadInfo {
   uploadType: "media" | "multipart";
   simplePath?: string;
   resumablePath?: string;
+  /** Accepted media content types from the Discovery doc (e.g. message/rfc822). */
+  accept?: string[];
 }
 
 export interface ServerVariable {
@@ -113,6 +115,10 @@ export interface ExtractedOperation {
   /** Stable tool name derived from operationId or method+path. */
   toolName: string;
   method: HttpMethod;
+  /** Derived once at parse: true for POST/PUT/PATCH/DELETE — usable in
+   *  filterOps predicates (readOnly → op => !op.mutating) and surfaced on
+   *  the compiled tool as tool.mutating. */
+  mutating: boolean;
   /** Path template, e.g. /users/{userId}/messages. */
   path: string;
   summary?: string;

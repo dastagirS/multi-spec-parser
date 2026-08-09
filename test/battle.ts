@@ -490,6 +490,50 @@ function syntheticMassive(): Record<string, unknown> {
   return { ...baseSpec("Massive"), components: { schemas }, paths };
 }
 
+/** Google Discovery with media uploads — item 9 surface + Ajv gate (4 of 12
+ *  ops are media-capable POSTs with simplePath, accept types, schema refs). */
+function syntheticGoogleMedia(): Record<string, unknown> {
+  const METHOD_COUNT = 12;
+  const methods: Record<string, unknown> = {};
+  for (let i = 0; i < METHOD_COUNT; i += 1) {
+    const isMedia = i % 3 === 0;
+    methods[`op${i}`] = {
+      id: `media.items.op${i}`,
+      path: `items/${i}`,
+      httpMethod: isMedia ? "POST" : "GET",
+      description: `op ${i}`,
+      ...(isMedia
+        ? {
+            request: { $ref: `Item${i}` },
+            supportsMediaUpload: true,
+            mediaUpload: {
+              accept: ["application/octet-stream"],
+              protocols: { simple: { multipart: true, path: `/upload/items/${i}` } },
+            },
+          }
+        : {}),
+      response: { $ref: `Item${i}` },
+    };
+  }
+  const schemas: Record<string, unknown> = {};
+  for (let i = 0; i < METHOD_COUNT; i += 1) {
+    schemas[`Item${i}`] = {
+      type: "object",
+      properties: { id: { type: "string" }, n: { type: "integer" } },
+    };
+  }
+  return {
+    kind: "discovery#restDescription",
+    name: "media",
+    version: "v1",
+    title: "Media",
+    rootUrl: "https://media.example.com/",
+    servicePath: "v1/",
+    resources: { items: { methods } },
+    schemas,
+  };
+}
+
 /** Build the synthetic ladder (best → worst) and write the spec files so the
  *  existing child probe can read them from the fixtures dir. */
 function buildSyntheticSpecs(): SpecCase[] {
@@ -567,6 +611,21 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "cyclic refs",
         defsBytesMaxBound: 100_000,
         defsBytesTotalBound: 500_000,
+        ajvFailuresBound: 0,
+        refFailuresBound: 0,
+      },
+    },
+    {
+      file: "synthetic-google-media.json",
+      build: syntheticGoogleMedia,
+      spec: {
+        name: "synthetic google media (Discovery, 12 ops — 4 media uploads)",
+        expectedOps: 12,
+        heapCapMB: 256,
+        timeoutMs: 30_000,
+        tier: "google media (Discovery)",
+        defsBytesMaxBound: 50_000,
+        defsBytesTotalBound: 150_000,
         ajvFailuresBound: 0,
         refFailuresBound: 0,
       },

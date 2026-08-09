@@ -8,6 +8,7 @@ function op(overrides: Partial<ExtractedOperation> = {}): ExtractedOperation {
   return {
     toolName: "test",
     method: "GET",
+    mutating: false,
     path: "/x",
     tags: [],
     parameters: [],
