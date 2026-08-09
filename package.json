@@ -12,7 +12,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist/src",
+    "examples"
   ],
   "sideEffects": false,
   "engines": {
@@ -23,6 +24,7 @@
     "test": "npm run build && node --test \"dist/test/unit/*.test.js\"",
     "battle": "npm run build && node dist/test/battle.js",
     "fixtures": "npm run build && node dist/test/scripts/fetch-fixtures.js",
+    "examples": "node examples/basic.mjs && node examples/multi-format.mjs && node examples/requests.mjs && node examples/llm-tools.mjs",
     "check": "npm run build && node --test \"dist/test/unit/*.test.js\" && node dist/test/battle.js"
   },
   "keywords": [

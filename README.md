@@ -27,41 +27,61 @@ npm install multi-spec-parser
 
 ## Quick start
 
+One class owns the whole lifecycle — config → parse → tools → requests:
+
 ```ts
-import { parseSpecText, compileSpecToTools } from "multi-spec-parser";
+import { MultiSpecParser } from "multi-spec-parser";
 
-// Text → object → normalized model (JSON or YAML, content-sniffed)
-const specObj = parseSpecText(specText); // specText may be JSON or YAML
+const parser = new MultiSpecParser({
+  spec: { url: "https://petstore3.swagger.io/api/v3/openapi.json" },
+  // spec source is exactly one of:
+  //   { url: "https://…" }      — fetched (content-addressed cache)
+  //   { text: "…" }            — raw JSON or YAML, content-sniffed
+  //   { spec: { … } }          — pre-parsed object
+  options: {
+    baseUrl: "https://petstore3.swagger.io", // default for requests; origin for relative servers
+    headers: { Authorization: "Bearer …" },  // default request headers
+    maxDefsBytes: 1_000_000,                 // per-tool $defs closure cap
+  },
+});
 
-// Parse any of the 4 formats into one model
-const parsed = parseSpec(specObj); // { operations, schemas, baseUrl, specFormat }
+await parser.parse();
+console.log(parser.format);   // "openapi3" | "swagger2" | "google-discovery"
 
-// Compile memory-safe tool definitions (input + output JSON Schema per op)
-const { tools, defs } = compileSpecToTools(parsed);
-for (const tool of tools) {
-  // tool.inputSchema  — JSON Schema with per-tool $defs closure (Ajv-compilable)
-  // tool.outputSchema — success-response schema, refs resolve against inputSchema.$defs
-  // tool.operation    — the normalized operation (params, requestBody, servers…)
-}
+const tool = parser.tool("findPetsByStatus");
+// tool.inputSchema  — JSON Schema with per-tool $defs closure (Ajv-compilable)
+// tool.outputSchema — success-response schema, refs resolve against inputSchema.$defs
+// tool.operation    — the normalized operation (params, requestBody, servers…)
+
+// Build a request, or build + execute in one step:
+const req = parser.buildRequest("findPetsByStatus", { status: "available" });
+const res = await parser.execute("findPetsByStatus", { status: "available" });
+// res = { status: "success" | "error", httpStatus, data, error? }
 ```
 
-### From a URL or text, cached
+The internal functions (`parseSpec`, `compileSpecToTools`, …) are not part of
+the public API — the exports map blocks them; everything hangs off the class.
 
-```ts
-import { compileSpecSource } from "multi-spec-parser";
+## Examples
 
-const { tools } = await compileSpecSource("https://petstore3.swagger.io/api/v3/openapi.json");
+Runnable, copy-pasteable usage lives in [`examples/`](examples/) (also shipped in the npm tarball):
+
+```sh
+npm run examples            # run all four
+node examples/basic.mjs     # text → model → per-tool schemas
+node examples/multi-format.mjs  # OpenAPI 3.0/3.1 + Swagger 2.0 + Google Discovery
+node examples/requests.mjs  # build + execute live requests (needs network)
+node examples/llm-tools.mjs # OpenAI-style tool definitions from a real spec
 ```
 
 ### Build a request
 
 ```ts
-import { buildRequest } from "multi-spec-parser";
-
-const req = buildRequest(tool.operation, { petId: "5", body: { name: "Rex" } }, {
-  baseUrl: "https://api.example.com",
-  headers: { Authorization: "Bearer …" },
-});
+const req = parser.buildRequest(
+  "addPet",                       // tool name or CompiledTool
+  { body: { name: "Rex", photoUrls: ["https://example.com/rex.jpg"] } },
+  { headers: { "X-Trace": "abc" } }, // per-call options merge over config defaults
+);
 // req = { url, method, headers, body }
 ```
 
@@ -70,7 +90,9 @@ deepObject), `allowReserved` path encoding, form-urlencoded / multipart /
 octet-stream bodies, `bodyBase64` media uploads, cookie params, server URL
 `{variables}` substitution. JSON/octet-stream bodies nest under a `body` key;
 form-style bodies (urlencoded/multipart, e.g. Slack's `formData`) are exposed
-as flat top-level fields and serialized accordingly.
+as flat top-level fields and serialized accordingly. A relative spec server
+(e.g. petstore3's `/api/v3`) resolves against the `baseUrl` override as
+origin; absolute servers are replaced outright.
 
 ## Formats
 
@@ -92,8 +114,9 @@ JSON-variant URL).
   output schemas (`collectReachableDefs`).
 - Tools whose closure exceeds `maxDefsBytes` (default 1MB) share the hoisted
   defs map by reference instead — Ajv compiles against it without mutating.
-- `compileSpecSource` content-addresses parsed+compiled results (WeakMap for
-  objects, Map for text/URLs).
+- `parse` content-addresses parsed results (WeakMap for objects, Map for
+text/URLs), so a multi-MB spec (GitHub 12.9MB) parses once per process even
+across MultiSpecParser instances.
 
 ## Tests
 

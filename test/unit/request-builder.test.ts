@@ -228,6 +228,32 @@ describe("buildRequest", () => {
     assert.equal(request.headers["Content-Type"], "multipart/form-data");
   });
 
+  it("resolves a relative spec server against the baseUrl override", () => {
+    const request = buildRequest(
+      op({
+        method: "GET",
+        path: "/pet/findByStatus",
+        servers: [{ url: "/api/v3" }],
+      }),
+      {},
+      { baseUrl: "https://petstore3.swagger.io" },
+    );
+    assert.equal(request.url, "https://petstore3.swagger.io/api/v3/pet/findByStatus");
+  });
+
+  it("replaces absolute spec servers with the baseUrl override", () => {
+    const request = buildRequest(
+      op({
+        method: "GET",
+        path: "/pets",
+        servers: [{ url: "https://original.example.com/v1" }],
+      }),
+      {},
+      { baseUrl: "https://override.example.com" },
+    );
+    assert.equal(request.url, "https://override.example.com/pets");
+  });
+
   it("decodes bodyBase64 for octet-stream bodies (media upload)", () => {
     const request = buildRequest(
       op({

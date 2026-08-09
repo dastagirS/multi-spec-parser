@@ -251,42 +251,51 @@ function ensureUniqueName(candidate: string, seen: Map<string, number>): string 
 // Source-level convenience with content-addressed caching
 // ---------------------------------------------------------------------------
 
-interface SourceCacheEntry {
-  parsed: ParsedSpec;
-  compiled: CompileResult;
-}
-
-const textCache = new Map<string, SourceCacheEntry>();
-const objectCache = new WeakMap<object, SourceCacheEntry>();
+const textCache = new Map<string, ParsedSpec>();
+let objectCache = new WeakMap<object, ParsedSpec>();
 
 /**
- * Parse + compile a spec from URL text or a pre-parsed object. Content-
- * addressed: identical text/URL yields the same parsed+compiled result, so a
- * multi-MB spec (GitHub 12.9MB) is parsed once per process instead of per call.
+ * Load a spec source (URL, raw text, or pre-parsed object) into a parsed
+ * model + compiled tools. Parse is content-addressed (identical URL/text
+ * parses once per process — a 12.9MB GitHub spec parses once); compile runs
+ * fresh per call so per-call options (maxDefsBytes) always apply.
+ */
+export async function loadSpecSource(
+  source: string | Record<string, unknown>,
+  options: CompileOptions = {},
+): Promise<{ parsed: ParsedSpec; compiled: CompileResult }> {
+  if (typeof source !== "string") {
+    let parsed = objectCache.get(source);
+    if (!parsed) {
+      parsed = parseSpec(source);
+      objectCache.set(source, parsed);
+    }
+    return { parsed, compiled: compileSpecToTools(parsed, options) };
+  }
+  let parsed = textCache.get(source);
+  if (!parsed) {
+    const text = source.startsWith("http://") || source.startsWith("https://")
+      ? await fetchSpecText(source)
+      : source;
+    parsed = parseSpec(parseSpecText(text));
+    textCache.set(source, parsed);
+  }
+  return { parsed, compiled: compileSpecToTools(parsed, options) };
+}
+
+/**
+ * Parse + compile a spec from URL text or a pre-parsed object. Convenience
+ * one-shot for callers who don't need the MultiSpecParser lifecycle.
  */
 export async function compileSpecSource(
   source: string | Record<string, unknown>,
+  options: CompileOptions = {},
 ): Promise<CompileResult> {
-  if (typeof source !== "string") {
-    const hit = objectCache.get(source);
-    if (hit) return hit.compiled;
-    const parsed = parseSpec(source);
-    const compiled = compileSpecToTools(parsed);
-    objectCache.set(source, { parsed, compiled });
-    return compiled;
-  }
-  const hit = textCache.get(source);
-  if (hit) return hit.compiled;
-  const text = source.startsWith("http://") || source.startsWith("https://")
-    ? await fetchSpecText(source)
-    : source;
-  const parsed = parseSpec(parseSpecText(text));
-  const compiled = compileSpecToTools(parsed);
-  textCache.set(source, { parsed, compiled });
-  return compiled;
+  return (await loadSpecSource(source, options)).compiled;
 }
 
 /** Test-only: drop cached entries so tests observe cold-cache behavior. */
 export function clearSpecCache(): void {
   textCache.clear();
+  objectCache = new WeakMap();
 }

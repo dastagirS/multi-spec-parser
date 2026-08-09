@@ -343,7 +343,20 @@ function resolveBaseUrl(
   servers: ServerInfo[] | undefined,
   serverArg: unknown,
 ): string {
-  if (override) return override.replace(/\/+$/, "");
+  if (override) {
+    const server = servers?.[0];
+    // Relative spec servers (petstore3 ships "/api/v3") resolve against the
+    // override as origin; absolute servers are replaced outright.
+    if (server?.url.startsWith("/")) {
+      try {
+        const origin = override.endsWith("/") ? override : `${override}/`;
+        return new URL(server.url, origin).toString().replace(/\/+$/, "");
+      } catch {
+        // Non-URL override (e.g. a bare host) — fall through to plain override.
+      }
+    }
+    return override.replace(/\/+$/, "");
+  }
   const server = servers?.[0];
   if (!server) return "";
   let url = server.url;
