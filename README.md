@@ -5,6 +5,14 @@ into one normalized model, then compile memory-safe JSON-Schema tool
 definitions for LLM tool sets. TypeScript, two tiny runtime deps
 (`js-yaml`, `ajv`), no framework coupling.
 
+> ⚠️ **WIP — expect breaking changes.** This package is pre-1.0 (`0.x`). The
+> API is still settling: new features land in minor versions, and breaking
+> changes can too (per semver convention for `0.x`). Pin an exact version
+> (`multi-spec-parser@0.2.1`) and re-check the README before upgrading.
+> The compiled-tool fields `name`/`method`/`path`/`inputSchema`/
+> `outputSchema`/`mutating` are the stable core; `operation()` and other
+> internals may change shape.
+
 ## Why
 
 Building LLM tools from real-world specs hits three walls:
