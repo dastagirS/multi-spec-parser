@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# npm pack artifacts
+*.tgz
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor junk
+.DS_Store
+*.log
+
+# Test coverage
+coverage/
+
+# Battle-test fixtures: ~22MB of re-fetchable upstream spec snapshots.
+# Restore with `npm run fixtures` (see test/scripts/fetch-fixtures.ts).
+test/fixtures/
