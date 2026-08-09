@@ -68,7 +68,9 @@ const req = buildRequest(tool.operation, { petId: "5", body: { name: "Rex" } }, 
 Full OAS3 serialization: `style`/`explode` (form, spaceDelimited, pipeDelimited,
 deepObject), `allowReserved` path encoding, form-urlencoded / multipart /
 octet-stream bodies, `bodyBase64` media uploads, cookie params, server URL
-`{variables}` substitution.
+`{variables}` substitution. JSON/octet-stream bodies nest under a `body` key;
+form-style bodies (urlencoded/multipart, e.g. Slack's `formData`) are exposed
+as flat top-level fields and serialized accordingly.
 
 ## Formats
 
@@ -97,14 +99,15 @@ JSON-variant URL).
 
 ```sh
 npm test     # unit tests (node:test)
-npm run battle  # battle suite: 5 real specs in heap-capped child processes
+npm run battle  # battle suite: 7 real specs in heap-capped child processes
 ```
 
 The battle suite is the gate: GitHub (1220 ops) must parse + compile under a
-**1GB heap cap** (the old pipeline OOM'd at 4GB), all 5 specs must hit exact op
-counts, every tool's input schema must compile under Ajv with all `$ref`s
-resolvable, and the parent process stays light (children own the heavy work,
-with per-spec timeouts and a fail-fast watchdog).
+**1GB heap cap** (the old pipeline OOM'd at 4GB), all 7 specs must hit exact op
+counts (incl. Slack's official Swagger 2.0 Web API spec and the Booking.com
+YAML download), every tool's input schema must compile under Ajv with all
+`$ref`s resolvable, and the parent process stays light (children own the heavy
+work, with per-spec timeouts and a fail-fast watchdog).
 
 ## License
 

@@ -123,9 +123,34 @@ function buildInputSchema(
   if (op.requestBody) {
     const rb = op.requestBody;
     const contents = rb.contents;
-    const isOctet =
-      rb.contentType.split(";")[0]!.trim().toLowerCase() === "application/octet-stream";
-    if (rb.schema) properties.body = rb.schema;
+    const base = rb.contentType.split(";")[0]!.trim().toLowerCase();
+    const isOctet = base === "application/octet-stream";
+    const isForm = base === "application/x-www-form-urlencoded" || base === "multipart/form-data";
+    // Form-style bodies are flat HTTP fields (Slack formData), so expose them
+    // top-level instead of nesting under `body`. Fall back to nesting when the
+    // schema isn't an object with properties, or a name collides with a param.
+    const formProps =
+      isForm && rb.schema?.type === "object" && rb.schema.properties
+        ? rb.schema.properties
+        : undefined;
+    const reserved = [
+      ...Object.keys(properties),
+      ...(contents && contents.length > 1 ? ["contentType"] : []),
+    ];
+    const canFlatten =
+      formProps !== undefined &&
+      Object.keys(formProps).length > 0 &&
+      !Object.keys(formProps).some((name) => reserved.includes(name));
+    if (canFlatten) {
+      for (const [name, schema] of Object.entries(formProps)) {
+        properties[name] = schema;
+      }
+      for (const name of rb.schema!.required ?? []) {
+        if (!required.includes(name)) required.push(name);
+      }
+    } else if (rb.schema) {
+      properties.body = rb.schema;
+    }
     if (isOctet) {
       properties.bodyBase64 = {
         type: "string",
@@ -135,7 +160,8 @@ function buildInputSchema(
       };
     }
     if (rb.required) {
-      required.push(isOctet && rb.schema ? "bodyBase64" : "body");
+      if (isOctet && rb.schema) required.push("bodyBase64");
+      else if (properties.body !== undefined) required.push("body");
     }
     if (contents && contents.length > 1) {
       properties.contentType = {

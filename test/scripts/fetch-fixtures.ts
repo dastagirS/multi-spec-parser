@@ -38,6 +38,10 @@ const FIXTURES: Array<{ file: string; url: string }> = [
     file: "swagger2.json",
     url: "https://petstore.swagger.io/v2/swagger.json",
   },
+  {
+    file: "slack.json",
+    url: "https://raw.githubusercontent.com/slackapi/slack-api-specs/refs/heads/master/web-api/slack_web_openapi_v2_without_examples.json",
+  },
 ];
 
 const force = process.argv.includes("--force");

@@ -10,6 +10,7 @@ import type {
   ExtractedOperation,
   HttpMethod,
   NormalizedParameter,
+  NormalizedRequestBody,
   ServerInfo,
 } from "./types.js";
 
@@ -208,8 +209,16 @@ function encodeBody(
 ): { body?: string | FormData | Uint8Array; contentType: string } {
   const rb = op.requestBody!;
   const contentType = (args.contentType as string | undefined) ?? rb.contentType;
-  const base = contentType.split(";")[0]!.trim().toLowerCase();
-  const bodyValue = args.body ?? args.input;
+  const base = baseContentType(contentType);
+
+  // Flattened form bodies (Slack-style formData): the tool schema exposes form
+  // fields at the top level of args, not under `body`. Pick those fields out so
+  // `server`/`contentType`/param keys never leak into the serialized body.
+  const isForm =
+    base === "application/x-www-form-urlencoded" || base === "multipart/form-data";
+  const formFieldNames = isForm ? formFieldNamesOf(rb) : [];
+  const pickedForm = formFieldNames.length > 0 ? pickKeys(args, formFieldNames) : undefined;
+  const bodyValue = args.body ?? pickedForm ?? args.input;
 
   // Media upload (Google uploadType=media): bytes via bodyBase64 or raw string.
   if (op.mediaUpload && base === "application/octet-stream") {
@@ -271,6 +280,32 @@ function encodeBody(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function baseContentType(value: string): string {
+  return value.split(";")[0]!.trim().toLowerCase();
+}
+
+/** Form-field names of a form-style body schema (empty when not object-typed). */
+function formFieldNamesOf(rb: NormalizedRequestBody): string[] {
+  if (rb.schema?.type !== "object" || !rb.schema.properties) return [];
+  return Object.keys(rb.schema.properties);
+}
+
+/** Pick args entries by name; undefined when nothing matched (→ no body). */
+function pickKeys(
+  source: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  let picked = 0;
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      out[key] = source[key];
+      picked += 1;
+    }
+  }
+  return picked > 0 ? out : undefined;
 }
 
 /** Copy a Uint8Array into a fresh ArrayBuffer — Node's BodyInit types reject

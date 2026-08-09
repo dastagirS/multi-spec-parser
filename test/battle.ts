@@ -87,6 +87,17 @@ const SPECS: SpecCase[] = [
     refFailuresBound: 0,
   },
   {
+    name: "slack (Swagger 2.0, 174 ops — official Web API spec)",
+    file: "slack.json",
+    expectedOps: 174,
+    heapCapMB: 512,
+    timeoutMs: 60_000,
+    defsBytesMaxBound: 100_000,
+    defsBytesTotalBound: 1_000_000,
+    ajvFailuresBound: 0,
+    refFailuresBound: 0,
+  },
+  {
     name: "swagger2 petstore (2.0 conversion)",
     file: "swagger2.json",
     expectedOps: 20,
@@ -182,7 +193,7 @@ async function main(): Promise<void> {
   }
 
   console.log("=".repeat(88));
-  console.log("BATTLE SUITE — 6 real specs (JSON + YAML), parse → compile → Ajv, heap-capped children");
+  console.log("BATTLE SUITE — 7 real specs (JSON + YAML), parse → compile → Ajv, heap-capped children");
   console.log("=".repeat(88));
 
   let failures = 0;

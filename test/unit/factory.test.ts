@@ -86,7 +86,33 @@ describe("compileSpecToTools", () => {
     assert.ok(upload, "expected uploadImage op");
     const props = upload.inputSchema.properties as Record<string, unknown>;
     assert.equal(props.bodyBase64, undefined); // multipart, not octet
-    assert.ok(props.body, "multipart body property present");
+    assert.equal(props.body, undefined); // form fields flattened, not nested
+    assert.equal((props.file as { format?: string }).format, "binary");
+    assert.ok(props.additionalMetadata, "form field flattened to top level");
+    // file is optional in the fixture — only petId is required.
+    assert.deepEqual(upload.inputSchema.required, ["petId"]);
+  });
+
+  it("flattens Slack's formData bodies to top-level tool properties", () => {
+    const parsed = parseSpec(fixture("slack.json"));
+    const { tools } = compileSpecToTools(parsed);
+    assert.equal(tools.length, 174);
+    const approve = tools.find((t) => t.name === "admin_apps_approve");
+    assert.ok(approve, "expected admin_apps_approve");
+    const approveProps = approve.inputSchema.properties as Record<string, unknown>;
+    assert.equal(approveProps.body, undefined);
+    assert.ok(approveProps.app_id, "formData field at top level");
+    assert.ok(approveProps.request_id, "formData field at top level");
+    assert.ok(approveProps.token, "header param stays top-level");
+    const upload = tools.find((t) => t.name === "files_upload");
+    assert.ok(upload, "expected files_upload");
+    const uploadProps = upload.inputSchema.properties as Record<string, unknown>;
+    assert.equal(uploadProps.body, undefined);
+    // Slack declares `file` as a plain string (no type:file anywhere in the
+    // spec) — assert the source's own typing, not an assumed binary format.
+    assert.equal((uploadProps.file as { type?: string }).type, "string");
+    assert.ok(uploadProps.channels, "file-upload form field at top level");
+    assert.ok(uploadProps.filename);
   });
 
   it("renames duplicate tool names deterministically", () => {

@@ -177,6 +177,57 @@ describe("buildRequest", () => {
     assert.equal(request.headers["Content-Type"], "multipart/form-data");
   });
 
+  it("serializes flattened urlencoded form fields from top-level args", () => {
+    const request = buildRequest(
+      op({
+        method: "POST",
+        path: "/survey",
+        requestBody: {
+          required: false,
+          contentType: "application/x-www-form-urlencoded",
+          schema: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+      }),
+      // Top-level form fields; `server` must NOT leak into the body.
+      { name: "Amy Smith", tags: ["a", "b"], server: { url: "https://other.example.com" } },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.equal(String(request.body), "name=Amy%20Smith&tags=a&tags=b");
+    assert.equal(request.headers["Content-Type"], "application/x-www-form-urlencoded");
+  });
+
+  it("builds FormData from flattened multipart form fields", () => {
+    const request = buildRequest(
+      op({
+        method: "POST",
+        path: "/upload",
+        requestBody: {
+          required: false,
+          contentType: "multipart/form-data",
+          schema: {
+            type: "object",
+            properties: {
+              note: { type: "string" },
+              file: { type: "string", format: "binary" },
+            },
+          },
+        },
+      }),
+      { note: "hi", file: new Blob(["abc"]), server: { url: "https://other.example.com" } },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.ok(request.body instanceof FormData);
+    assert.equal(request.body.get("note"), "hi");
+    assert.ok(request.body.get("file") instanceof Blob);
+    assert.equal(request.headers["Content-Type"], "multipart/form-data");
+  });
+
   it("decodes bodyBase64 for octet-stream bodies (media upload)", () => {
     const request = buildRequest(
       op({
