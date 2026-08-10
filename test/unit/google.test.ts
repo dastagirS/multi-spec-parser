@@ -170,17 +170,4 @@ describe("Google Discovery adapter", () => {
     const parsed = parseSpec(doc as unknown as Record<string, unknown>);
     assert.deepEqual(parsed.schemas.Message!.required, ["id"]);
   });
-
-  it("surfaces media upload info (uploadType=media)", () => {
-    const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
-    const send = parsed.operations.find((o) => o.toolName === "mail_users_messages_send")!;
-    assert.equal(send.mediaUpload?.uploadType, "media");
-    assert.ok(send.mediaUpload?.simplePath?.includes("/upload/gmail/"));
-    assert.ok(send.mediaUpload?.resumablePath?.includes("/resumable/upload/"));
-    // Downloads (supportsMediaDownload only) are NOT uploads.
-    const attachment = parsed.operations.find(
-      (o) => o.toolName === "mail_users_messages_attachments_get",
-    )!;
-    assert.equal(attachment.mediaUpload, undefined);
-  });
 });

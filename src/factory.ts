@@ -30,8 +30,6 @@ export interface CompiledTool {
   /** Success-response schema; $refs resolve against inputSchema.$defs. */
   outputSchema: Record<string, unknown> | undefined;
   operation: ExtractedOperation;
-  /** Item 9: surfaced Google media-upload surface (was operation.mediaUpload only). */
-  mediaUpload?: ExtractedOperation["mediaUpload"];
   /** Refs that could not be resolved: top-level refs dropped at parse time
    *  (original form, e.g. #/components/parameters/X) + schema refs pruned at
    *  compile time (rewritten #/$defs/ form). Absent when none. */
@@ -179,7 +177,6 @@ export function compileSpecToTools(
       inputSchema: prunedInput,
       outputSchema: prunedOutput,
       operation: op,
-      ...(op.mediaUpload ? { mediaUpload: op.mediaUpload } : {}),
       ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
     });
   }
@@ -198,36 +195,6 @@ function buildInputSchema(
   for (const param of op.parameters) {
     setOwn(properties, param.name, param.schema);
     if (param.required) required.push(param.name);
-  }
-
-  // Item 9: media-capable ops advertise the content-type switch + raw-bytes
-  // input so an LLM can actually opt into uploadType=media / multipart. The
-  // spec's default (JSON metadata) stays, so normal calls are unchanged.
-  if (op.mediaUpload?.simplePath && op.requestBody) {
-    if (!("contentType" in properties)) {
-      const declared = op.requestBody.contentType.split(";")[0]!.trim().toLowerCase();
-      const options = [declared];
-      if (declared !== "application/octet-stream") options.push("application/octet-stream");
-      if (declared !== "multipart/related") options.push("multipart/related");
-      properties.contentType = {
-        type: "string",
-        enum: options,
-        default: op.requestBody.contentType,
-        description:
-          "Content type for the request: the spec default (metadata JSON) or a " +
-          "media upload (application/octet-stream for uploadType=media; " +
-          "multipart/related for uploadType=multipart with body { metadata, media }).",
-      };
-    }
-    if (!("bodyBase64" in properties)) {
-      properties.bodyBase64 = {
-        type: "string",
-        contentEncoding: "base64",
-        contentMediaType: op.mediaUpload.accept?.[0] ?? "application/octet-stream",
-        description:
-          "Base64-encoded raw bytes for media uploads (uploadType=media / the media part of multipart).",
-      };
-    }
   }
 
   const servers = op.servers ?? docServers;
@@ -423,17 +390,25 @@ function ensureUniqueName(
 // Source-level convenience with content-addressed caching
 // ---------------------------------------------------------------------------
 
-const textCache = new Map<string, ParsedSpec>();
+const textCache = new Map<string, LoadedSpec>();
 let objectCache = new WeakMap<object, ParsedSpec>();
 // In-flight string-source loads: two concurrent loads of the same URL must
 // fetch + parse once, not twice (PR6).
-const inflightText = new Map<string, Promise<ParsedSpec>>();
+const inflightText = new Map<string, Promise<LoadedSpec>>();
+
+/** A loaded string source: the raw parsed document (JSON/YAML → object, pre-
+ *  normalization — what parser.parse() returns for typed access) + the
+ *  normalized model derived from it. */
+interface LoadedSpec {
+  document: Record<string, unknown>;
+  parsed: ParsedSpec;
+}
 
 // Bounded LRU: a long-lived process loading many distinct specs shouldn't
 // retain every raw text + parsed model forever (G2). Re-insert on hit.
 const TEXT_CACHE_MAX = 32;
 
-function textCacheGet(key: string): ParsedSpec | undefined {
+function textCacheGet(key: string): LoadedSpec | undefined {
   const hit = textCache.get(key);
   if (hit !== undefined) {
     textCache.delete(key);
@@ -442,9 +417,9 @@ function textCacheGet(key: string): ParsedSpec | undefined {
   return hit;
 }
 
-function textCacheSet(key: string, parsed: ParsedSpec): void {
+function textCacheSet(key: string, loaded: LoadedSpec): void {
   textCache.delete(key);
-  textCache.set(key, parsed);
+  textCache.set(key, loaded);
   if (textCache.size > TEXT_CACHE_MAX) {
     const oldest = textCache.keys().next().value;
     if (oldest !== undefined) textCache.delete(oldest);
@@ -460,38 +435,42 @@ function textCacheSet(key: string, parsed: ParsedSpec): void {
 export async function loadSpecSource(
   source: string | Record<string, unknown>,
   options: CompileOptions = {},
-): Promise<{ parsed: ParsedSpec; compiled: CompileResult }> {
+): Promise<{ document: Record<string, unknown>; parsed: ParsedSpec; compiled: CompileResult }> {
   if (typeof source !== "string") {
+    // The raw document of an object source IS the passed object (identity —
+    // parser.parse() returns it typed as the consumer's spec).
     let parsed = objectCache.get(source);
     if (!parsed) {
       parsed = parseSpec(source);
       objectCache.set(source, parsed);
     }
-    return { parsed, compiled: compileSpecToTools(parsed, options) };
+    return { document: source, parsed, compiled: compileSpecToTools(parsed, options) };
   }
-  let parsed = textCacheGet(source);
-  if (parsed) return { parsed, compiled: compileSpecToTools(parsed, options) };
+  const cached = textCacheGet(source);
+  if (cached) return { ...cached, compiled: compileSpecToTools(cached.parsed, options) };
   const existing = inflightText.get(source);
   if (existing) {
     const shared = await existing;
-    return { parsed: shared, compiled: compileSpecToTools(shared, options) };
+    return { ...shared, compiled: compileSpecToTools(shared.parsed, options) };
   }
-  const promise = (async (): Promise<ParsedSpec> => {
+  const promise = (async (): Promise<LoadedSpec> => {
     const text =
       source.startsWith("http://") || source.startsWith("https://")
         ? await fetchSpecText(source)
         : source;
-    const parsedSpec = parseSpec(parseSpecText(text));
-    textCacheSet(source, parsedSpec);
-    return parsedSpec;
+    const document = parseSpecText(text);
+    const loaded: LoadedSpec = { document, parsed: parseSpec(document) };
+    textCacheSet(source, loaded);
+    return loaded;
   })();
   inflightText.set(source, promise);
+  let loaded: LoadedSpec;
   try {
-    parsed = await promise;
+    loaded = await promise;
   } finally {
     inflightText.delete(source);
   }
-  return { parsed, compiled: compileSpecToTools(parsed, options) };
+  return { ...loaded, compiled: compileSpecToTools(loaded.parsed, options) };
 }
 
 /**

@@ -524,7 +524,7 @@ function swagger2OutputSchema(
 function parseGoogleDiscovery(doc: GoogleDiscoveryDoc): ParsedSpec {
   // Modern docs carry servicePath (Gmail: rootUrl=https://gmail.googleapis.com/,
   // servicePath=""); basePath is legacy. Prefer servicePath, fall back to basePath.
-  const baseUrl = doc.rootUrl.replace(/\/+$/, "") + (doc.servicePath ?? doc.basePath ?? "/");
+  const baseUrl = googleBaseUrl(doc);
 
   const schemas: Record<string, SchemaObject> = {};
   for (const [name, gs] of Object.entries(doc.schemas ?? {})) {
@@ -545,6 +545,17 @@ function parseGoogleDiscovery(doc: GoogleDiscoveryDoc): ParsedSpec {
     description: doc.description,
     version: doc.version,
   };
+}
+
+/** rootUrl + servicePath/basePath joined with exactly one separator. Real
+ *  Discovery docs use servicePath "v4/" (NO leading slash) — the naive
+ *  concat rootUrl.replace(/\/+$/,"") + servicePath produced
+ *  "https://sheets.googleapis.comv4/". Legacy basePath ("\/calendar\/v3\/") and
+ *  the fixture's "/v1/" both carry a leading slash — strip it, join once. */
+function googleBaseUrl(doc: GoogleDiscoveryDoc): string {
+  const root = doc.rootUrl.replace(/\/+$/, "");
+  const path = (doc.servicePath ?? doc.basePath ?? "").replace(/^\/+/, "");
+  return path.length > 0 ? `${root}/${path}` : `${root}/`;
 }
 
 function walkGoogleResources(
@@ -611,18 +622,6 @@ function googleMethodToOperation(
     ? { $ref: `#/components/schemas/${method.response.$ref}` }
     : undefined;
 
-  const simplePath = method.mediaUpload?.protocols?.simple?.path;
-  const resumablePath = method.mediaUpload?.protocols?.resumable?.path;
-  const mediaUpload =
-    method.supportsMediaUpload === true && (simplePath || resumablePath)
-      ? {
-          uploadType: "media" as const,
-          ...(simplePath ? { simplePath } : {}),
-          ...(resumablePath ? { resumablePath } : {}),
-          ...(method.mediaUpload?.accept ? { accept: method.mediaUpload.accept } : {}),
-        }
-      : undefined;
-
   return {
     toolName,
     method: (method.httpMethod || "GET").toUpperCase() as HttpMethod,
@@ -634,9 +633,8 @@ function googleMethodToOperation(
     requestBody,
     outputSchema,
     deprecated: false,
-    servers: [{ url: doc.rootUrl.replace(/\/+$/, "") + (doc.servicePath ?? doc.basePath ?? "/") }],
+    servers: [{ url: googleBaseUrl(doc) }],
     requiredScopes: method.scopes,
-    ...(mediaUpload ? { mediaUpload } : {}),
   };
 }
 

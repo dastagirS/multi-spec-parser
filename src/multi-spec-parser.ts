@@ -28,11 +28,12 @@ import type { ExtractedOperation, ParsedSpec, SchemaObject, SpecFormat } from ".
 import type { ValidateFunction } from "ajv";
 
 /** Exactly one spec source. URL fetches (content-addressed cache); text is raw
- *  JSON or YAML (sniffed, never extension-guessed); spec is a pre-parsed object. */
-export type SpecSource =
+ *  JSON or YAML (sniffed, never extension-guessed); spec is a pre-parsed object.
+ *  T is the spec's own shape for object sources (parse() returns it typed). */
+export type SpecSource<T = Record<string, unknown>> =
   | { url: string }
   | { text: string }
-  | { spec: Record<string, unknown> };
+  | { spec: T };
 
 export interface MultiSpecParserOptions {
   /** Cap on a tool's per-tool $defs JSON size (default 1MB; see CompileOptions). */
@@ -92,8 +93,8 @@ export type ValidationResult =
   | { valid: true }
   | { valid: false; issues: Array<{ message: string }> };
 
-export interface MultiSpecParserConfig {
-  spec: SpecSource;
+export interface MultiSpecParserConfig<T = Record<string, unknown>> {
+  spec: SpecSource<T>;
   options?: MultiSpecParserOptions;
 }
 
@@ -108,31 +109,43 @@ const DEFAULT_DESCRIBE_MAX_BYTES = 64 * 1024;
 // the only place ajv is required at module load.
 const validators = new WeakMap<CompiledTool, ValidateFunction>();
 
-export class MultiSpecParser {
-  private readonly source: SpecSource;
+export class MultiSpecParser<
+  T extends Record<string, unknown> = Record<string, unknown>,
+> {
+  private readonly source: SpecSource<T>;
   private readonly options: MultiSpecParserOptions;
   private parsed: ParsedSpec | undefined;
   private compiled: CompileResult | undefined;
+  /** The raw parsed document (JSON/YAML → object, pre-normalization) that
+   *  parse() returns — typed as T for object sources. */
+  private raw: T | undefined;
 
-  constructor(config: MultiSpecParserConfig) {
+  constructor(config: MultiSpecParserConfig<T>) {
     validateConfig(config);
     this.source = config.spec;
     this.options = config.options ?? {};
   }
 
   /** Load (fetch if URL) + parse. Memoized: repeated calls return the cached
-   *  model. Returns the normalized ParsedSpec. */
-  async parse(): Promise<ParsedSpec> {
-    if (this.parsed) return this.parsed;
+   *  model. Returns the RAW parsed document, typed to the input spec for
+   *  object sources — the parser's view of the underlying schema:
+   *
+   *     const { resources } = await parser.parse();
+   *
+   *  (URL/text sources are Record<string, unknown>; pass an explicit generic
+   *  to type them: new MultiSpecParser<MyType>({ spec: { url } })). */
+  async parse(): Promise<T> {
+    if (this.parsed) return this.raw as T;
     const source = this.sourceAsInput();
-    const { parsed, compiled } = await loadSpecSource(source, {
+    const { document, parsed, compiled } = await loadSpecSource(source, {
       maxDefsBytes: this.options.maxDefsBytes,
       filterOps: this.options.filterOps,
       extraParameters: this.options.extraParameters,
     });
+    this.raw = document as T;
     this.parsed = parsed;
     this.compiled = compiled;
-    return parsed;
+    return this.raw;
   }
 
   /** Detected dialect (openapi3 / swagger2 / google-discovery). */
@@ -349,8 +362,8 @@ export class MultiSpecParser {
 
   /** The normalized operation behind a tool (params, requestBody, servers…).
    *  NOTE: internal model — its shape may change in minor versions. Persist or
-   *  key on the stable tool fields (name/method/path/inputSchema/outputSchema/
-   *  mediaUpload), not on operation internals. */
+   *  key on the stable tool fields (name/method/path/inputSchema/outputSchema),
+   *  not on operation internals. */
   operation(tool: string | CompiledTool): CompiledTool["operation"] {
     return this.resolveTool(tool).operation;
   }

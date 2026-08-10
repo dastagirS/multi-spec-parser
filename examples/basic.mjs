@@ -62,9 +62,11 @@ components:
 const parser = new MultiSpecParser({ spec: { text: yaml } });
 
 // Load + parse (idempotent — repeated calls return the cached model).
-const parsed = await parser.parse();
+// parse() returns the RAW document, typed to the input spec; the compiled
+// tools + model live on the parser.
+await parser.parse();
 console.log("format:", parser.format);
-console.log("operations:", parsed.operations.length, "| baseUrl:", parser.baseUrl);
+console.log("operations:", parser.tools().length, "| baseUrl:", parser.baseUrl);
 
 // Memory-safe tool definitions: each tool's schema carries only its own
 // reachable $ref closure as $defs, not the whole spec.

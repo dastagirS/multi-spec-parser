@@ -294,6 +294,37 @@ describe("buildRequest", () => {
     assert.equal(request.body, "<x/>");
   });
 
+  it("builds against an override path template (path option)", () => {
+    const request = buildRequest(
+      op({
+        method: "POST",
+        path: "/users/{userId}/messages/send",
+        parameters: [
+          { name: "userId", in: "path", required: true, schema: {} },
+        ],
+      }),
+      { userId: "me" },
+      {
+        baseUrl: "https://api.example.com",
+        // A Google Discovery media-upload path shares the op's placeholders.
+        path: "/upload/mail/v1/users/{userId}/messages/send",
+      },
+    );
+    assert.equal(
+      request.url,
+      "https://api.example.com/upload/mail/v1/users/me/messages/send",
+    );
+  });
+
+  it("path override never leaks into the default template", () => {
+    const request = buildRequest(
+      op({ method: "GET", path: "/pets/{petId}" }),
+      { petId: "1" },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.equal(request.url, "https://api.example.com/pets/1");
+  });
+
   it("sets Accept on every request, not just body-bearing ones", () => {
     const request = buildRequest(op({ path: "/pets" }), {}, { baseUrl: "https://api.example.com" });
     assert.equal(request.headers.Accept, "application/json");

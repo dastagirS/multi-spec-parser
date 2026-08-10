@@ -140,8 +140,11 @@ describe("MultiSpecParser", () => {
 
   it("parses from a pre-parsed spec object", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    const parsed = await parser.parse();
-    assert.equal(parsed.operations.length, 3);
+    const document = await parser.parse();
+    // parse() returns the RAW document (typed to the input spec) — not the
+    // normalized model. For object sources it is the same object passed in.
+    assert.equal(document, SPEC);
+    assert.equal(document.openapi, "3.0.3");
     assert.equal(parser.format, "openapi3");
     assert.equal(parser.baseUrl, "https://api.example.com/v1");
   });
@@ -158,8 +161,8 @@ paths:
         "200": { description: ok }
 `;
     const parser = new MultiSpecParser({ spec: { text: yaml } });
-    const parsed = await parser.parse();
-    assert.equal(parsed.specFormat, "openapi3");
+    const document = await parser.parse();
+    assert.equal(document.openapi, "3.0.3");
     assert.equal(parser.tool("listPets")?.name, "listPets");
   });
 

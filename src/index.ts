@@ -35,7 +35,6 @@ export type {
   GoogleSchemaObject,
   HttpMethod,
   MediaBinding,
-  MediaUploadInfo,
   NormalizedParameter,
   NormalizedRequestBody,
   OpenApi3PathItem,

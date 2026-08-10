@@ -90,15 +90,6 @@ export interface NormalizedRequestBody {
   schema?: SchemaObject;
 }
 
-/** Google Discovery media upload (uploadType=media / multipart, Gmail/Drive). */
-export interface MediaUploadInfo {
-  uploadType: "media" | "multipart";
-  simplePath?: string;
-  resumablePath?: string;
-  /** Accepted media content types from the Discovery doc (e.g. message/rfc822). */
-  accept?: string[];
-}
-
 export interface ServerVariable {
   default: string;
   enum?: string[];
@@ -129,8 +120,6 @@ export interface ExtractedOperation {
   servers?: ServerInfo[];
   /** OAuth2 scopes required by this operation (flattened). */
   requiredScopes?: string[];
-  /** Google media upload surface (uploadType=media endpoints). */
-  mediaUpload?: MediaUploadInfo;
   /** External $refs left unresolved (e.g. Booking's ../accommodations/...). */
   unresolvedRefs?: string[];
 }

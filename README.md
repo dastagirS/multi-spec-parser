@@ -56,6 +56,10 @@ const parser = new MultiSpecParser({
 await parser.parse();
 console.log(parser.format);   // "openapi3" | "swagger2" | "google-discovery"
 
+// parse() returns the RAW parsed document, TYPED to the input spec for
+// object sources — the parser's view of the underlying schema:
+const { paths } = await parser.parse();   // typeof yourSpec.paths
+
 const tool = parser.tool("findPetsByStatus");
 // tool.inputSchema  — JSON Schema with per-tool $defs closure (Ajv-compilable)
 // tool.outputSchema — success-response schema, refs resolve against inputSchema.$defs
@@ -75,12 +79,14 @@ the public API — the exports map blocks them; everything hangs off the class.
 Runnable, copy-pasteable usage lives in [`examples/`](examples/) (also shipped in the npm tarball):
 
 ```sh
-npm run examples            # run all five
+npm run examples            # run all seven
 node examples/basic.mjs     # text → model → per-tool schemas
 node examples/multi-format.mjs  # OpenAPI 3.0/3.1 + Swagger 2.0 + Google Discovery
 node examples/requests.mjs  # build + execute live requests (needs network)
 node examples/llm-tools.mjs # OpenAI-style tool definitions from a real spec
 node examples/policies.mjs  # filterOps, processors, 401 retry, truncation, validate, Standard Schema
+node examples/consumer-media-upload.mjs  # Google media upload done consumer-side
+node examples/google-attachment-to-s3.mjs  # Gmail attachment → S3, parser ends at the bytes
 ```
 
 ### Build a request
@@ -92,11 +98,15 @@ const req = parser.buildRequest(
   { headers: { "X-Trace": "abc" } }, // per-call options merge over config defaults
 );
 // req = { url, method, headers, body }
+
+`buildRequest` also takes a `path` template override — placeholders still
+resolve against the op's params. This is the primitive that lets consumers
+implement Google media uploads themselves (see “Consumer-side protocols”).
 ```
 
 Full OAS3 serialization: `style`/`explode` (form, spaceDelimited, pipeDelimited,
 deepObject), `allowReserved` path encoding, form-urlencoded / multipart /
-octet-stream bodies, `bodyBase64` media uploads, cookie params, server URL
+octet-stream bodies, cookie params, server URL
 `{variables}` substitution. JSON/octet-stream bodies nest under a `body` key;
 form-style bodies (urlencoded/multipart, e.g. Slack's `formData`) are exposed
 as flat top-level fields and serialized accordingly. A relative spec server
@@ -202,7 +212,7 @@ Semantics:
   `describeTools()`, and `execute()`/`tool()` by its name throws "unknown
 tool" (the safety boundary: a tool that doesn't exist can't be called).
   Match on anything in the operation model: `toolName`, `method`,
-  `requiredScopes`, `tags`, `mediaUpload`.
+  `requiredScopes`, `tags`.
 - **`processors`** run after fetch, before truncation; they see every result
   (success and error) and may return any `ExecuteResult`. A throwing
   processor — or one returning a non-`ExecuteResult` — degrades to
@@ -224,11 +234,6 @@ tool" (the safety boundary: a tool that doesn't exist can't be called).
   with a real Ajv-backed `validate`. Imported from the **subpath**
   `multi-spec-parser/standard-schema` (ajv is an optional dependency, so the
   main entry never loads it).
-- **Google media uploads** are exposed on the tool as `mediaUpload`
-  (`simplePath`, `accept`), and `buildRequest` routes `contentType:
-  "application/octet-stream"` → `uploadType=media` and `"multipart/related"`
-  with `body: { metadata, media }` → `uploadType=multipart` against the
-  simple upload path.
 
 ## Options reference
 
@@ -246,6 +251,44 @@ tool" (the safety boundary: a tool that doesn't exist can't be called).
 | `maxResponseBytes` | `execute()` (after processors) | no cap |
 | `onTruncate` | `execute()` (on truncate) | none |
 | `describeMaxBytes` | `describeTools()` | 64KB |
+
+## Consumer-side protocols
+
+The package is a **parser + generic primitives + hooks** — it never implements
+a *protocol* or *policy* (that's consumer behavior). If you need something
+format- or vendor-specific — Google media uploads, resumable uploads, OAuth
+exchange, S3 storage — you build it on top of what the parser gives you:
+
+- **`parse()` returns the raw document**, typed to your input spec — so the
+  spec's own data (Google `mediaUpload` paths, `x-` extensions, anything not
+  normalized into the model) is in your hands:
+
+  ```ts
+  const { resources } = await parser.parse();
+  const uploadPath = resources.users.methods.send.mediaUpload.protocols.simple.path;
+  ```
+
+- **`buildRequest(tool, args, { path })`** builds on any path template —
+  placeholders resolve against the op's params, and the upload path shares
+  them:
+
+  ```ts
+  const req = parser.buildRequest(tool, { userId: "me" }, { path: uploadPath });
+  req.url += (req.url.includes("?") ? "&" : "?") + "uploadType=media";
+  req.body = bytes;                                // your bytes
+  req.headers["Content-Type"] = "application/octet-stream";
+  const res = await fetch(req.url, {
+    method: req.method, headers: req.headers, body: req.body,
+  });
+  ```
+
+  `multipart/related` framing is yours too (~20 lines, see
+  `examples/consumer-media-upload.mjs`, which runs the whole recipe against a
+  local server).
+
+- **The hooks** (`filterOps`, `processors`, `onUnauthorized`, `onTruncate`,
+  `extraParameters`) are the seams where your policy plugs in — S3/OAuth/etc.
+  live in your closures, never in the package.
 
 ## Releasing
 
