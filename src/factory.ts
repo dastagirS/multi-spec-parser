@@ -30,8 +30,6 @@ export interface CompiledTool {
   /** Success-response schema; $refs resolve against inputSchema.$defs. */
   outputSchema: Record<string, unknown> | undefined;
   operation: ExtractedOperation;
-  /** Item 7: true when the op mutates server state (POST/PUT/PATCH/DELETE). */
-  mutating: boolean;
   /** Item 9: surfaced Google media-upload surface (was operation.mediaUpload only). */
   mediaUpload?: ExtractedOperation["mediaUpload"];
   /** Refs that could not be resolved: top-level refs dropped at parse time
@@ -60,7 +58,7 @@ export interface CompileOptions {
   /** Open compile-time filter: return true to keep an op. A filtered op never
    *  becomes a tool — it can't be listed, described, or executed (the safety
    *  boundary). Runs pre-dedup, so kept ops' names are unaffected by dropped
-   *  ones. Examples: readOnly → op => !op.mutating; denylist → op =>
+   *  ones. Examples: readOnly → op => !["POST","PUT","PATCH","DELETE"].includes(op.method); denylist → op =>
    *  !BLOCKED.has(op.toolName); scope-gate → op => op.requiredScopes?.includes(x). */
   filterOps?: (op: ExtractedOperation) => boolean;
   /** Item 5: per-tool extra input-schema properties (LLM-visible, ignored by
@@ -178,7 +176,6 @@ export function compileSpecToTools(
       description: buildDescription(op),
       method: op.method,
       path: op.path,
-      mutating: op.mutating,
       inputSchema: prunedInput,
       outputSchema: prunedOutput,
       operation: op,

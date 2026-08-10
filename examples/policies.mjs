@@ -103,9 +103,9 @@ const parser = new MultiSpecParser({
   options: {
     baseUrl: `http://127.0.0.1:${port}`,
 
-    // filterOps: return true to keep. Read-only is one predicate on the
-    // derived mutating flag; a denylist is just another predicate.
-    filterOps: (op) => !op.mutating, // keeps getPet + listPets, drops createPet
+    // filterOps: return true to keep. Read-only is one predicate on the HTTP
+    // method; a denylist is just another predicate.
+    filterOps: (op) => !["POST", "PUT", "PATCH", "DELETE"].includes(op.method), // keeps getPet + listPets, drops createPet
 
     // extraParameters: LLM-visible inputs that buildRequest ignores —
     // metadata only your processor cares about.

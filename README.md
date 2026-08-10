@@ -10,7 +10,7 @@ definitions for LLM tool sets. TypeScript, two tiny runtime deps
 > changes can too (per semver convention for `0.x`). Pin an exact version
 > (`multi-spec-parser@0.2.1`) and re-check the README before upgrading.
 > The compiled-tool fields `name`/`method`/`path`/`inputSchema`/
-> `outputSchema`/`mutating` are the stable core; `operation()` and other
+> `outputSchema` are the stable core; `operation()` and other
 > internals may change shape.
 
 ## Why
@@ -145,8 +145,8 @@ JSON-variant URL).
   tool as `unresolvedRefs`.
 - **`__proto__` keys** (schema/property/param names) are preserved as own
   properties — the parser never trips the prototype trap.
-- Every tool carries a **`mutating`** flag (POST/PUT/PATCH/DELETE → true) so
-  approval/gating layers don't re-derive it from the method.
+- The `method` (GET/POST/…) is exposed on every tool so approval/gating
+  layers can derive read-only semantics themselves (`!["POST","PUT","PATCH","DELETE"].includes(tool.method)`).
 
 ## Policies & hooks
 
@@ -160,8 +160,10 @@ const parser = new MultiSpecParser({
   options: {
     // Open compile-time filter: return true to keep an op. A filtered op
     // never becomes a tool — it can't be listed, described, or executed.
-    // "Read-only" is one predicate on the derived mutating flag.
-    filterOps: (op) => !op.mutating && !DESTRUCTIVE.has(op.toolName),
+    // "Read-only" is one predicate on the HTTP method.
+    filterOps: (op) =>
+      !["POST", "PUT", "PATCH", "DELETE"].includes(op.method) &&
+      !DESTRUCTIVE.has(op.toolName),
 
     // 401 → refresh → retry once (or maxAuthRetries times).
     onUnauthorized: async () => `Bearer ${await refreshToken()}`,

@@ -1,7 +1,7 @@
 /**
  * Unit tests for the 0.2.0 policy surface: compile-time blocking (1), response
  * processors (2), 401 retry (3), response truncation (4), extra parameters (5),
- * the mutating flag (7), describeTools() (8), and option validation guards.
+ * describeTools() (8), and option validation guards.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -98,10 +98,10 @@ describe("filterOps (item 1 — open compile-time filter)", () => {
     assert.deepEqual(names(parser), ["listPets"]);
   });
 
-  it("readOnly is just a predicate on the derived mutating flag", async () => {
+  it("readOnly is just a predicate on the HTTP method", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
-      options: { filterOps: (op) => !op.mutating },
+      options: { filterOps: (op) => !["POST", "PUT", "PATCH", "DELETE"].includes(op.method) },
     });
     await parser.parse();
     assert.deepEqual(names(parser), ["getPet", "listPets"]);
@@ -111,7 +111,9 @@ describe("filterOps (item 1 — open compile-time filter)", () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
       options: {
-        filterOps: (op) => !op.mutating && !op.toolName.includes("list"),
+        filterOps: (op) =>
+          !["POST", "PUT", "PATCH", "DELETE"].includes(op.method) &&
+          !op.toolName.includes("list"),
       },
     });
     await parser.parse();
@@ -204,18 +206,6 @@ describe("extraParameters (item 5)", () => {
       options: { extraParameters: { getPet: [{ name: "" } as never] } },
     });
     await assert.rejects(() => parser.parse(), /extraParameter must be/);
-  });
-});
-
-describe("mutating flag (item 7)", () => {
-  it("is derived from the method at compile time", async () => {
-    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    await parser.parse();
-    const byName = new Map(parser.tools().map((t) => [t.name, t.mutating]));
-    assert.equal(byName.get("deletePet"), true);
-    assert.equal(byName.get("createPet"), true);
-    assert.equal(byName.get("getPet"), false);
-    assert.equal(byName.get("listPets"), false);
   });
 });
 
@@ -499,7 +489,6 @@ describe("describeTools (item 8)", () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } }); // 64KB default
     await parser.parse();
     const getPet = parser.describeTools().find((d) => d.name === "getPet")!;
-    assert.equal(getPet.mutating, false);
     assert.equal(getPet.inputSchema.$refs, undefined, "under budget → full schema kept");
     assert.ok(getPet.outputSchema, "output contract included in describeTools");
 
@@ -592,7 +581,7 @@ describe("compile-time helpers stay coherent", () => {
   it("compileSpecToTools honors filtering and extras directly", () => {
     const parsed = parseSpec(SPEC);
     const { tools } = compileSpecToTools(parsed, {
-      filterOps: (op) => !op.mutating,
+      filterOps: (op) => !["POST", "PUT", "PATCH", "DELETE"].includes(op.method),
       extraParameters: { listPets: [{ name: "traceId", schema: { type: "string" } }] },
     });
     assert.deepEqual(tools.map((t) => t.name).sort(), ["getPet", "listPets"]);

@@ -46,8 +46,9 @@ export interface MultiSpecParserOptions {
   executeTimeoutMs?: number;
   /** Open compile-time filter: return true to keep an op. A filtered op never
    *  becomes a tool — it can't be listed, described, or executed. Runs
-   *  pre-dedup. Examples: readOnly → op => !op.mutating; denylist → op =>
-   *  !BLOCKED.has(op.toolName); scope-gate → op => op.requiredScopes?.includes(x). */
+   *  pre-dedup. Examples: readOnly → op => !["POST","PUT","PATCH","DELETE"].includes(op.method);
+   *  denylist → op => !BLOCKED.has(op.toolName); scope-gate → op =>
+   *  op.requiredScopes?.includes(x). */
   filterOps?: (op: ExtractedOperation) => boolean;
   /** Item 5: per-tool extra input-schema properties. */
   extraParameters?: Record<string, ExtraParameter[]>;
@@ -80,7 +81,6 @@ export type ExecuteProcessor = (
 export interface ToolDescription {
   name: string;
   description: string;
-  mutating: boolean;
   inputSchema: Record<string, unknown>;
   /** Success-response contract, bounded by the same describeMaxBytes budget
    *  (its $refs resolve against the entry's inputSchema.$defs). */
@@ -166,7 +166,6 @@ export class MultiSpecParser {
     return this.tools().map((tool) => ({
       name: tool.name,
       description: tool.description,
-      mutating: tool.mutating,
       inputSchema: boundedSchema(tool.inputSchema, maxBytes),
       ...(tool.outputSchema
         ? { outputSchema: boundedSchema(tool.outputSchema, maxBytes) }
@@ -351,7 +350,7 @@ export class MultiSpecParser {
   /** The normalized operation behind a tool (params, requestBody, servers…).
    *  NOTE: internal model — its shape may change in minor versions. Persist or
    *  key on the stable tool fields (name/method/path/inputSchema/outputSchema/
-   *  mutating/mediaUpload), not on operation internals. */
+   *  mediaUpload), not on operation internals. */
   operation(tool: string | CompiledTool): CompiledTool["operation"] {
     return this.resolveTool(tool).operation;
   }

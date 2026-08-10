@@ -38,9 +38,6 @@ import type {
 
 const HTTP_METHODS = ["get", "put", "post", "patch", "delete", "head", "options", "trace"] as const;
 
-/** Methods that mutate server state — derived onto every op at parse time so
- *  filterOps can predicate on it (readOnly → op => !op.mutating). */
-const MUTATING_METHODS = new Set<string>(["POST", "PUT", "PATCH", "DELETE"]);
 const VALID_PARAM_LOCATIONS = new Set(["query", "path", "header", "cookie"]);
 const VALID_SCHEMA_TYPES = new Set([
   "array",
@@ -211,7 +208,6 @@ function openApi3Operation(
   return {
     toolName,
     method: method.toUpperCase() as HttpMethod,
-    mutating: MUTATING_METHODS.has(method.toUpperCase()),
     path,
     summary: op.summary,
     description: op.description,
@@ -405,7 +401,6 @@ function swagger2Operation(
   return {
     toolName,
     method: method.toUpperCase() as HttpMethod,
-    mutating: MUTATING_METHODS.has(method.toUpperCase()),
     path,
     summary: op.summary,
     description: op.description,
@@ -631,7 +626,6 @@ function googleMethodToOperation(
   return {
     toolName,
     method: (method.httpMethod || "GET").toUpperCase() as HttpMethod,
-    mutating: MUTATING_METHODS.has((method.httpMethod || "GET").toUpperCase()),
     path: rawPath.startsWith("/") ? rawPath : `/${rawPath}`,
     summary: method.description?.split("\n")[0] ?? method.id,
     description: method.description,

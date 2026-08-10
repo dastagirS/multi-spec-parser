@@ -109,7 +109,7 @@ describe("google media upload (item 9)", () => {
       const parser = makeParser(port);
       await parser.parse();
       const send = parser.tool("mail_users_messages_send")!;
-      assert.equal(send.mutating, true);
+      assert.equal(send.method, "POST");
       assert.equal(send.mediaUpload?.uploadType, "media");
       assert.ok(send.mediaUpload?.simplePath?.includes("/upload/mail/v1/"));
       assert.deepEqual(send.mediaUpload?.accept, ["message/rfc822"]);
