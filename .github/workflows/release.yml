@@ -38,6 +38,7 @@ jobs:
   publish:
     needs: native-prebuild
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
