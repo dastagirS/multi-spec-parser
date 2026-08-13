@@ -154,9 +154,9 @@ static bool ny_quote_may_start(const char *source, size_t index) {
   return true;
 }
 
-static char *ny_strip_comment(const char *source, size_t length) {
-  if (source == NULL) return NULL;
-  char quote = 0; unsigned flow = 0;
+static char *ny_strip_comment(const char *source, size_t length, char *quote_state) {
+  if (source == NULL || quote_state == NULL) return NULL;
+  char quote = *quote_state;
   for (size_t index = 0; index < length; index++) {
     char character = source[index];
     if (quote == '\'' && character == '\'' && index + 1 < length && source[index + 1] == '\'') { index++; continue; }
@@ -164,18 +164,29 @@ static char *ny_strip_comment(const char *source, size_t length) {
     if (quote == '"' && character == '\\') { if (index + 1 < length) index++; continue; }
     if (quote == '"' && character == '"') { quote = 0; continue; }
     if (quote == 0 && (character == '\'' || character == '"') && ny_quote_may_start(source, index)) { quote = character; continue; }
-    if (quote == 0 && (character == '[' || character == '{')) { flow++; continue; }
-    if (quote == 0 && (character == ']' || character == '}')) { if (flow > 0) flow--; continue; }
     if (quote == 0 && character == '#' && (index == 0 || isspace((unsigned char)source[index - 1]))) length = index;
   }
+  *quote_state = quote;
   while (length > 0 && (source[length - 1] == ' ' || source[length - 1] == '\t')) length--;
   return ny_copy(source, length);
+}
+
+static bool ny_block_header(const char *source, size_t length) {
+  if (source == NULL || length == 0) return false;
+  for (size_t index = 0; index < length; index++) {
+    if (source[index] != ':' || (index + 1 < length && !isspace((unsigned char)source[index + 1]))) continue;
+    size_t value = index + 1;
+    while (value < length && isspace((unsigned char)source[value])) value++;
+    return value < length && (source[value] == '|' || source[value] == '>');
+  }
+  return false;
 }
 
 static bool ny_lines(NyParser *parser, const char *text, size_t length) {
   if (parser == NULL || text == NULL) return false;
   if (!ny_range(length <= NY_MAX_INPUT_BYTES, parser, "input is too large")) return false;
   size_t position = 0;
+  char quote_state = 0; size_t block_parent_indent = SIZE_MAX;
   if (length >= 3 && (unsigned char)text[0] == 0xef && (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf) position = 3;
   while (position <= length) {
     size_t end = position;
@@ -184,8 +195,11 @@ static bool ny_lines(NyParser *parser, const char *text, size_t length) {
     size_t indent = 0;
     while (position + indent < raw_end && text[position + indent] == ' ') indent++;
     if (position + indent < raw_end && text[position + indent] == '\t') return ny_fail(parser, "tab indentation is not supported");
-    char *raw = ny_copy(text + position + indent, raw_end - position - indent);
-    char *content = ny_strip_comment(text + position + indent, raw_end - position - indent);
+    size_t line_length = raw_end - position - indent;
+    bool block_content = block_parent_indent != SIZE_MAX && (line_length == 0 || indent > block_parent_indent);
+    if (block_parent_indent != SIZE_MAX && !block_content) block_parent_indent = SIZE_MAX;
+    char *raw = ny_copy(text + position + indent, line_length);
+    char *content = block_content ? ny_copy(text + position + indent, line_length) : ny_strip_comment(text + position + indent, line_length, &quote_state);
     if (raw == NULL || content == NULL) { free(raw); free(content); return ny_fail(parser, "out of memory"); }
     if (parser->count == parser->capacity) {
       size_t capacity = parser->capacity == 0 ? 128 : parser->capacity * 2;
@@ -195,6 +209,7 @@ static bool ny_lines(NyParser *parser, const char *text, size_t length) {
     }
     parser->lines[parser->count++] = (NyLine){content, raw, strlen(content), indent, content[0] == '\0'};
     if (parser->count > NY_MAX_LINES) return ny_fail(parser, "line count limit exceeded");
+    if (!block_content && block_parent_indent == SIZE_MAX && ny_block_header(content, strlen(content))) { block_parent_indent = indent; quote_state = 0; }
     if (end == length) break;
     position = end + 1;
     if (text[end] == '\r' && position < length && text[position] == '\n') position++;
@@ -219,7 +234,7 @@ static bool ny_find_colon(const char *source, size_t length, bool flow, size_t *
     if (quote == 0 && (character == '\'' || character == '"')) {
       size_t previous = index;
       while (previous > 0 && isspace((unsigned char)source[previous - 1])) previous--;
-      bool starts_quote = previous == 0 || source[previous - 1] == ':' || source[previous - 1] == ',' || source[previous - 1] == '[' || source[previous - 1] == '{';
+      bool starts_quote = ny_quote_may_start(source, index);
       if (starts_quote) { quote = character; continue; }
     }
     if (quote == 0 && (character == '[' || character == '{')) { depth++; continue; }
@@ -262,6 +277,18 @@ static bool ny_decode_double(NyParser *parser, const char *source, size_t length
         if (value < 0) { free(result); return ny_fail(parser, "invalid unicode escape"); }
         code = code * 16u + (uint32_t)value;
       }
+      if (code >= 0xd800u && code <= 0xdbffu) {
+        size_t low_start = index + 3;
+        if (low_start + 3 >= length || source[index + 1] != '\\' || source[index + 2] != 'u') { free(result); return ny_fail(parser, "high surrogate requires low surrogate"); }
+        uint32_t low = 0;
+        for (size_t digit = 0; digit < 4; digit++) {
+          char hex = source[low_start + digit]; int value = isdigit((unsigned char)hex) ? hex - '0' : (hex >= 'a' && hex <= 'f') ? hex - 'a' + 10 : (hex >= 'A' && hex <= 'F') ? hex - 'A' + 10 : -1;
+          if (value < 0) { free(result); return ny_fail(parser, "invalid low surrogate"); }
+          low = low * 16u + (uint32_t)value;
+        }
+        if (low < 0xdc00u || low > 0xdfffu) { free(result); return ny_fail(parser, "high surrogate requires low surrogate"); }
+        code = 0x10000u + ((code - 0xd800u) << 10) + (low - 0xdc00u); index = low_start + 3;
+      } else if (code >= 0xdc00u && code <= 0xdfffu) { free(result); return ny_fail(parser, "unexpected low surrogate"); }
       if (code <= 0x7fu) result[count++] = (char)code;
       else if (code <= 0x7ffu) { result[count++] = (char)(0xc0u | (code >> 6)); result[count++] = (char)(0x80u | (code & 0x3fu)); }
       else if (code <= 0xffffu) { result[count++] = (char)(0xe0u | (code >> 12)); result[count++] = (char)(0x80u | ((code >> 6) & 0x3fu)); result[count++] = (char)(0x80u | (code & 0x3fu)); }
@@ -305,19 +332,32 @@ static bool ny_parse_scalar(NyParser *parser, const char *source, size_t length,
   *out = ny_node(parser, NY_STRING); if (*out == NULL) { free(plain); return false; } (*out)->data.string.value = plain; (*out)->data.string.length = strlen(plain); return true;
 }
 
-static bool ny_split_flow(const char *source, size_t length, size_t *end) {
-  char quote = 0; unsigned depth = 0;
+static bool ny_flow_scan(const char *source, size_t length, char *closings, size_t *depth, char *quote) {
+  if (source == NULL || closings == NULL || depth == NULL || quote == NULL) return false;
   for (size_t index = 0; index < length; index++) {
     char character = source[index];
-    if (quote == '\'' && character == '\'' && index + 1 < length && source[index + 1] == '\'') { index++; continue; }
-    if (quote == '\'' && character == '\'') { quote = 0; continue; }
-    if (quote == '"' && character == '\\') { if (index + 1 < length) index++; continue; }
-    if (quote == '"' && character == '"') { quote = 0; continue; }
-    if (quote == 0 && (character == '\'' || character == '"')) { quote = character; continue; }
-    if (quote == 0 && (character == '[' || character == '{')) { depth++; if (depth > NY_MAX_FLOW_DEPTH) return false; }
-    if (quote == 0 && (character == ']' || character == '}')) { if (depth == 0) return false; depth--; }
+    if (*quote == '\'' && character == '\'' && index + 1 < length && source[index + 1] == '\'') { index++; continue; }
+    if (*quote == '\'' && character == '\'') { *quote = 0; continue; }
+    if (*quote == '"' && character == '\\') { if (index + 1 < length) index++; continue; }
+    if (*quote == '"' && character == '"') { *quote = 0; continue; }
+    if (*quote == 0 && (character == '\'' || character == '"') && ny_quote_may_start(source, index)) { *quote = character; continue; }
+    if (*quote == 0 && (character == '[' || character == '{')) {
+      if (*depth >= NY_MAX_FLOW_DEPTH) return false;
+      closings[(*depth)++] = character == '[' ? ']' : '}';
+      continue;
+    }
+    if (*quote == 0 && (character == ']' || character == '}')) {
+      if (*depth == 0 || closings[*depth - 1] != character) return false;
+      (*depth)--;
+    }
   }
-  if (quote != 0) return false;
+  return true;
+}
+
+static bool ny_split_flow(const char *source, size_t length, size_t *end) {
+  if (source == NULL || end == NULL) return false;
+  char closings[NY_MAX_FLOW_DEPTH]; char quote = 0; size_t depth = 0;
+  if (!ny_flow_scan(source, length, closings, &depth, &quote) || quote != 0) return false;
   *end = depth; return true;
 }
 
@@ -348,7 +388,7 @@ static bool ny_parse_flow(NyParser *parser, const char *source, size_t length, N
           frames[frame_count++] = (NyFlowFrame){child, opener == '[' ? ']' : '}', opener == '{', 0, NULL}; continue;
         }
         size_t start = cursor; char quote = 0;
-        while (cursor < length) { char character = source[cursor]; if (quote == 0 && (character == ',' || character == ']' || character == '}' || (frame->map && character == ':'))) break; if (quote == '\'' && character == '\'' && cursor + 1 < length && source[cursor + 1] == '\'') { cursor += 2; continue; } if (quote == '"' && character == '\\') { cursor += 2; continue; } if (quote == 0 && (character == '\'' || character == '"')) quote = character; else if (quote != 0 && character == quote) quote = 0; cursor++; }
+        while (cursor < length) { char character = source[cursor]; if (quote == 0 && (character == ',' || character == ']' || character == '}' || (frame->map && character == ':'))) break; if (quote == '\'' && character == '\'' && cursor + 1 < length && source[cursor + 1] == '\'') { cursor += 2; continue; } if (quote == '"' && character == '\\') { cursor += 2; continue; } if (quote == 0 && (character == '\'' || character == '"') && ny_quote_may_start(source, cursor)) quote = character; else if (quote != 0 && character == quote) quote = 0; cursor++; }
         if (quote != 0 || cursor == start) { free(frames); return ny_fail(parser, "invalid flow scalar"); }
         NyNode *value = NULL; if (!ny_parse_scalar(parser, source + start, cursor - start, &value)) { free(frames); return false; }
         if (frame->map) { if (frame->pending_key != NULL) { if (!ny_map_add(parser, frame->container, frame->pending_key, value)) { free(frames); return false; } frame->pending_key = NULL; frame->state = 3; } else { if (value->type != NY_STRING) { ny_free_node(value); free(frames); return ny_fail(parser, "flow mapping key must be scalar text"); } frame->pending_key = ny_copy(value->data.string.value, value->data.string.length); ny_free_node(value); if (frame->pending_key == NULL) { free(frames); return ny_fail(parser, "out of memory"); } frame->state = 1; } }
@@ -376,6 +416,40 @@ static bool ny_double_quote_complete(const char *source, size_t length) {
     if (character == '"') return true;
   }
   return false;
+}
+
+static bool ny_single_quote_complete(const char *source, size_t length) {
+  if (source == NULL || length < 1 || source[0] != '\'') return false;
+  for (size_t index = 1; index < length; index++) {
+    if (source[index] != '\'') continue;
+    if (index + 1 < length && source[index + 1] == '\'') { index++; continue; }
+    return true;
+  }
+  return false;
+}
+
+static bool ny_join_single_quoted(NyParser *parser, size_t *line_index, const char *source, size_t length, char **joined, size_t *joined_length) {
+  if (parser == NULL || line_index == NULL || source == NULL || joined == NULL || joined_length == NULL) return false;
+  if (length == 0 || source[0] != '\'') return ny_fail(parser, "single quote must start a scalar");
+  size_t capacity = length + 1; char *result = ny_copy(source, length);
+  if (result == NULL) return ny_fail(parser, "out of memory");
+  size_t total = length; size_t current = *line_index + 1;
+  while (!ny_single_quote_complete(result, total) && current < parser->count) {
+    const NyLine *line = &parser->lines[current]; size_t add = line->length;
+    size_t needed = total + add + 2;
+    if (needed > NY_MAX_INPUT_BYTES) { free(result); return ny_fail(parser, "quoted scalar is too large"); }
+    while (capacity < needed) {
+      if (capacity > NY_MAX_INPUT_BYTES / 2) { free(result); return ny_fail(parser, "quoted scalar is too large"); }
+      capacity *= 2;
+    }
+    char *grown = realloc(result, capacity);
+    if (grown == NULL) { free(result); return ny_fail(parser, "out of memory"); }
+    result = grown; result[total++] = line->blank ? '\n' : ' ';
+    if (!line->blank) { memcpy(result + total, line->text, add); total += add; }
+    current++;
+  }
+  if (!ny_single_quote_complete(result, total)) { free(result); return ny_fail(parser, "unterminated multiline single quote"); }
+  result[total] = '\0'; *line_index = current - 1; *joined = result; *joined_length = total; return true;
 }
 
 static bool ny_join_double_quoted(NyParser *parser, size_t *line_index, const char *source, size_t length, char **joined, size_t *joined_length) {
@@ -435,10 +509,28 @@ static bool ny_choose_child(NyParser *parser, size_t line_index, NyNode **out) {
 
 static bool ny_join_flow(NyParser *parser, size_t *line_index, const char *source, size_t length, char **joined, size_t *joined_length) {
   if (parser == NULL || line_index == NULL || source == NULL || joined == NULL || joined_length == NULL) return false;
-  size_t capacity = length + 1; char *result = ny_copy(source, length); if (result == NULL) return ny_fail(parser, "out of memory"); size_t total = length; size_t depth = 0; if (!ny_split_flow(source, length, &depth)) { free(result); return ny_fail(parser, "Flow nesting or syntax invalid"); }
-  size_t current = *line_index + 1;
-  while (depth > 0 && current < parser->count) { if (parser->lines[current].blank) { current++; continue; } size_t add = parser->lines[current].length; if (total + add + 1 > NY_MAX_INPUT_BYTES) { free(result); return ny_fail(parser, "flow value is too large"); } while (capacity < total + add + 2) capacity *= 2; char *grown = realloc(result, capacity); if (grown == NULL) { free(result); return ny_fail(parser, "out of memory"); } result = grown; result[total++] = ' '; memcpy(result + total, parser->lines[current].text, add); total += add; for (size_t cursor = total - add; cursor < total; cursor++) { if (result[cursor] == '[' || result[cursor] == '{') depth++; if (result[cursor] == ']' || result[cursor] == '}') if (depth > 0) depth--; } current++; }
-  if (depth != 0) { free(result); return ny_fail(parser, "flow collection is not closed"); } result[total] = '\0'; *line_index = current - 1; *joined = result; *joined_length = total; return true;
+  char closings[NY_MAX_FLOW_DEPTH]; char quote = 0; size_t depth = 0;
+  size_t capacity = length + 1; char *result = ny_copy(source, length);
+  if (result == NULL) return ny_fail(parser, "out of memory");
+  if (!ny_flow_scan(source, length, closings, &depth, &quote)) { free(result); return ny_fail(parser, "Flow nesting or syntax invalid"); }
+  size_t total = length; size_t current = *line_index + 1;
+  while ((depth > 0 || quote != 0) && current < parser->count) {
+    const NyLine *line = &parser->lines[current];
+    size_t add = line->length;
+    if (total + add + 1 > NY_MAX_INPUT_BYTES) { free(result); return ny_fail(parser, "flow value is too large"); }
+    while (capacity < total + add + 2) {
+      if (capacity > NY_MAX_INPUT_BYTES / 2) { free(result); return ny_fail(parser, "flow value is too large"); }
+      capacity *= 2;
+    }
+    char *grown = realloc(result, capacity);
+    if (grown == NULL) { free(result); return ny_fail(parser, "out of memory"); }
+    result = grown; result[total++] = ' ';
+    memcpy(result + total, line->text, add); total += add;
+    if (!ny_flow_scan(line->text, add, closings, &depth, &quote)) { free(result); return ny_fail(parser, "Flow nesting or syntax invalid"); }
+    current++;
+  }
+  if (depth != 0 || quote != 0) { free(result); return ny_fail(parser, "flow collection is not closed"); }
+  result[total] = '\0'; *line_index = current - 1; *joined = result; *joined_length = total; return true;
 }
 
 static bool ny_block(NyParser *parser, NyNode **out) {
@@ -454,7 +546,11 @@ static bool ny_block(NyParser *parser, NyNode **out) {
   while (index < parser->count) {
     parser->index = index; NyLine *line = &parser->lines[index]; if (line->blank) { index++; continue; }
     if (line->length == 3 && strncmp(line->text, "---", 3) == 0) { if (index != first) { free(frames); ny_free_node(root); return ny_fail(parser, "Multiple YAML documents are unsupported"); } index++; continue; }
-    if (line->length == 3 && strncmp(line->text, "...", 3) == 0) { index++; break; }
+    if (line->length == 3 && strncmp(line->text, "...", 3) == 0) {
+      size_t trailing = 0;
+      if (ny_next_content(parser, index + 1, &trailing)) { free(frames); ny_free_node(root); return ny_fail(parser, "content after document end marker"); }
+      index++; break;
+    }
     if (line->text[0] == '%') { free(frames); ny_free_node(root); return ny_fail(parser, "directives are unsupported"); }
     while (frame_count > 1 && line->indent < frames[frame_count - 1].indent) frame_count--;
     if (line->indent != frames[frame_count - 1].indent) { char detail[256]; snprintf(detail, sizeof(detail), "invalid indentation at %zu: got %zu expected %zu (%s)", index, line->indent, frames[frame_count - 1].indent, line->text); free(frames); ny_free_node(root); return ny_fail(parser, detail); }
@@ -491,14 +587,14 @@ static bool ny_block(NyParser *parser, NyNode **out) {
         const char *value_source = rest + colon + 1; size_t value_length = rest_length - colon - 1; ny_trim(&value_source, &value_length); NyNode *value = NULL;
         if (value_length > 0 && (value_source[0] == '|' || value_source[0] == '>')) { if (!ny_block_scalar(parser, line->indent + 2, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } index = parser->index; }
         else if (value_length == 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; } if (frame_count + 1 >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){map, line->indent + 2, false}; frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE}; } else value = ny_node(parser, NY_NULL); }
-        else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined != NULL) { value = NULL; if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); ny_free_node(root); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } }
+        else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined != NULL) { value = NULL; if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); ny_free_node(root); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } }
         if (value == NULL || !ny_map_add(parser, map, key, value)) { free(key); free(frames); ny_free_node(root); return false; }
         if (value_length != 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (frame_count >= parser->max_depth) { free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){map, parser->lines[next].indent, false}; } }
         index++; continue;
       }
       NyNode *value = NULL;
       if (rest_length > 0 && (rest[0] == '|' || rest[0] == '>')) { if (!ny_block_scalar(parser, line->indent, rest, rest_length, &value)) { free(frames); ny_free_node(root); return false; } index = parser->index; }
-      else { char *joined = NULL; size_t joined_length = 0; if (rest_length > 0 && rest[0] == '"' && !ny_double_quote_complete(rest, rest_length) && !ny_join_double_quoted(parser, &index, rest, rest_length, &joined, &joined_length)) { free(frames); ny_free_node(root); return false; } if (joined != NULL) { bool parsed = ny_inline(parser, joined, joined_length, &value); free(joined); if (!parsed) { free(frames); ny_free_node(root); return false; } } else if (!ny_inline(parser, rest, rest_length, &value)) { free(frames); ny_free_node(root); return false; } }
+      else { char *joined = NULL; size_t joined_length = 0; if (rest_length > 0 && rest[0] == '\'' && !ny_single_quote_complete(rest, rest_length) && !ny_join_single_quoted(parser, &index, rest, rest_length, &joined, &joined_length)) { free(frames); ny_free_node(root); return false; } if (joined == NULL && rest_length > 0 && rest[0] == '"' && !ny_double_quote_complete(rest, rest_length) && !ny_join_double_quoted(parser, &index, rest, rest_length, &joined, &joined_length)) { free(frames); ny_free_node(root); return false; } if (joined != NULL) { bool parsed = ny_inline(parser, joined, joined_length, &value); free(joined); if (!parsed) { free(frames); ny_free_node(root); return false; } } else if (!ny_inline(parser, rest, rest_length, &value)) { free(frames); ny_free_node(root); return false; } }
       if (value == NULL || !ny_sequence_add(parser, frame->node, value)) { free(frames); ny_free_node(root); return false; } index++; continue;
     }
     size_t colon = 0; if (!ny_find_colon(line->text, line->length, false, &colon)) { free(frames); ny_free_node(root); return ny_fail(parser, "mapping entry expected"); }
@@ -506,7 +602,7 @@ static bool ny_block(NyParser *parser, NyNode **out) {
     const char *value_source = line->text + colon + 1; size_t value_length = line->length - colon - 1; ny_trim(&value_source, &value_length); NyNode *value = NULL;
     if (value_length > 0 && (value_source[0] == '|' || value_source[0] == '>')) { if (!ny_block_scalar(parser, line->indent, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } index = parser->index; }
     else if (value_length == 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; } if (frame_count >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE}; } else value = ny_node(parser, NY_NULL); }
-    else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined != NULL) { if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); ny_free_node(root); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } }
+    else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined != NULL) { if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); return false; } }
     if (value == NULL || !ny_map_add(parser, frame->node, key, value)) { free(key); free(frames); ny_free_node(root); return false; } index++;
   }
   free(frames); parser->index = index; *out = root; return true;

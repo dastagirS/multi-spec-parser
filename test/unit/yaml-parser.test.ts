@@ -85,6 +85,19 @@ describe("parseYaml", () => {
     });
   });
 
+  it("accepts apostrophes and delimiters inside multiline flow quotes", () => {
+    assert.deepEqual(jsonValue("document: [It's valid,\n  \"x]\", {message: It's valid}]\n"), {
+      document: ["It's valid", "x]", { message: "It's valid" }],
+    });
+  });
+
+  it("preserves comments and newlines inside multiline quoted scalars", () => {
+    assert.deepEqual(jsonValue("double: \"hello\n  world # kept\"\nsingle: 'hello\n  world'\n"), {
+      double: "hello world # kept",
+      single: "hello world",
+    });
+  });
+
   it("handles compact flow mappings without a space after ':', like JSON", () => {
     assert.deepEqual(jsonValue('document: {"a":1,b:{"c":[2,3]}}'), {
       document: { a: 1, b: { c: [2, 3] } },
@@ -94,6 +107,7 @@ describe("parseYaml", () => {
   it("decodes quoted escapes and preserves plain scalar punctuation", () => {
     assert.deepEqual(jsonValue(`
       double: "line\\n\\t\\u263A\\x21"
+      emoji: "\\uD83D\\uDE00"
       single: 'a ''quoted'' value'
       punctuation: http://example.test/?a=1:2#fragment
       colon: value:with:colons
@@ -101,6 +115,7 @@ describe("parseYaml", () => {
       question: ?not-a-key-marker
     `), {
       double: "line\n\t☺!",
+      emoji: "😀",
       single: "a 'quoted' value",
       punctuation: "http://example.test/?a=1:2#fragment",
       colon: "value:with:colons",
@@ -176,6 +191,13 @@ describe("parseYaml", () => {
     });
   });
 
+  it("keeps block scalar quotes and hashes as literal content", () => {
+    assert.deepEqual(jsonValue("text: |-\n  \" unmatched # text\nnext: value # comment\n"), {
+      text: "\" unmatched # text",
+      next: "value",
+    });
+  });
+
   it("preserves comments, brackets, and blank lines inside block scalars", () => {
     assert.deepEqual(jsonValue(`
       text: |-
@@ -216,6 +238,7 @@ describe("parseYaml", () => {
 
   it("supports document markers but rejects document streams and directives", () => {
     assert.deepEqual(jsonValue("# heading\n---\nvalue: 1\n...\n"), { value: 1 });
+    assert.throws(() => parseYaml("a: 1\n...\nb: 2\n"), /content after document end/);
     assert.throws(() => parseYaml("---\na: 1\n---\nb: 2\n"), /Multiple YAML documents/);
     assert.throws(() => parseYaml("%YAML 1.2\n---\na: 1\n"), /directives/);
     assert.throws(() => parseYaml("...\n"), /before content|empty/);
