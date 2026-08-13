@@ -1,0 +1,70 @@
+name: Native prebuilds
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-14
+          - target: win32-x64
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build native addon
+        run: npm run native:prebuild
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Smoke-test native addon
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { parseYaml } from './dist/src/yaml-parser.js';
+          const parsed = parseYaml('openapi: 3.0.0\ninfo: {}\npaths: {}\n');
+          if (parsed.openapi !== '3.0.0') throw new Error('Native YAML smoke test failed');
+          console.log('Native YAML smoke test passed');
+          NODE
+
+      - name: Stage prebuild
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          node -e "const fs = require('node:fs'); const target = process.env.NATIVE_TARGET; fs.mkdirSync('native-artifact/' + target, { recursive: true }); fs.copyFileSync('native/prebuilds/' + target + '/parser.node', 'native-artifact/' + target + '/parser.node');"
+
+      - name: Upload prebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-prebuild-${{ matrix.target }}
+          path: native-artifact
+          if-no-files-found: error
+          retention-days: 7

@@ -4,7 +4,7 @@
  * Booking's documented download is .yaml under a JSON-variant URL).
  */
 
-import { load as yamlLoad } from "js-yaml";
+import { parseYaml } from "./yaml-parser.js";
 
 import { DocResolver, isRef } from "./ref-resolver.js";
 import { setOwn } from "./schema-closure.js";
@@ -100,7 +100,7 @@ export function parseSpecText(text: string): Record<string, unknown> {
   }
   const parsed = (() => {
     try {
-      return yamlLoad(trimmed, { json: true }) as unknown;
+      return parseYaml(trimmed);
     } catch (err) {
       // Not JSON and not YAML — surface both attempts (I5).
       throw new Error(

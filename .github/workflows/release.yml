@@ -11,10 +11,12 @@ name: Release to npm
 #
 # Usage:
 #   npm version 0.2.0
-#   git push origin master --tags
-#   Actions → "Release to npm" → Run workflow → version: 0.2.0
+#   git push origin release
+#   Or use Actions → "Release to npm" → Run workflow → version: 0.2.0
 
 on:
+  push:
+    branches: [release]
   workflow_dispatch:
     inputs:
       version:
@@ -30,7 +32,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  native-prebuild:
+    uses: ./.github/workflows/native-prebuild.yml
+
   publish:
+    needs: native-prebuild
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -45,10 +51,26 @@ jobs:
           cache: npm
 
       - name: Install
-        run: npm ci
+        run: npm ci --ignore-scripts
 
-      - name: Validate version input
+      - name: Download native prebuilds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-prebuild-*
+          path: native/prebuilds
+          merge-multiple: true
+
+      - name: Verify native prebuilds
+        shell: bash
         run: |
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            test -s "native/prebuilds/$target/parser.node"
+          done
+
+      - name: Validate release version
+        id: version
+        run: |
+          input="${VERSION_INPUT:-$(node -p 'require("./package.json").version')}"
           node -e '
             const input = process.argv[1];
             const semver = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -62,11 +84,12 @@ jobs:
               console.error("Input " + want + " does not match package.json " + pkg.version + " — run `npm version " + want + "` and commit first.");
               process.exit(1);
             }
-            console.log("Publishing v" + pkg.version);
-          ' "$VERSION_INPUT"
+            console.error("Publishing v" + pkg.version);
+            process.stdout.write("version=" + want + "\n");
+          ' "$input" >> "$GITHUB_OUTPUT"
         env:
-          # Pass via env, not inline interpolation — the semver gate makes it
-          # safe either way, but env passing makes that structural (PR5).
+          # Manual releases use the supplied version; release-branch pushes use
+          # the package version, keeping the version validation in one place.
           VERSION_INPUT: ${{ inputs.version }}
 
       - name: Fetch battle fixtures
@@ -82,11 +105,10 @@ jobs:
 
       - name: Tag and create GitHub Release
         run: |
-          VERSION="v$(echo "$VERSION_INPUT" | sed 's/^v//')"
+          VERSION="v${{ steps.version.outputs.version }}"
           git tag "$VERSION" || true # may already exist from `npm version`
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push origin "$VERSION" || true # already on remote? fine
           gh release create "$VERSION" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION_INPUT: ${{ inputs.version }}

@@ -2,8 +2,9 @@
 
 Parse **OpenAPI 3.0/3.1**, **Swagger 2.0**, and **Google Discovery** API specs
 into one normalized model, then compile memory-safe JSON-Schema tool
-definitions for LLM tool sets. TypeScript, two tiny runtime deps
-(`js-yaml`, `ajv`), no framework coupling.
+definitions for LLM tool sets. YAML parsing uses a dependency-free Node-API
+native addon with platform prebuilds and a bundled C-source fallback; Ajv remains
+optional for validation and the standard-schema adapter.
 
 > ⚠️ **WIP — expect breaking changes.** This package is pre-1.0 (`0.x`). The
 > API is still settling: new features land in minor versions, and breaking
@@ -32,6 +33,15 @@ Building LLM tools from real-world specs hits three walls:
 ```sh
 npm install multi-spec-parser
 ```
+
+The package loads a matching native prebuild when available. On another
+platform, its install script compiles the bundled `native/parser.c` with the
+local C compiler. If Node.js development headers are not installed, the
+fallback downloads and caches the exact matching headers under the user cache
+and verifies the archive before extracting it. Set `CC` to choose a compiler
+explicitly, or set `MULTI_SPEC_PARSER_NODE_HEADERS` to an absolute headers
+folder. The addon uses Node-API, so it is compatible across supported Node.js
+versions without a Node-version-specific rebuild.
 
 ## Quick start
 
@@ -156,7 +166,10 @@ origin; absolute servers are replaced outright.
 | Google Discovery | `kind: "discovery#restDescription"` | `flatPath`, `repeated`, global params, `rootUrl+servicePath`, `type:"any"` filtered |
 
 Detection is by **content**, never URL/extension (Booking ships YAML under a
-JSON-variant URL).
+JSON-variant URL). YAML loading uses the parser bundled in this package, so the
+core parser has no YAML runtime dependency. It accepts the JSON-compatible YAML
+profile used by API descriptions and rejects tags/aliases that cannot be safely
+represented in the normalized JSON model.
 
 ## Memory model
 

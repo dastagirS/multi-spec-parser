@@ -17,7 +17,8 @@
   },
   "files": [
     "dist/src",
-    "examples"
+    "examples",
+    "native"
   ],
   "sideEffects": false,
   "engines": {
@@ -37,7 +38,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run build",
+    "install": "node native/install.mjs",
+    "prepublishOnly": "npm run build && npm run native:prebuild",
+    "native:build": "node native/build.mjs",
+    "native:prebuild": "node native/build.mjs --prebuild-current",
     "test": "npm run build && node --test \"dist/test/unit/*.test.js\"",
     "battle": "npm run build && node dist/test/battle.js",
     "benchmark": "npm run build && node dist/test/benchmark.js",
@@ -55,11 +59,7 @@
     "tools"
   ],
   "license": "MIT",
-  "dependencies": {
-    "js-yaml": "^4.1.0"
-  },
   "devDependencies": {
-    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
   },
