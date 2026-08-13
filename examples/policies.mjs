@@ -1,5 +1,5 @@
 /**
- * The 0.2.0 policy surface, end to end: filterOps, extraParameters, the
+ * The policy surface, end to end: filterOps, extraParameters, the
  * execute() pipeline (401 retry → processors → truncation), describeTools(),
  * validate(), and the Standard Schema adapter.
  *
@@ -124,14 +124,17 @@ const parser = new MultiSpecParser({
     onTruncate: (size, toolName) =>
       console.log(`  ⚠ onTruncate: ${toolName} was ${size} bytes`),
 
-    // Per-tool response shaping (S3 upload, PII strip, …).
-    processors: {
-      listPets: async (result) => {
-        if (result.status !== "success") return result;
-        const count = Array.isArray(result.data?.items) ? result.data.items.length : 0;
-        return { status: "success", data: { count }, httpStatus: 200 };
+    // Ordered response shaping rules (S3 upload, PII strip, …).
+    processors: [
+      {
+        matches: (tool) => tool.method === "GET" && tool.path === "/pets",
+        process: async (result) => {
+          if (result.status !== "success") return result;
+          const count = Array.isArray(result.data?.items) ? result.data.items.length : 0;
+          return { status: "success", data: { count }, httpStatus: 200 };
+        },
       },
-    },
+    ],
 
     // describeTools() budget for the LLM/prompt projection.
     describeMaxBytes: 200,

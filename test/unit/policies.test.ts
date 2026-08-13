@@ -221,13 +221,16 @@ describe("processors (item 2)", () => {
           spec: { spec: SPEC },
           options: {
             baseUrl: `http://127.0.0.1:${port}`,
-            processors: {
-              getPet: async (result, ctx) => {
-                assert.equal(ctx.args.petId, "7");
-                if (result.status !== "success") return result;
-                return { status: "success", data: { stripped: true }, httpStatus: 200 };
+            processors: [
+              {
+                matches: (tool) => tool.method === "GET" && tool.path === "/pets/{petId}",
+                process: async (result, ctx) => {
+                  assert.equal(ctx.args.petId, "7");
+                  if (result.status !== "success") return result;
+                  return { status: "success", data: { stripped: true }, httpStatus: 200 };
+                },
               },
-            },
+            ],
           },
         });
         await parser.parse();
@@ -248,17 +251,92 @@ describe("processors (item 2)", () => {
           spec: { spec: SPEC },
           options: {
             baseUrl: `http://127.0.0.1:${port}`,
-            processors: {
-              listPets: async () => {
-                throw new Error("s3 exploded");
+            processors: [
+              {
+                matches: (tool) => tool.name === "listPets",
+                process: async () => {
+                  throw new Error("s3 exploded");
+                },
               },
-            },
+            ],
           },
         });
         await parser.parse();
         const res = await parser.execute("listPets", {});
         assert.equal(res.status, "error");
         assert.match(res.error ?? "", /s3 exploded/);
+      },
+    );
+  });
+
+  it("composes all matching processors in declaration order", async () => {
+    const order: string[] = [];
+    await withServer(
+      (req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true }));
+      },
+      async (port) => {
+        const parser = new MultiSpecParser({
+          spec: { spec: SPEC },
+          options: {
+            baseUrl: `http://127.0.0.1:${port}`,
+            processors: [
+              {
+                matches: (tool) => tool.method === "GET",
+                process: async (result) => {
+                  order.push("first");
+                  return result.status === "success"
+                    ? { ...result, data: { ...(result.data as object), first: true } }
+                    : result;
+                },
+              },
+              {
+                matches: (tool) => tool.path.startsWith("/pets"),
+                process: async (result) => {
+                  order.push("second");
+                  return result.status === "success"
+                    ? { ...result, data: { ...(result.data as object), second: true } }
+                    : result;
+                },
+              },
+            ],
+          },
+        });
+        await parser.parse();
+        const result = await parser.execute("listPets", {});
+        assert.deepEqual(order, ["first", "second"]);
+        assert.deepEqual(result.data, { ok: true, first: true, second: true });
+      },
+    );
+  });
+
+  it("a matcher failure becomes an explicit error and stops the pipeline", async () => {
+    let processed = false;
+    await withServer(
+      (req, res) => res.end("{}"),
+      async (port) => {
+        const parser = new MultiSpecParser({
+          spec: { spec: SPEC },
+          options: {
+            baseUrl: `http://127.0.0.1:${port}`,
+            processors: [
+              {
+                matches: () => { throw new Error("matcher exploded"); },
+                process: async (result) => result,
+              },
+              {
+                matches: () => true,
+                process: async (result) => { processed = true; return result; },
+              },
+            ],
+          },
+        });
+        await parser.parse();
+        const result = await parser.execute("listPets", {});
+        assert.equal(result.status, "error");
+        assert.match(result.error ?? "", /matcher exploded/);
+        assert.equal(processed, false);
       },
     );
   });
@@ -274,7 +352,12 @@ describe("processors (item 2)", () => {
           spec: { spec: SPEC },
           options: {
             baseUrl: `http://127.0.0.1:${port}`,
-            processors: { listPets: async () => "not-a-result" as never },
+            processors: [
+              {
+                matches: (tool) => tool.name === "listPets",
+                process: async () => "not-a-result" as never,
+              },
+            ],
           },
         });
         await parser.parse();
@@ -443,12 +526,15 @@ describe("response truncation (item 4)", () => {
           options: {
             baseUrl: `http://127.0.0.1:${port}`,
             maxResponseBytes: 1_000,
-            processors: {
-              listPets: async (result) =>
-                result.status === "success"
-                  ? { status: "success", data: { tiny: true }, httpStatus: 200 }
-                  : result,
-            },
+            processors: [
+              {
+                matches: (tool) => tool.method === "GET" && tool.path === "/pets",
+                process: async (result) =>
+                  result.status === "success"
+                    ? { status: "success", data: { tiny: true }, httpStatus: 200 }
+                    : result,
+              },
+            ],
           },
         });
         await parser.parse();
@@ -545,6 +631,7 @@ describe("option validation guards", () => {
     for (const options of [
       { filterOps: "not a fn" },
       { processors: { x: "not a fn" } },
+      { processors: [{ matches: "not a fn", process: async () => ({ status: "success", data: null, httpStatus: 200 }) }] },
       { extraParameters: [] },
       { onUnauthorized: "not a fn" },
       { maxAuthRetries: -1 },

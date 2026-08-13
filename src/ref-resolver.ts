@@ -10,7 +10,8 @@
 import type { RefObject } from "./types.js";
 
 export function isRef(value: unknown): value is RefObject {
-  return typeof value === "object" && value !== null && "$ref" in value;
+  return typeof value === "object" && value !== null &&
+    Object.prototype.hasOwnProperty.call(value, "$ref");
 }
 
 export class DocResolver {
@@ -35,7 +36,10 @@ export class DocResolver {
     let current: unknown = this.doc;
     for (const segment of ref.slice(2).split("/")) {
       if (typeof current !== "object" || current === null) return null;
-      current = (current as Record<string, unknown>)[decodePointerSegment(segment)];
+      const key = decodePointerSegment(segment);
+      const record = current as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(record, key)) return null;
+      current = record[key];
       if (current === undefined) return null;
     }
     return current;

@@ -28,6 +28,7 @@ import type {
   ResponseObject,
   SchemaObject,
   ServerInfo,
+  NormalizedSecurityRequirement,
   SpecFormat,
   Swagger2Operation,
   Swagger2Parameter,
@@ -54,7 +55,7 @@ const NDJSON_MEDIA_TYPES = new Set(["application/stream+json", "application/x-nd
 
 /** Guard against hung/failed fetches: parse() must not hang forever (G6). */
 const FETCH_TIMEOUT_MS = 60_000;
-const MAX_SPEC_BYTES = 200 * 1024 * 1024;
+export const MAX_SPEC_BYTES = 200 * 1024 * 1024;
 
 function isNdjsonMediaType(mediaType: string): boolean {
   return NDJSON_MEDIA_TYPES.has(mediaType.split(";")[0]!.trim().toLowerCase());
@@ -65,10 +66,11 @@ function isNdjsonMediaType(mediaType: string): boolean {
 // ---------------------------------------------------------------------------
 
 /** Fetch spec text — never res.json(): YAML specs (Booking) fail JSON parsing. */
-export async function fetchSpecText(url: string): Promise<string> {
+export async function fetchSpecText(url: string, signal?: AbortSignal): Promise<string> {
+  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(FETCH_TIMEOUT_MS);
   const res = await fetch(url, {
     headers: { Accept: "application/json, application/yaml, text/yaml, */*" },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: requestSignal,
   });
   if (!res.ok) {
     throw new Error(`Failed to fetch spec: ${res.status} ${res.statusText}`);
@@ -79,11 +81,14 @@ export async function fetchSpecText(url: string): Promise<string> {
       `Spec too large: content-length ${contentLength} bytes exceeds ${MAX_SPEC_BYTES} byte limit`,
     );
   }
-  return await res.text();
+  return await readBoundedResponseText(res, MAX_SPEC_BYTES);
 }
 
 /** Parse spec text as JSON when it looks like JSON, else YAML. */
 export function parseSpecText(text: string): Record<string, unknown> {
+  if (new TextEncoder().encode(text).byteLength > MAX_SPEC_BYTES) {
+    throw new Error(`Spec too large: text exceeds ${MAX_SPEC_BYTES} byte limit`);
+  }
   const trimmed = text.trim();
   if (!trimmed) throw new Error("Spec document is empty");
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
@@ -111,6 +116,34 @@ export function parseSpecText(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+async function readBoundedResponseText(response: Response, limit: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        throw new Error(`Spec too large: streamed body exceeds ${limit} byte limit`);
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 // ---------------------------------------------------------------------------
 // Format detection
 // ---------------------------------------------------------------------------
@@ -134,6 +167,7 @@ export function detectSpecFormat(obj: Record<string, unknown>): SpecFormat {
 /** Parse a parsed spec object into the normalized model. */
 export function parseSpec(specObj: Record<string, unknown>): ParsedSpec {
   const specFormat = detectSpecFormat(specObj);
+  validateSpecShape(specObj, specFormat);
   switch (specFormat) {
     case "openapi3":
       return parseOpenApi3(specObj as unknown as OpenApi3Spec);
@@ -142,6 +176,32 @@ export function parseSpec(specObj: Record<string, unknown>): ParsedSpec {
     case "google-discovery":
       return parseGoogleDiscovery(specObj as unknown as GoogleDiscoveryDoc);
   }
+}
+
+function validateSpecShape(spec: Record<string, unknown>, format: SpecFormat): void {
+  const paths = spec.paths;
+  if ((format === "openapi3" || format === "swagger2") && paths !== undefined && !isRecord(paths)) {
+    throw new TypeError(`${format} spec paths must be an object.`);
+  }
+  if (format === "openapi3") {
+    const components = spec.components;
+    if (components !== undefined && !isRecord(components)) {
+      throw new TypeError("OpenAPI components must be an object.");
+    }
+  }
+  if (format === "swagger2") {
+    const definitions = spec.definitions;
+    if (definitions !== undefined && !isRecord(definitions)) {
+      throw new TypeError("Swagger definitions must be an object.");
+    }
+  }
+  if (format === "google-discovery" && !isRecord(spec.resources)) {
+    throw new TypeError("Google Discovery resources must be an object.");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +261,8 @@ function openApi3Operation(
   const parameters = extractOpenApi3Parameters(pathItem, op, r, unresolved);
   const requestBody = extractRequestBody(op, r, unresolved);
   const outputSchema = extractOutputSchema(op, r, unresolved);
-  const requiredScopes = collectScopes(op.security ?? spec.security);
+  const security = normalizeSecurity(op.security ?? spec.security);
+  const requiredScopes = collectScopes(security);
   const servers = operationServers(pathItem, op, docServers);
   const operationUnresolved = unresolved.size > 0 ? [...unresolved] : undefined;
 
@@ -217,6 +278,7 @@ function openApi3Operation(
     outputSchema,
     deprecated: op.deprecated === true,
     servers,
+    security,
     requiredScopes,
     unresolvedRefs: operationUnresolved,
   };
@@ -395,7 +457,8 @@ function swagger2Operation(
 
   const consumes = op.consumes ?? spec.consumes;
   const requestBody = buildSwagger2RequestBody(bodyParams, consumes);
-  const requiredScopes = collectScopes(op.security ?? spec.security);
+  const security = normalizeSecurity(op.security ?? spec.security);
+  const requiredScopes = collectScopes(security);
   const outputSchema = swagger2OutputSchema(op, r, unresolved);
 
   return {
@@ -410,6 +473,7 @@ function swagger2Operation(
     outputSchema,
     deprecated: op.deprecated === true,
     servers: docServers,
+    security,
     requiredScopes,
     ...(unresolved.size > 0 ? { unresolvedRefs: [...unresolved] } : {}),
   };
@@ -479,13 +543,13 @@ function buildSwagger2RequestBody(
   const properties: Record<string, SchemaObject> = {};
   const required: string[] = [];
   for (const p of bodyParams) {
-    properties[p.name] = {
+    setOwn(properties, p.name, {
       type: p.type === "file" ? "string" : p.type,
       ...(p.type === "file" ? { format: "binary" } : {}),
       ...(p.format && p.type !== "file" ? { format: p.format } : {}),
       ...(p.enum ? { enum: p.enum } : {}),
       ...(p.items ? { items: p.items } : {}),
-    };
+    });
     if (p.required) required.push(p.name);
   }
   return {
@@ -564,16 +628,25 @@ function walkGoogleResources(
   operations: ExtractedOperation[],
   doc: GoogleDiscoveryDoc,
 ): void {
-  for (const [resourceName, resource] of Object.entries(resources)) {
-    const currentTags = [...tags, resourceName];
-    for (const method of Object.values(resource.methods ?? {})) {
-      operations.push(googleMethodToOperation(method, currentTags, doc));
-    }
-    if (resource.resources) {
-      walkGoogleResources(resource.resources, currentTags, operations, doc);
+  const pending: Array<{ resources: Record<string, GoogleResourceObject>; tags: string[] }> = [
+    { resources, tags },
+  ];
+  let visited = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    for (const [resourceName, resource] of Object.entries(current.resources)) {
+      visited += 1;
+      if (visited > MAX_GOOGLE_RESOURCES) throw new Error("Google resource tree exceeds the supported limit");
+      const resourceTags = [...current.tags, resourceName];
+      for (const method of Object.values(resource.methods ?? {})) {
+        operations.push(googleMethodToOperation(method, resourceTags, doc));
+      }
+      if (resource.resources) pending.push({ resources: resource.resources, tags: resourceTags });
     }
   }
 }
+
+const MAX_GOOGLE_RESOURCES = 100_000;
 
 /** Global params (prettyPrint, alt, fields, key, quotaUser, uploadType...) are
  *  injected into every operation unless already defined there. */
@@ -640,41 +713,64 @@ function googleMethodToOperation(
 
 /** Convert a Google schema: per-property required → required[], $ref bare name
  *  → #/components/schemas/X, invalid types (e.g. "any") dropped at conversion. */
-function googleSchemaToSchema(gs: GoogleSchemaObject): SchemaObject {
-  const result: SchemaObject = {};
-  if (gs.type && VALID_SCHEMA_TYPES.has(gs.type)) result.type = gs.type;
-  if (gs.description) result.description = gs.description;
-  if (gs.format) result.format = gs.format;
-  if (gs.enum) result.enum = gs.enum;
-  if (gs.default !== undefined) result.default = gs.default;
-  if (gs.readOnly) result.readOnly = true;
-
-  // Discovery marks requiredness per-property (boolean), not as a string[].
-  const required: string[] = [];
-  for (const [propName, prop] of Object.entries(gs.properties ?? {})) {
-    if (prop.required) required.push(propName);
-  }
-  if (required.length > 0) result.required = required;
-
-  if (gs.$ref) {
-    const refName = gs.$ref.replace(/^#\//, "").replace(/^schemas\//, "components/schemas/");
-    result.$ref = refName.startsWith("#")
-      ? refName
-      : `#/components/schemas/${refName.replace(/^components\/schemas\//, "")}`;
-  }
-
-  if (gs.properties) {
-    result.properties = {};
-    for (const [key, val] of Object.entries(gs.properties)) {
-      setOwn(result.properties, key, googleSchemaToSchema(val));
+function googleSchemaToSchema(root: GoogleSchemaObject): SchemaObject {
+  const results = new WeakMap<object, SchemaObject>();
+  const states = new WeakMap<object, 1 | 2>();
+  const pending: Array<{ schema: GoogleSchemaObject; exit: boolean; depth: number }> = [
+    { schema: root, exit: false, depth: 0 },
+  ];
+  let visited = 0;
+  while (pending.length > 0) {
+    const frame = pending.pop()!;
+    if (frame.depth > MAX_GOOGLE_SCHEMA_DEPTH) throw new Error("Google schema nesting exceeds the supported depth");
+    const state = states.get(frame.schema);
+    if (!frame.exit) {
+      if (state === 1) throw new Error("Cyclic Google schema object is not supported");
+      if (state === 2) continue;
+      states.set(frame.schema, 1);
+      visited += 1;
+      if (visited > MAX_GOOGLE_SCHEMA_NODES) throw new Error("Google schema exceeds the supported node limit");
+      pending.push({ schema: frame.schema, exit: true, depth: frame.depth });
+      for (const child of Object.values(frame.schema.properties ?? {}).reverse()) {
+        pending.push({ schema: child, exit: false, depth: frame.depth + 1 });
+      }
+      if (frame.schema.items) pending.push({ schema: frame.schema.items, exit: false, depth: frame.depth + 1 });
+      if (frame.schema.additionalProperties) pending.push({ schema: frame.schema.additionalProperties, exit: false, depth: frame.depth + 1 });
+      continue;
     }
+    const googleSchema = frame.schema;
+    const result: SchemaObject = {};
+    if (googleSchema.type && VALID_SCHEMA_TYPES.has(googleSchema.type)) result.type = googleSchema.type;
+    if (googleSchema.description) result.description = googleSchema.description;
+    if (googleSchema.format) result.format = googleSchema.format;
+    if (googleSchema.enum) result.enum = googleSchema.enum;
+    if (googleSchema.default !== undefined) result.default = googleSchema.default;
+    if (googleSchema.readOnly) result.readOnly = true;
+    const required: string[] = [];
+    if (googleSchema.properties) {
+      result.properties = {};
+      for (const [propertyName, propertySchema] of Object.entries(googleSchema.properties)) {
+        if (propertySchema.required) required.push(propertyName);
+        setOwn(result.properties, propertyName, results.get(propertySchema)!);
+      }
+    }
+    if (required.length > 0) result.required = required;
+    if (googleSchema.$ref) {
+      const refName = googleSchema.$ref.replace(/^#\//, "").replace(/^schemas\//, "components/schemas/");
+      result.$ref = refName.startsWith("#")
+        ? refName
+        : `#/components/schemas/${refName.replace(/^components\/schemas\//, "")}`;
+    }
+    if (googleSchema.items) result.items = results.get(googleSchema.items);
+    if (googleSchema.additionalProperties) result.additionalProperties = results.get(googleSchema.additionalProperties);
+    results.set(googleSchema, result);
+    states.set(googleSchema, 2);
   }
-  if (gs.items) result.items = googleSchemaToSchema(gs.items);
-  if (gs.additionalProperties) {
-    result.additionalProperties = googleSchemaToSchema(gs.additionalProperties);
-  }
-  return result;
+  return results.get(root)!;
 }
+
+const MAX_GOOGLE_SCHEMA_DEPTH = 512;
+const MAX_GOOGLE_SCHEMA_NODES = 1_000_000;
 
 function googleParamToSchema(gp: GoogleParameterObject): NormalizedParameter {
   const schema: SchemaObject = {
@@ -808,15 +904,27 @@ function sanitizeToolName(name: string): string {
   );
 }
 
-/** Flatten OAuth scopes from security requirements (all alternatives unioned). */
-function collectScopes(security?: Array<Record<string, string[]>>): string[] | undefined {
+function normalizeSecurity(
+  security: Array<Record<string, string[]>> | undefined,
+): NormalizedSecurityRequirement[] | undefined {
+  if (!security) return undefined;
+  return security.map((alternative) => ({
+    schemes: Object.entries(alternative).map(([name, scopes]) => ({
+      name,
+      scopes: (scopes ?? []).filter((scope): scope is string => typeof scope === "string"),
+    })),
+  }));
+}
+
+/** Backward-compatible scope projection; callers needing OR semantics use security. */
+function collectScopes(
+  security: NormalizedSecurityRequirement[] | undefined,
+): string[] | undefined {
   if (!security) return undefined;
   const scopes = new Set<string>();
-  for (const req of security) {
-    for (const schemeScopes of Object.values(req)) {
-      for (const scope of schemeScopes ?? []) {
-        if (typeof scope === "string" && scope.length > 0) scopes.add(scope);
-      }
+  for (const alternative of security) {
+    for (const scheme of alternative.schemes) {
+      for (const scope of scheme.scopes) scopes.add(scope);
     }
   }
   return scopes.size > 0 ? [...scopes] : undefined;

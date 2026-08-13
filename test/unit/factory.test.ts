@@ -146,6 +146,33 @@ describe("compileSpecToTools", () => {
     assert.equal(new Set(names).size, names.length);
   });
 
+  it("separates colliding wire parameters from model input names", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      paths: {
+        "/users/{id}": {
+          get: {
+            operationId: "users",
+            parameters: [
+              { name: "id", in: "path", required: true, schema: { type: "string" } },
+              { name: "id", in: "query", schema: { type: "string" } },
+              { name: "constructor", in: "query", schema: { type: "string" } },
+            ],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    });
+    const tool = compileSpecToTools(parsed).tools[0]!;
+    const properties = tool.inputSchema.properties as Record<string, unknown>;
+    assert.deepEqual(Object.keys(properties), ["path_id", "query_id", "constructor_2"]);
+    assert.deepEqual(
+      tool.operation.parameters.map((parameter) => [parameter.name, parameter.inputName]),
+      [["id", "path_id"], ["id", "query_id"], ["constructor", "constructor_2"]],
+    );
+  });
+
   it("prunes dangling refs (input + output) and records them on the tool", () => {
     const parsed = parseSpec({
       openapi: "3.0.0",
@@ -209,7 +236,7 @@ describe("compileSpecToTools", () => {
     assert.ok(desc.includes("DEPRECATED"));
   });
 
-  it("keeps __proto__-named schemas, params, and properties (N1)", () => {
+  it("keeps __proto__-named schemas and safely remaps the input parameter (N1)", () => {
     const spec = JSON.parse(`{
       "openapi": "3.0.0", "info": {"title":"t","version":"1"},
       "components": { "schemas": {
@@ -226,8 +253,8 @@ describe("compileSpecToTools", () => {
       "defs keeps the __proto__ schema",
     );
     const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
-    assert.ok(Object.prototype.hasOwnProperty.call(props, "__proto__"), "param __proto__ kept");
-    assert.deepEqual(props["__proto__"], { type: "string" });
+    assert.ok(Object.prototype.hasOwnProperty.call(props, "__proto___2"), "param input was remapped");
+    assert.deepEqual(props["__proto___2"], { type: "string" });
     const holderProps = (defs.Holder as { properties?: Record<string, unknown> }).properties!;
     assert.ok(Object.prototype.hasOwnProperty.call(holderProps, "__proto__"));
   });
@@ -255,7 +282,11 @@ describe("compileSpecToTools", () => {
     });
     const { tools } = compileSpecToTools(parsed);
     const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
-    assert.deepEqual(props.body, { type: "string" }); // the param wins; body not exposed
+    assert.deepEqual(props.query_body, { type: "string" });
+    assert.deepEqual(props.body, {
+      type: "object",
+      properties: { x: { type: "string" } },
+    });
   });
 
   it("prunes def-internal dangling refs once and reports them per tool (P1)", () => {

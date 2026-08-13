@@ -16,13 +16,20 @@
  *   const res = await parser.execute(tool, { status: "available" });
  */
 
-import { loadSpecSource } from "./factory.js";
-import type { CompileResult, CompiledTool, ExtraParameter } from "./factory.js";
+import { loadSpecSource, clearSpecCache, specCacheStats } from "./factory.js";
+import type {
+  CompileResult,
+  CompiledTool,
+  ExtraParameter,
+  TransformOptions,
+} from "./factory.js";
 import { buildRequest as buildRequestFor, executeRequest } from "./request-builder.js";
 import type {
   BuiltRequest,
+  ExecuteRequestOptions,
   ExecuteResult,
   RequestBuildOptions,
+  RequestTransport,
 } from "./request-builder.js";
 import type { ExtractedOperation, ParsedSpec, SchemaObject, SpecFormat } from "./types.js";
 import type { ValidateFunction } from "ajv";
@@ -45,6 +52,8 @@ export interface MultiSpecParserOptions {
   headers?: Record<string, string>;
   /** Default timeout for execute() calls (ms). */
   executeTimeoutMs?: number;
+  /** Optional API request transport; global fetch is used when omitted. */
+  transport?: RequestTransport;
   /** Open compile-time filter: return true to keep an op. A filtered op never
    *  becomes a tool — it can't be listed, described, or executed. Runs
    *  pre-dedup. Examples: readOnly → op => !["POST","PUT","PATCH","DELETE"].includes(op.method);
@@ -53,10 +62,9 @@ export interface MultiSpecParserOptions {
   filterOps?: (op: ExtractedOperation) => boolean;
   /** Item 5: per-tool extra input-schema properties. */
   extraParameters?: Record<string, ExtraParameter[]>;
-  /** Item 2: per-tool response post-processors, run after fetch, before
-   *  truncation. The consumer's closure owns all stack-specific state (S3,
-   *  PII stripping) — the package only calls the hook. */
-  processors?: Record<string, ExecuteProcessor>;
+  /** Ordered response processor rules. Every matching rule runs in
+   *  declaration order, after response transforms and before truncation. */
+  processors?: ProcessorRule[];
   /** Item 3: called on a 401 before each retry; return the new Authorization
    *  header value (your closure does the OAuth refresh). */
   onUnauthorized?: () => string | Promise<string>;
@@ -67,6 +75,12 @@ export interface MultiSpecParserOptions {
   maxResponseBytes?: number;
   /** Item 4: warning hook when a result is truncated (must not throw). */
   onTruncate?: (size: number, toolName: string) => void;
+  /** Maximum raw response body retained before decoding (default 50 MiB). */
+  maxResponseBodyBytes?: number;
+  /** Consumer-owned compile and request/response transformations. */
+  transforms?: TransformOptions;
+  /** Parsed/document cache controls. */
+  cache?: CacheOptions;
   /** Item 8: per-tool inputSchema byte budget for describeTools() (default 64KB). */
   describeMaxBytes?: number;
 }
@@ -75,8 +89,20 @@ export interface MultiSpecParserOptions {
  *  to an explicit error result, never an unhandled rejection). */
 export type ExecuteProcessor = (
   result: ExecuteResult,
-  ctx: { tool: CompiledTool; args: Record<string, unknown> },
+  ctx: {
+    tool: CompiledTool;
+    args: Record<string, unknown>;
+    request: BuiltRequest;
+    response?: ExecuteResult["response"];
+    retryCount: number;
+    signal?: AbortSignal;
+  },
 ) => ExecuteResult | Promise<ExecuteResult>;
+
+export interface ProcessorRule {
+  matches: (tool: CompiledTool) => boolean;
+  process: ExecuteProcessor;
+}
 
 /** Item 8: one entry of describeTools() — the LLM/prompt projection. */
 export interface ToolDescription {
@@ -92,6 +118,16 @@ export interface ToolDescription {
 export type ValidationResult =
   | { valid: true }
   | { valid: false; issues: Array<{ message: string }> };
+
+export interface CacheOptions {
+  enabled?: boolean;
+  maxEntries?: number;
+  ttlMs?: number;
+}
+
+export interface ParseOptions {
+  signal?: AbortSignal;
+}
 
 export interface MultiSpecParserConfig<T = Record<string, unknown>> {
   spec: SpecSource<T>;
@@ -134,13 +170,17 @@ export class MultiSpecParser<
    *
    *  (URL/text sources are Record<string, unknown>; pass an explicit generic
    *  to type them: new MultiSpecParser<MyType>({ spec: { url } })). */
-  async parse(): Promise<T> {
+  async parse(parseOptions: ParseOptions = {}): Promise<T> {
+    if (parseOptions.signal?.aborted) throw new Error("MultiSpecParser: parse aborted.");
     if (this.parsed) return this.raw as T;
     const source = this.sourceAsInput();
     const { document, parsed, compiled } = await loadSpecSource(source, {
       maxDefsBytes: this.options.maxDefsBytes,
       filterOps: this.options.filterOps,
       extraParameters: this.options.extraParameters,
+      transforms: this.options.transforms,
+      signal: parseOptions.signal,
+      cache: this.options.cache,
     });
     this.raw = document as T;
     this.parsed = parsed;
@@ -237,15 +277,23 @@ export class MultiSpecParser<
     args: Record<string, unknown>,
     options: RequestBuildOptions = {},
   ): BuiltRequest {
+    const resolved = this.resolveTool(tool);
     const defaults: RequestBuildOptions = {
       ...(this.options.baseUrl !== undefined ? { baseUrl: this.options.baseUrl } : {}),
       headers: { ...(this.options.headers ?? {}) },
     };
-    return buildRequestFor(this.resolveTool(tool).operation, args, {
+    const request = buildRequestFor(resolved.operation, args, {
       ...defaults,
       ...options,
       headers: { ...defaults.headers, ...(options.headers ?? {}) },
     });
+    const transform = this.options.transforms?.request;
+    if (!transform) return request;
+    const transformed = transform(request, { tool: resolved, args });
+    if (!isBuiltRequest(transformed)) {
+      throw new TypeError("Request transform returned an invalid request.");
+    }
+    return transformed;
   }
 
   /** Build + execute. Returns { status, httpStatus, data } — never throws on
@@ -257,13 +305,11 @@ export class MultiSpecParser<
   async execute(
     tool: string | CompiledTool,
     args: Record<string, unknown>,
-    options: RequestBuildOptions = {},
+    options: ExecuteRequestOptions = {},
   ): Promise<ExecuteResult> {
     const resolved = this.resolveTool(tool);
-    const timeoutMs =
-      this.options.executeTimeoutMs !== undefined
-        ? this.options.executeTimeoutMs
-        : undefined;
+    const timeoutMs = options.timeoutMs ?? this.options.executeTimeoutMs;
+    const maxResponseBodyBytes = options.maxResponseBodyBytes ?? this.options.maxResponseBodyBytes;
 
     // Item 3: 401 → onUnauthorized() → retry (maxAuthRetries times). The
     // retried request rebuilds with the new Authorization header; per-call
@@ -272,8 +318,19 @@ export class MultiSpecParser<
     // degrades to an explicit error result.
     const maxAuthRetries = this.options.maxAuthRetries ?? 1;
     let retries = 0;
-    let request = this.buildRequest(resolved, args, options);
-    let result = await executeRequest(request, { timeoutMs });
+    let request: BuiltRequest;
+    try {
+      request = this.buildRequest(resolved, args, options);
+    } catch (error: unknown) {
+      return requestFailure(resolved, error);
+    }
+    let result = await executeRequest(request, {
+      timeoutMs,
+      signal: options.signal,
+      maxResponseBodyBytes,
+      retryCount: 0,
+      transport: this.options.transport,
+    });
     while (
       result.status === "error" &&
       result.httpStatus === 401 &&
@@ -285,63 +342,135 @@ export class MultiSpecParser<
       try {
         header = await this.options.onUnauthorized();
       } catch (err) {
+        const message = `onUnauthorized failed: ${errorMessage(err)}`;
         return {
           status: "error",
           data: null,
           httpStatus: 401,
-          error: `onUnauthorized failed: ${err instanceof Error ? err.message : String(err)}`,
+          error: message,
+          errorDetails: {
+            code: "HTTP_ERROR",
+            message,
+            httpStatus: 401,
+            url: request.url,
+            method: request.method,
+            retryCount: retries,
+            causeMessage: errorMessage(err),
+          },
         };
       }
-      request = this.buildRequest(resolved, args, {
-        ...options,
-        headers: { ...(options.headers ?? {}), Authorization: header },
+      try {
+        request = this.buildRequest(resolved, args, {
+          ...options,
+          headers: { ...(options.headers ?? {}), Authorization: header },
+        });
+      } catch (error: unknown) {
+        return requestFailure(resolved, error);
+      }
+      result = await executeRequest(request, {
+        timeoutMs,
+        signal: options.signal,
+        maxResponseBodyBytes,
+        retryCount: retries,
+        transport: this.options.transport,
       });
-      result = await executeRequest(request, { timeoutMs });
     }
 
+    result = await this.applyResponseTransform(resolved, args, request, result, retries, options.signal);
     // Item 2: post-process (consumer closure owns S3/PII/etc.).
-    result = await this.applyProcessor(resolved, args, result);
+    result = await this.applyProcessor(resolved, args, result, request, retries, options.signal);
 
     // Item 4: uniform size guarantee AFTER processors (a processor can shrink
     // the result — truncating first would destroy its input).
     return this.maybeTruncate(resolved, result);
   }
 
+  private async applyResponseTransform(
+    tool: CompiledTool,
+    args: Record<string, unknown>,
+    request: BuiltRequest,
+    result: ExecuteResult,
+    retryCount: number,
+    signal: AbortSignal | undefined,
+  ): Promise<ExecuteResult> {
+    const transform = this.options.transforms?.response;
+    if (!transform) return result;
+    try {
+      const transformed = await transform(result, { tool, args, request, retryCount, signal });
+      return isExecuteResult(transformed) ? transformed : processorFailure(result, `Response transform for "${tool.name}" returned an invalid result.`);
+    } catch (error: unknown) {
+      return processorFailure(result, `Response transform for "${tool.name}" failed: ${errorMessage(error)}`);
+    }
+  }
+
   private async applyProcessor(
     tool: CompiledTool,
     args: Record<string, unknown>,
     result: ExecuteResult,
+    request: BuiltRequest,
+    retryCount: number,
+    signal: AbortSignal | undefined,
   ): Promise<ExecuteResult> {
-    const processor = this.options.processors?.[tool.name];
-    if (!processor) return result;
-    try {
-      const out = await processor(result, { tool, args });
-      if (!isExecuteResult(out)) {
-        // A wrong-shaped return is a bug in the processor — say so explicitly
-        // instead of silently passing the original result through.
-        return {
-          status: "error",
-          data: null,
-          httpStatus: result.httpStatus,
-          error: `Processor "${tool.name}" returned an invalid result (expected an ExecuteResult).`,
-        };
+    const rules = this.options.processors ?? [];
+    for (const rule of rules) {
+      let matches = false;
+      try {
+        matches = rule.matches(tool);
+      } catch (error: unknown) {
+        return processorFailure(
+          result,
+          `Processor matcher for "${tool.name}" failed: ${errorMessage(error)}`,
+        );
       }
-      return out;
-    } catch (err) {
-      // A throwing processor must not escape execute() — degrade explicitly.
-      return {
-        status: "error",
-        data: null,
-        httpStatus: result.httpStatus,
-        error: `Processor "${tool.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
+      if (!matches) continue;
+      try {
+        const processed = await rule.process(result, {
+          tool,
+          args,
+          request,
+          response: result.response,
+          retryCount,
+          signal,
+        });
+        if (!isExecuteResult(processed)) {
+          return processorFailure(
+            result,
+            `Processor for "${tool.name}" returned an invalid result (expected an ExecuteResult).`,
+          );
+        }
+        result = processed;
+      } catch (error: unknown) {
+        return processorFailure(
+          result,
+          `Processor for "${tool.name}" failed: ${errorMessage(error)}`,
+        );
+      }
     }
+    return result;
   }
 
   private maybeTruncate(tool: CompiledTool, result: ExecuteResult): ExecuteResult {
     const maxBytes = this.options.maxResponseBytes;
     if (maxBytes === undefined) return result;
-    const size = JSON.stringify(result).length;
+    let size: number;
+    try {
+      size = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+    } catch (error: unknown) {
+      return {
+        status: "error",
+        data: null,
+        httpStatus: result.httpStatus,
+        error: `Response could not be serialized: ${errorMessage(error)}`,
+        errorDetails: {
+          code: "INVALID_RESPONSE",
+          message: "Response could not be serialized",
+          url: result.response?.url ?? "",
+          method: tool.method,
+          retryCount: result.errorDetails?.retryCount ?? 0,
+          causeMessage: errorMessage(error),
+        },
+      };
+    }
     if (size <= maxBytes) return result;
     try {
       this.options.onTruncate?.(size, tool.name);
@@ -354,6 +483,8 @@ export class MultiSpecParser<
       httpStatus: result.httpStatus,
       size,
       toolName: tool.name,
+      response: result.response,
+      errorDetails: result.errorDetails,
       message:
         `Response was ${size} bytes — exceeds the ${maxBytes}-byte limit. ` +
         `Request a narrower response (fewer fields / more specific parameters).`,
@@ -368,9 +499,19 @@ export class MultiSpecParser<
     return this.resolveTool(tool).operation;
   }
 
+  /** Clear shared source caches; useful after a spec deployment or in tests. */
+  clearCache(): void {
+    clearSpecCache();
+  }
+
+  /** Inspect shared text/in-flight source cache entries without exposing values. */
+  cacheStats(): { textEntries: number; inflightEntries: number } {
+    return specCacheStats();
+  }
+
   private sourceAsInput(): string | Record<string, unknown> {
-    if ("url" in this.source) return this.source.url;
-    if ("text" in this.source) return this.source.text;
+    if (isUrlSource(this.source)) return this.source.url;
+    if (isTextSource(this.source)) return this.source.text;
     return this.source.spec;
   }
 
@@ -413,18 +554,18 @@ function validateConfig(config: MultiSpecParserConfig): void {
       `MultiSpecParser: spec source required — got ${JSON.stringify(source)}.`,
     );
   }
-  const present = (["url", "text", "spec"] as const).filter((k) => k in source);
+  const present = (["url", "text", "spec"] as const).filter((key) => Object.prototype.hasOwnProperty.call(source, key));
   if (present.length !== 1) {
     throw new TypeError(
       `MultiSpecParser: spec must be exactly one of {url}, {text}, {spec} — got ${JSON.stringify(source)}.`,
     );
   }
   // Runtime guards for JS consumers (TS already enforces these statically).
-  if ("url" in source) {
+  if (hasOwnKey(source, "url")) {
     if (typeof source.url !== "string" || source.url.length === 0) {
       throw new TypeError("MultiSpecParser: spec.url must be a non-empty string.");
     }
-  } else if ("text" in source) {
+  } else if (hasOwnKey(source, "text")) {
     if (typeof source.text !== "string" || source.text.length === 0) {
       throw new TypeError("MultiSpecParser: spec.text must be a non-empty string.");
     }
@@ -481,16 +622,22 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
   if (options.filterOps !== undefined && typeof options.filterOps !== "function") {
     throw new TypeError("MultiSpecParser: options.filterOps must be a function.");
   }
-  if (
-    options.processors !== undefined &&
-    (typeof options.processors !== "object" ||
-      options.processors === null ||
-      Array.isArray(options.processors) ||
-      Object.values(options.processors).some((p) => typeof p !== "function"))
-  ) {
-    throw new TypeError(
-      "MultiSpecParser: options.processors must be a map of toolName → function.",
-    );
+  if (options.processors !== undefined) {
+    if (!Array.isArray(options.processors)) {
+      throw new TypeError("MultiSpecParser: options.processors must be an array of rules.");
+    }
+    for (const [index, rule] of options.processors.entries()) {
+      if (
+        rule === null ||
+        typeof rule !== "object" ||
+        typeof rule.matches !== "function" ||
+        typeof rule.process !== "function"
+      ) {
+        throw new TypeError(
+          `MultiSpecParser: options.processors[${index}] must contain matches and process functions.`,
+        );
+      }
+    }
   }
   if (
     options.extraParameters !== undefined &&
@@ -501,6 +648,9 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
     throw new TypeError(
       "MultiSpecParser: options.extraParameters must be a map of toolName → array.",
     );
+  }
+  if (options.transport !== undefined && typeof options.transport !== "function") {
+    throw new TypeError("MultiSpecParser: options.transport must be a function.");
   }
   if (options.onUnauthorized !== undefined && typeof options.onUnauthorized !== "function") {
     throw new TypeError("MultiSpecParser: options.onUnauthorized must be a function.");
@@ -514,18 +664,90 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
     );
   }
   positiveNumber(options.maxResponseBytes, "maxResponseBytes");
+  positiveNumber(options.maxResponseBodyBytes, "maxResponseBodyBytes");
   positiveNumber(options.describeMaxBytes, "describeMaxBytes");
+  validateCacheOptions(options.cache);
   if (options.onTruncate !== undefined && typeof options.onTruncate !== "function") {
     throw new TypeError("MultiSpecParser: options.onTruncate must be a function.");
+  }
+  if (options.transforms !== undefined && typeof options.transforms !== "object") {
+    throw new TypeError("MultiSpecParser: options.transforms must be an object.");
+  }
+}
+
+function validateCacheOptions(cache: CacheOptions | undefined): void {
+  if (cache === undefined) return;
+  if (typeof cache !== "object" || cache === null || Array.isArray(cache)) {
+    throw new TypeError("MultiSpecParser: options.cache must be an object.");
+  }
+  if (cache.maxEntries !== undefined && (!Number.isInteger(cache.maxEntries) || cache.maxEntries <= 0)) {
+    throw new TypeError("MultiSpecParser: options.cache.maxEntries must be a positive integer.");
+  }
+  if (cache.ttlMs !== undefined && (!Number.isFinite(cache.ttlMs) || cache.ttlMs <= 0)) {
+    throw new TypeError("MultiSpecParser: options.cache.ttlMs must be a positive number.");
   }
 }
 
 /** Shape guard for processor results — a wrong-shaped return degrades to the
  *  original result rather than corrupting the ExecuteResult contract. */
+function isUrlSource<T>(source: SpecSource<T>): source is { url: string } {
+  return Object.prototype.hasOwnProperty.call(source, "url");
+}
+
+function isTextSource<T>(source: SpecSource<T>): source is { text: string } {
+  return Object.prototype.hasOwnProperty.call(source, "text");
+}
+
+function hasOwnKey<T extends object, K extends PropertyKey>(
+  value: T,
+  key: K,
+): value is T & Record<K, unknown> {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function isExecuteResult(value: unknown): value is ExecuteResult {
   if (typeof value !== "object" || value === null) return false;
   const status = (value as { status?: unknown }).status;
   return status === "success" || status === "error" || status === "truncated";
+}
+
+function isBuiltRequest(value: unknown): value is BuiltRequest {
+  if (typeof value !== "object" || value === null) return false;
+  const request = value as { url?: unknown; method?: unknown; headers?: unknown };
+  return typeof request.url === "string" && typeof request.method === "string" &&
+    typeof request.headers === "object" && request.headers !== null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requestFailure(tool: CompiledTool, error: unknown): ExecuteResult {
+  const message = errorMessage(error);
+  return {
+    status: "error",
+    data: null,
+    httpStatus: 0,
+    error: message,
+    errorDetails: {
+      code: "INVALID_REQUEST",
+      message,
+      url: "",
+      method: tool.method,
+      retryCount: 0,
+      causeMessage: message,
+    },
+  };
+}
+
+function processorFailure(result: ExecuteResult, message: string): ExecuteResult {
+  return {
+    status: "error",
+    data: null,
+    httpStatus: result.httpStatus,
+    error: message,
+    ...(result.response ? { response: result.response } : {}),
+  };
 }
 
 /** Item 8: $defs-stripped projection when the full schema exceeds the budget. */

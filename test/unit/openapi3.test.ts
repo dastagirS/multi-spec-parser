@@ -46,6 +46,24 @@ describe("OpenAPI 3.x adapter", () => {
     assert.ok(withOutput.length > 10, `expected many output schemas, got ${withOutput.length}`);
   });
 
+  it("preserves security alternatives and AND semantics", () => {
+    const parsed = parseSpec({
+      openapi: "3.0.0",
+      info: { title: "t", version: "1" },
+      security: [
+        { oauth: ["read", "write"], tenant: [] },
+        { apiKey: [] },
+      ],
+      paths: {
+        "/x": { get: { responses: { "200": { description: "ok" } } } },
+      },
+    });
+    assert.deepEqual(parsed.operations[0]!.security, [
+      { schemes: [{ name: "oauth", scopes: ["read", "write"] }, { name: "tenant", scopes: [] }] },
+      { schemes: [{ name: "apiKey", scopes: [] }] },
+    ]);
+  });
+
   it("parses 3.1 type arrays without normalization", () => {
     const spec = {
       openapi: "3.1.0",

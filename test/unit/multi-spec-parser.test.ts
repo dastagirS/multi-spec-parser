@@ -131,6 +131,10 @@ describe("MultiSpecParser", () => {
       () => new MultiSpecParser({ spec: { spec: SPEC }, options: { executeTimeoutMs: 0 } }),
       /executeTimeoutMs/,
     );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { cache: { maxEntries: 0 } } }),
+      /cache\.maxEntries/,
+    );
     // Valid options pass.
     new MultiSpecParser({
       spec: { spec: SPEC },
@@ -175,6 +179,66 @@ paths:
     assert.equal(first.tools().length, 3);
     await second.parse(); // global content-addressed cache → no second fetch
     assert.equal(server.hits(), 1);
+    await server.close();
+    server = undefined;
+  });
+
+  it("supports compile, request, and response transforms", async () => {
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        transforms: {
+          operation: (operation) => ({ ...operation, description: "transformed" }),
+          schema: (schema, context) => context.kind === "parameter"
+            ? { ...schema, description: "parameter transformed" }
+            : schema,
+          request: (request) => ({ ...request, headers: { ...request.headers, "X-Transform": "yes" } }),
+          response: (result) => ({ ...result, data: { transformed: result.data } }),
+        },
+      },
+    });
+    await parser.parse();
+    const request = parser.buildRequest("getPet", { petId: "one" });
+    assert.equal(request.headers["X-Transform"], "yes");
+    assert.equal(parser.tool("getPet")?.description, "transformed");
+  });
+
+  it("uses the optional custom transport and keeps the default when omitted", async () => {
+    const calls: string[] = [];
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        transport: async (request) => {
+          calls.push(request.url);
+          return new Response(JSON.stringify({ custom: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      },
+    });
+    await parser.parse();
+    const result = await parser.execute("listPets", {});
+    assert.equal(result.status, "success");
+    assert.deepEqual(result.data, { custom: true });
+    assert.deepEqual(calls, ["https://api.example.com/v1/pets"]);
+  });
+
+  it("supports parser cancellation and cache controls", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    await assert.rejects(parser.parse({ signal: controller.signal }), /parse aborted/);
+    server = await startServer();
+    const specUrl = `${server.url}/spec.json`;
+    const first = new MultiSpecParser({ spec: { url: specUrl }, options: { cache: { enabled: false } } });
+    const second = new MultiSpecParser({ spec: { url: specUrl }, options: { cache: { enabled: false } } });
+    first.clearCache();
+    await first.parse();
+    await second.parse();
+    assert.equal(server.hits(), 2);
+    assert.equal(first.cacheStats().textEntries, 0);
+    first.clearCache();
     await server.close();
     server = undefined;
   });

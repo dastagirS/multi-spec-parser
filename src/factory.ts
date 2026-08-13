@@ -12,13 +12,15 @@
  */
 
 import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
-import { fetchSpecText, parseSpec, parseSpecText } from "./parse-spec.js";
+import { fetchSpecText, MAX_SPEC_BYTES, parseSpec, parseSpecText } from "./parse-spec.js";
 import type {
   ExtractedOperation,
+  NormalizedParameter,
   ParsedSpec,
   SchemaObject,
   ServerInfo,
 } from "./types.js";
+import type { BuiltRequest, ExecuteResult } from "./request-builder.js";
 
 export interface CompiledTool {
   name: string;
@@ -62,6 +64,37 @@ export interface CompileOptions {
   /** Item 5: per-tool extra input-schema properties (LLM-visible, ignored by
    *  buildRequest, readable by processors via ctx.args). */
   extraParameters?: Record<string, ExtraParameter[]>;
+  /** Consumer-owned compile and request/response transformation seams. */
+  transforms?: TransformOptions;
+}
+
+export interface TransformOptions {
+  operation?: (operation: ExtractedOperation) => ExtractedOperation;
+  schema?: (schema: SchemaObject, context: SchemaTransformContext) => SchemaObject;
+  request?: (request: BuiltRequest, context: RequestTransformContext) => BuiltRequest;
+  response?: (
+    result: ExecuteResult,
+    context: ResponseTransformContext,
+  ) => ExecuteResult | Promise<ExecuteResult>;
+}
+
+export interface SchemaTransformContext {
+  kind: "definition" | "parameter" | "request-body" | "response";
+  name?: string;
+  operation?: ExtractedOperation;
+}
+
+export interface RequestTransformContext {
+  tool: CompiledTool;
+  args: Record<string, unknown>;
+}
+
+export interface ResponseTransformContext {
+  tool: CompiledTool;
+  args: Record<string, unknown>;
+  request: BuiltRequest;
+  retryCount: number;
+  signal?: AbortSignal;
 }
 
 /** Item 5: a consumer-supplied input property merged into a tool's schema. */
@@ -79,13 +112,20 @@ export function compileSpecToTools(
   options: CompileOptions = {},
 ): CompileResult {
   const maxDefsBytes = options.maxDefsBytes ?? DEFAULT_MAX_DEFS_BYTES;
+  const transformedSchemas: Record<string, SchemaObject> = {};
+  for (const [name, schema] of Object.entries(parsed.schemas)) {
+    setOwn(transformedSchemas, name, applySchemaTransform(schema, {
+      kind: "definition",
+      name,
+    }, options.transforms));
+  }
 
   // P1: prune the shared defs ONCE per compile. Transitivity means a ref
   // inside a def can only dangle if its name is missing from the WHOLE defs
   // map (the closure BFS includes everything reachable), so one global pass —
   // memoized per def object since defs are shared across tools — replaces the
   // old per-tool walk of the attached $defs subtree (Stripe: 1.2s → 3.0s).
-  const rawDefs = normalizeDefs(parsed.schemas) as unknown as Record<string, unknown>;
+  const rawDefs = normalizeDefs(transformedSchemas) as unknown as Record<string, unknown>;
   const allDefNames = new Set(Object.keys(rawDefs));
   const defPruneMemo = new WeakMap<object, unknown>();
   const prunedRefsByDef = new Map<string, Set<string>>();
@@ -107,22 +147,30 @@ export function compileSpecToTools(
   const seen = new Map<string, number>();
   const used = new Set<string>();
 
-  for (const op of parsed.operations) {
+  for (const sourceOperation of parsed.operations) {
+    const transformedOperation = options.transforms?.operation
+      ? options.transforms.operation(sourceOperation)
+      : sourceOperation;
+    if (!isExtractedOperation(transformedOperation)) {
+      throw new TypeError("Operation transform must return an ExtractedOperation.");
+    }
     // Open compile-time filter: return true to keep. A filtered op never
-    // becomes a tool — invisible to the LLM AND un-callable (execute() by
-    // name throws "unknown tool"). Runs before ensureUniqueName, so dropped
-    // ops consume no name slots (blocking "get" never suffixes a kept dup).
-    if (options.filterOps && !options.filterOps(op)) continue;
-    const name = ensureUniqueName(op.toolName, seen, used);
+    // becomes a tool — invisible to the LLM AND un-callable by name.
+    if (options.filterOps && !options.filterOps(transformedOperation)) continue;
+    const name = ensureUniqueName(transformedOperation.toolName, seen, used);
+    const operation = assignInputNames(transformedOperation, parsed.servers);
     // Item 5: merge consumer extras into the RAW input (before normalization)
     // so their $refs get rewritten, closed over, and pruned like any other.
-    const rawInput = buildInputSchema(op, parsed.servers);
-    mergeExtraParameters(rawInput, options.extraParameters?.[op.toolName]);
+    const rawInput = buildInputSchema(operation, parsed.servers, options.transforms);
+    mergeExtraParameters(rawInput, options.extraParameters?.[transformedOperation.toolName]);
     // Op-level schemas carry native refs (#/components/schemas, #/definitions);
     // rewrite them at the boundary so $refs resolve against the hoisted $defs.
     const inputSchema = normalizeSchemaRefs(rawInput) as Record<string, unknown>;
-    const outputSchema = op.outputSchema
-      ? (normalizeSchemaRefs(op.outputSchema) as Record<string, unknown>)
+    const outputSchema = operation.outputSchema
+      ? (normalizeSchemaRefs(applySchemaTransform(operation.outputSchema, {
+          kind: "response",
+          operation,
+        }, options.transforms)) as Record<string, unknown>)
       : undefined;
 
     // Closure of input + output refs, attached to the input schema so the LLM
@@ -161,22 +209,22 @@ export function compileSpecToTools(
 
     // Defs that were globally pruned AND are in this tool's closure surface
     // their dangling refs here too (B1 + B3 discipline: per-tool reporting).
-    const unresolvedRefs = new Set<string>(op.unresolvedRefs ?? []);
+    const unresolvedRefs = new Set<string>(operation.unresolvedRefs ?? []);
     for (const ref of pruned) unresolvedRefs.add(ref);
     for (const [defName, refs] of prunedRefsByDef) {
-      if (defName in reachable) {
+      if (Object.prototype.hasOwnProperty.call(reachable, defName)) {
         for (const ref of refs) unresolvedRefs.add(ref);
       }
     }
 
     tools.push({
       name,
-      description: buildDescription(op),
-      method: op.method,
-      path: op.path,
+      description: buildDescription(operation),
+      method: operation.method,
+      path: operation.path,
       inputSchema: prunedInput,
       outputSchema: prunedOutput,
-      operation: op,
+      operation,
       ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
     });
   }
@@ -185,21 +233,81 @@ export function compileSpecToTools(
 }
 
 /** Per-op input schema: params + body + optional contentType/server inputs. */
+function assignInputNames(
+  operation: ExtractedOperation,
+  documentServers: ServerInfo[],
+): ExtractedOperation {
+  const locationsByName = new Map<string, Set<NormalizedParameter["in"]>>();
+  for (const parameter of operation.parameters) {
+    const locations = locationsByName.get(parameter.name) ?? new Set();
+    locations.add(parameter.in);
+    locationsByName.set(parameter.name, locations);
+  }
+
+  const generated = generatedInputNames(operation, documentServers);
+  const reserved = new Set(Object.values(generated).filter((name): name is string => name !== undefined));
+  const used = new Set(reserved);
+  const parameters = operation.parameters.map((parameter) => {
+    const blocked = BLOCKED_INPUT_NAMES.has(parameter.name);
+    const safeName = blocked ? `${parameter.name}_2` : parameter.name;
+    const locations = locationsByName.get(parameter.name)!;
+    const needsLocation = locations.size > 1 || reserved.has(parameter.name);
+    const base = needsLocation && !blocked ? `${parameter.in}_${safeName}` : safeName;
+    let inputName = base;
+    let suffix = 2;
+    while (used.has(inputName)) {
+      inputName = `${base}_${suffix}`;
+      suffix += 1;
+    }
+    used.add(inputName);
+    return { ...parameter, inputName };
+  });
+  return { ...operation, parameters, generatedInputNames: generated };
+}
+
+function generatedInputNames(
+  operation: ExtractedOperation,
+  documentServers: ServerInfo[],
+): NonNullable<ExtractedOperation["generatedInputNames"]> {
+  const servers = operation.servers ?? documentServers;
+  const names: NonNullable<ExtractedOperation["generatedInputNames"]> = {};
+  if (servers.length > 1 || servers.some((server) => Object.keys(server.variables ?? {}).length > 0)) {
+    names.server = "server";
+  }
+  if (operation.requestBody?.schema) {
+    names.body = "body";
+    const contentTypes = operation.requestBody.contents;
+    if (contentTypes && contentTypes.length > 1) names.contentType = "contentType";
+    if (operation.requestBody.contentType.split(";")[0]!.trim().toLowerCase() === "application/octet-stream") {
+      names.bodyBase64 = "bodyBase64";
+    }
+  }
+  return names;
+}
+
+const BLOCKED_INPUT_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
 function buildInputSchema(
   op: ExtractedOperation,
   docServers: ServerInfo[],
+  transforms: TransformOptions | undefined,
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
   const required: string[] = [];
 
   for (const param of op.parameters) {
-    setOwn(properties, param.name, param.schema);
-    if (param.required) required.push(param.name);
+    const inputName = param.inputName ?? param.name;
+    setOwn(properties, inputName, applySchemaTransform(param.schema, {
+      kind: "parameter",
+      name: param.name,
+      operation: op,
+    }, transforms));
+    if (param.required) required.push(inputName);
   }
 
   const servers = op.servers ?? docServers;
   const serverProperty = buildServerInput(servers);
-  if (serverProperty && !("server" in properties)) properties.server = serverProperty;
+  if (serverProperty && !Object.prototype.hasOwnProperty.call(properties, "server")) setOwn(properties, "server", serverProperty);
 
   if (op.requestBody) {
     const rb = op.requestBody;
@@ -229,16 +337,23 @@ function buildInputSchema(
     let bodyBase64Added = false;
     if (canFlatten) {
       for (const [name, schema] of Object.entries(formProps)) {
-        setOwn(properties, name, schema);
+        setOwn(properties, name, applySchemaTransform(schema, {
+          kind: "request-body",
+          name,
+          operation: op,
+        }, transforms));
       }
       for (const name of rb.schema!.required ?? []) {
         if (!required.includes(name)) required.push(name);
       }
-    } else if (rb.schema && !("body" in properties)) {
-      properties.body = rb.schema;
+    } else if (rb.schema && !Object.prototype.hasOwnProperty.call(properties, "body")) {
+      properties.body = applySchemaTransform(rb.schema, {
+        kind: "request-body",
+        operation: op,
+      }, transforms);
       bodyAdded = true;
     }
-    if (isOctet && !("bodyBase64" in properties)) {
+    if (isOctet && !Object.prototype.hasOwnProperty.call(properties, "bodyBase64")) {
       properties.bodyBase64 = {
         type: "string",
         contentEncoding: "base64",
@@ -251,7 +366,7 @@ function buildInputSchema(
       if (isOctet && bodyBase64Added) required.push("bodyBase64");
       else if (bodyAdded) required.push("body");
     }
-    if (contents && contents.length > 1 && !("contentType" in properties)) {
+    if (contents && contents.length > 1 && !Object.prototype.hasOwnProperty.call(properties, "contentType")) {
       properties.contentType = {
         type: "string",
         enum: contents.map((c) => c.contentType),
@@ -276,7 +391,7 @@ function buildServerInput(servers: ServerInfo[]): Record<string, unknown> | unde
   const variableDefs: Record<string, { default: string; enum?: string[]; description?: string }> = {};
   for (const server of servers) {
     for (const [name, v] of Object.entries(server.variables ?? {})) {
-      if (!(name in variableDefs)) setOwn(variableDefs, name, v);
+      if (!Object.prototype.hasOwnProperty.call(variableDefs, name)) setOwn(variableDefs, name, v);
     }
   }
   const variableNames = Object.keys(variableDefs);
@@ -322,8 +437,20 @@ function buildDescription(op: ExtractedOperation): string {
   if (op.summary) parts.push(op.summary);
   if (op.description && op.description !== op.summary) parts.push(op.description);
   if (parts.length === 0) parts.push(`${op.method} ${op.path}`);
-  if (op.requiredScopes && op.requiredScopes.length > 0) {
-    parts.push(`Required OAuth scopes: ${op.requiredScopes.join(", ")}`);
+  if (op.security && op.security.length > 0) {
+    const alternatives = op.security.map((alternative) =>
+      alternative.schemes.length === 0
+        ? "anonymous"
+        : alternative.schemes.map((scheme) =>
+            scheme.scopes.length > 0 ? `${scheme.name} [${scheme.scopes.join(", ")}]` : scheme.name,
+          ).join(" AND "),
+    );
+    if (op.security.length === 1 && op.security[0]!.schemes.length === 1 &&
+        op.security[0]!.schemes[0]!.name === "oauth2") {
+      parts.push(`Required OAuth scopes: ${op.security[0]!.schemes[0]!.scopes.join(", ")}`);
+    } else {
+      parts.push(`Security alternatives: ${alternatives.join(" OR ")}`);
+    }
   }
   if (op.deprecated) parts.push("⚠️ DEPRECATED");
   return parts.join("\n\n");
@@ -349,7 +476,7 @@ function mergeExtraParameters(
         `compileSpecToTools: extraParameter must be { name, schema } — got ${JSON.stringify(extra)}.`,
       );
     }
-    if (extra.name in properties) {
+    if (Object.prototype.hasOwnProperty.call(properties, extra.name)) {
       throw new TypeError(
         `compileSpecToTools: extraParameter "${extra.name}" collides with a spec-declared input.`,
       );
@@ -364,6 +491,27 @@ function mergeExtraParameters(
       (input as Record<string, unknown>).required = required;
     }
   }
+}
+
+function applySchemaTransform(
+  schema: SchemaObject,
+  context: SchemaTransformContext,
+  transforms: TransformOptions | undefined,
+): SchemaObject {
+  const transform = transforms?.schema;
+  if (!transform) return schema;
+  const transformed = transform(schema, context);
+  if (typeof transformed !== "object" || transformed === null || Array.isArray(transformed)) {
+    throw new TypeError("Schema transform must return a schema object.");
+  }
+  return transformed;
+}
+
+function isExtractedOperation(value: unknown): value is ExtractedOperation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const operation = value as Partial<ExtractedOperation>;
+  return typeof operation.toolName === "string" && typeof operation.path === "string" &&
+    Array.isArray(operation.parameters);
 }
 
 function ensureUniqueName(
@@ -391,7 +539,15 @@ function ensureUniqueName(
 // ---------------------------------------------------------------------------
 
 const textCache = new Map<string, LoadedSpec>();
-let objectCache = new WeakMap<object, ParsedSpec>();
+interface CachedParsedSpec {
+  parsed: ParsedSpec;
+  cachedAtMs: number;
+}
+
+let objectCache = new WeakMap<object, CachedParsedSpec>();
+const DEFAULT_CACHE_MAX_ENTRIES = 32;
+const DEFAULT_CACHE_TTL_MS = 0;
+const MAX_SOURCE_OBJECT_NODES = 1_000_000;
 // In-flight string-source loads: two concurrent loads of the same URL must
 // fetch + parse once, not twice (PR6).
 const inflightText = new Map<string, Promise<LoadedSpec>>();
@@ -402,27 +558,76 @@ const inflightText = new Map<string, Promise<LoadedSpec>>();
 interface LoadedSpec {
   document: Record<string, unknown>;
   parsed: ParsedSpec;
+  cachedAtMs: number;
+}
+
+export interface SourceCacheOptions {
+  enabled?: boolean;
+  maxEntries?: number;
+  ttlMs?: number;
+}
+
+function assertObjectSourceWithinLimit(source: Record<string, unknown>): void {
+  const pending: unknown[] = [source];
+  const visited = new WeakSet<object>();
+  let estimatedBytes = 2;
+  let nodes = 0;
+  while (pending.length > 0) {
+    const value = pending.pop()!;
+    if (value === null) {
+      estimatedBytes += 4;
+      continue;
+    }
+    if (typeof value === "string") {
+      estimatedBytes += new TextEncoder().encode(value).byteLength + 2;
+      continue;
+    }
+    if (typeof value !== "object") {
+      estimatedBytes += String(value).length + 1;
+      continue;
+    }
+    if (visited.has(value)) continue;
+    visited.add(value);
+    nodes += 1;
+    if (nodes > MAX_SOURCE_OBJECT_NODES) throw new Error("Spec object exceeds the supported node limit");
+    if (Array.isArray(value)) {
+      for (const item of value) pending.push(item);
+      continue;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      estimatedBytes += new TextEncoder().encode(key).byteLength + 3;
+      pending.push(child);
+    }
+    if (estimatedBytes > MAX_SPEC_BYTES) {
+      throw new Error(`Spec too large: object exceeds ${MAX_SPEC_BYTES} byte limit`);
+    }
+  }
 }
 
 // Bounded LRU: a long-lived process loading many distinct specs shouldn't
 // retain every raw text + parsed model forever (G2). Re-insert on hit.
-const TEXT_CACHE_MAX = 32;
-
-function textCacheGet(key: string): LoadedSpec | undefined {
+function textCacheGet(key: string, cache: SourceCacheOptions): LoadedSpec | undefined {
+  if (cache.enabled === false) return undefined;
   const hit = textCache.get(key);
-  if (hit !== undefined) {
+  if (hit === undefined) return undefined;
+  if (cache.ttlMs !== undefined && cache.ttlMs > DEFAULT_CACHE_TTL_MS && Date.now() - hit.cachedAtMs > cache.ttlMs) {
     textCache.delete(key);
-    textCache.set(key, hit);
+    return undefined;
   }
+  textCache.delete(key);
+  textCache.set(key, hit);
   return hit;
 }
 
-function textCacheSet(key: string, loaded: LoadedSpec): void {
+function textCacheSet(key: string, loaded: LoadedSpec, cache: SourceCacheOptions): void {
+  if (cache.enabled === false) return;
   textCache.delete(key);
   textCache.set(key, loaded);
-  if (textCache.size > TEXT_CACHE_MAX) {
+  const maxEntries = cache.maxEntries ?? DEFAULT_CACHE_MAX_ENTRIES;
+  while (textCache.size > maxEntries) {
     const oldest = textCache.keys().next().value;
-    if (oldest !== undefined) textCache.delete(oldest);
+    if (oldest === undefined) break;
+    textCache.delete(oldest);
   }
 }
 
@@ -432,21 +637,32 @@ function textCacheSet(key: string, loaded: LoadedSpec): void {
  * parses once per process — a 12.9MB GitHub spec parses once); compile runs
  * fresh per call so per-call options (maxDefsBytes) always apply.
  */
+export interface LoadSpecOptions extends CompileOptions {
+  signal?: AbortSignal;
+  cache?: SourceCacheOptions;
+}
+
 export async function loadSpecSource(
   source: string | Record<string, unknown>,
-  options: CompileOptions = {},
+  options: LoadSpecOptions = {},
 ): Promise<{ document: Record<string, unknown>; parsed: ParsedSpec; compiled: CompileResult }> {
   if (typeof source !== "string") {
     // The raw document of an object source IS the passed object (identity —
     // parser.parse() returns it typed as the consumer's spec).
-    let parsed = objectCache.get(source);
-    if (!parsed) {
-      parsed = parseSpec(source);
-      objectCache.set(source, parsed);
+    assertObjectSourceWithinLimit(source);
+    const cache = options.cache ?? {};
+    const cached = cache.enabled === false ? undefined : objectCache.get(source);
+    const cacheFresh = cached === undefined || cache.ttlMs === undefined ||
+      cache.ttlMs <= DEFAULT_CACHE_TTL_MS || Date.now() - cached.cachedAtMs <= cache.ttlMs;
+    const parsed = cached && cacheFresh ? cached.parsed : parseSpec(source);
+    if (!cached || !cacheFresh) objectCache.delete(source);
+    if (cache.enabled !== false && (!cached || !cacheFresh)) {
+      objectCache.set(source, { parsed, cachedAtMs: Date.now() });
     }
     return { document: source, parsed, compiled: compileSpecToTools(parsed, options) };
   }
-  const cached = textCacheGet(source);
+  const cache = options.cache ?? {};
+  const cached = textCacheGet(source, cache);
   if (cached) return { ...cached, compiled: compileSpecToTools(cached.parsed, options) };
   const existing = inflightText.get(source);
   if (existing) {
@@ -456,11 +672,11 @@ export async function loadSpecSource(
   const promise = (async (): Promise<LoadedSpec> => {
     const text =
       source.startsWith("http://") || source.startsWith("https://")
-        ? await fetchSpecText(source)
+        ? await fetchSpecText(source, options.signal)
         : source;
     const document = parseSpecText(text);
-    const loaded: LoadedSpec = { document, parsed: parseSpec(document) };
-    textCacheSet(source, loaded);
+    const loaded: LoadedSpec = { document, parsed: parseSpec(document), cachedAtMs: Date.now() };
+    textCacheSet(source, loaded, cache);
     return loaded;
   })();
   inflightText.set(source, promise);
@@ -485,8 +701,17 @@ export async function compileSpecSource(
 }
 
 /** Test-only: drop cached entries so tests observe cold-cache behavior. */
+export interface SpecCacheStats {
+  textEntries: number;
+  inflightEntries: number;
+}
+
 export function clearSpecCache(): void {
   textCache.clear();
   inflightText.clear();
   objectCache = new WeakMap();
+}
+
+export function specCacheStats(): SpecCacheStats {
+  return { textEntries: textCache.size, inflightEntries: inflightText.size };
 }

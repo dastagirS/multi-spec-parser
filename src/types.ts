@@ -18,6 +18,16 @@ export type HttpMethod =
 
 export type ParamLocation = "query" | "path" | "header" | "cookie";
 
+export interface NormalizedSecurityScheme {
+  name: string;
+  scopes: string[];
+}
+
+/** One security alternative: schemes in this entry are AND-ed together. */
+export interface NormalizedSecurityRequirement {
+  schemes: NormalizedSecurityScheme[];
+}
+
 /**
  * A JSON-Schema-ish schema object. `type` may be an array (OpenAPI 3.1 /
  * JSON Schema 2020-12); `exclusiveMinimum/Maximum` may be numeric (3.1) or
@@ -64,7 +74,10 @@ export interface SchemaObject {
 }
 
 export interface NormalizedParameter {
+  /** Original parameter name used on the wire. */
   name: string;
+  /** Model-facing input name; assigned during tool compilation when needed. */
+  inputName?: string;
   in: ParamLocation;
   required: boolean;
   description?: string;
@@ -118,8 +131,17 @@ export interface ExtractedOperation {
   deprecated: boolean;
   /** Servers for this operation (op-level, else path-level, else document). */
   servers?: ServerInfo[];
-  /** OAuth2 scopes required by this operation (flattened). */
+  /** Security alternatives; entries are OR-ed, schemes within one entry are AND-ed. */
+  security?: NormalizedSecurityRequirement[];
+  /** Backward-compatible flattened OAuth scope view. Prefer `security`. */
   requiredScopes?: string[];
+  /** Model-facing names reserved for generated request inputs. */
+  generatedInputNames?: {
+    server?: string;
+    body?: string;
+    bodyBase64?: string;
+    contentType?: string;
+  };
   /** External $refs left unresolved (e.g. Booking's ../accommodations/...). */
   unresolvedRefs?: string[];
 }

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { buildRequest, queryParamEntries } from "../../src/request-builder.js";
+import { buildRequest, executeRequest, queryParamEntries } from "../../src/request-builder.js";
 import type { ExtractedOperation } from "../../src/types.js";
 
 function op(overrides: Partial<ExtractedOperation> = {}): ExtractedOperation {
@@ -62,6 +62,25 @@ describe("queryParamEntries (OAS3 style/explode)", () => {
   });
 });
 
+describe("executeRequest", () => {
+  it("returns structured errors and bounds response bodies", async () => {
+    const response = await executeRequest(
+      { url: "data:text/plain,123456", method: "GET", headers: {} },
+      { maxResponseBodyBytes: 3 },
+    );
+    assert.equal(response.status, "truncated");
+    assert.equal(response.errorDetails?.code, "RESPONSE_TOO_LARGE");
+
+    const aborted = new AbortController();
+    aborted.abort();
+    const cancelled = await executeRequest(
+      { url: "data:text/plain,ok", method: "GET", headers: {} },
+      { signal: aborted.signal },
+    );
+    assert.equal(cancelled.errorDetails?.code, "ABORTED");
+  });
+});
+
 describe("buildRequest", () => {
   it("substitutes path params and encodes reserved characters", () => {
     const request = buildRequest(
@@ -76,6 +95,25 @@ describe("buildRequest", () => {
       { baseUrl: "https://api.example.com" },
     );
     assert.equal(request.url, "https://api.example.com/users/a%2Fb/files/hello%20world");
+  });
+
+  it("uses distinct model names for colliding wire parameters", () => {
+    const request = buildRequest(
+      op({
+        path: "/users/{id}",
+        parameters: [
+          { name: "id", inputName: "path_id", in: "path", required: true, schema: {} },
+          { name: "id", inputName: "query_id", in: "query", required: false, schema: {} },
+          { name: "constructor", inputName: "constructor_2", in: "query", required: false, schema: {} },
+          { name: "__proto__", inputName: "__proto___2", in: "header", required: false, schema: {} },
+        ],
+      }),
+      { path_id: "user-1", query_id: "related", constructor_2: "safe", __proto___2: "trace" },
+      { baseUrl: "https://api.example.com" },
+    );
+    assert.equal(request.url, "https://api.example.com/users/user-1?id=related&constructor=safe");
+    assert.equal(Object.hasOwn(request.headers, "__proto__"), true);
+    assert.equal(request.headers["__proto__"], "trace");
   });
 
   it("throws on missing required path params", () => {

@@ -40,6 +40,7 @@
     "prepublishOnly": "npm run build",
     "test": "npm run build && node --test \"dist/test/unit/*.test.js\"",
     "battle": "npm run build && node dist/test/battle.js",
+    "benchmark": "npm run build && node dist/test/benchmark.js",
     "fixtures": "npm run build && node dist/test/scripts/fetch-fixtures.js",
     "examples": "node examples/basic.mjs && node examples/multi-format.mjs && node examples/requests.mjs && node examples/llm-tools.mjs && node examples/policies.mjs && node examples/consumer-media-upload.mjs && node examples/google-attachment-to-s3.mjs",
     "check": "npm run build && node --test \"dist/test/unit/*.test.js\" && node dist/test/battle.js"

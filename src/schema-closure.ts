@@ -32,49 +32,81 @@ export function setOwn(obj: Record<string, unknown>, key: string, value: unknown
 }
 
 /**
- * Rewrite schema refs to #/$defs/X AND convert OAS 3.0 `nullable` into
- * draft-07-valid shapes (PR4): `type` → [type, "null"], `$ref` → anyOf with
- * {type:"null"}, `enum` → append null. One pass; returns the same object when
- * nothing changed (no clone on the common no-ref/no-nullable path).
+ * Rewrite refs and nullable markers with an explicit stack. Spec documents are
+ * external input, so iterative traversal prevents aliases or deep schemas from
+ * exhausting the JavaScript call stack.
  */
 export function normalizeSchemaRefs(node: unknown): unknown {
-  if (Array.isArray(node)) {
-    let changed = false;
-    const out = node.map((item) => {
-      const n = normalizeSchemaRefs(item);
-      if (n !== item) changed = true;
-      return n;
-    });
-    return changed ? out : node;
-  }
   if (node === null || typeof node !== "object") return node;
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.$ref === "string") {
-    const m = obj.$ref.match(SCHEMA_REF_RE);
-    // $ref may carry siblings (OpenAPI 3.1 allows description/summary); those
-    // siblings must be normalized too, so recurse instead of returning early.
-    if (m) {
-      let changed = false;
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(obj)) {
-        const n = k === "$ref" ? `#/$defs/${m[1]}` : normalizeSchemaRefs(v);
-        if (n !== v) changed = true;
-        setOwn(out, k, n);
+  const states = new WeakMap<object, 1 | 2>();
+  const results = new WeakMap<object, unknown>();
+  const stack: Array<{ value: object; exit: boolean; depth: number }> = [
+    { value: node, exit: false, depth: 0 },
+  ];
+  let visited = 0;
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    const current = frame.value;
+    if (frame.depth > MAX_SCHEMA_DEPTH) throw new Error("Schema nesting exceeds the supported depth");
+    if (!frame.exit) {
+      const state = states.get(current);
+      if (state === 1) throw new Error("Cyclic schema object is not supported");
+      if (state === 2) continue;
+      states.set(current, 1);
+      visited += 1;
+      if (visited > MAX_SCHEMA_NODES) throw new Error("Schema exceeds the supported node limit");
+      if (isExternalRef(current)) {
+        results.set(current, current);
+        states.set(current, 2);
+        continue;
       }
-      const converted = applyNullable(out);
-      return converted !== out || changed ? converted : obj;
+      stack.push({ value: current, exit: true, depth: frame.depth });
+      const children = Array.isArray(current)
+        ? current
+        : Object.entries(current).filter(([key]) => key !== "$ref").map(([, value]) => value);
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        const child = children[index];
+        if (child !== null && typeof child === "object") {
+          stack.push({ value: child, exit: false, depth: frame.depth + 1 });
+        }
+      }
+      continue;
     }
-    return obj;
+    const original = current;
+    let changed = false;
+    if (Array.isArray(original)) {
+      const output = original.map((child) => {
+        const replacement = child !== null && typeof child === "object" ? results.get(child) : child;
+        if (replacement !== child) changed = true;
+        return replacement;
+      });
+      results.set(original, changed ? output : original);
+      states.set(original, 2);
+      continue;
+    }
+    const source = original as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    const reference = typeof source.$ref === "string" ? source.$ref.match(SCHEMA_REF_RE) : null;
+    for (const [key, value] of Object.entries(source)) {
+      const replacement = key === "$ref"
+        ? reference ? `#/$defs/${reference[1]}` : value
+        : value !== null && typeof value === "object" ? results.get(value) : value;
+      if (replacement !== value) changed = true;
+      setOwn(output, key, replacement);
+    }
+    const converted = applyNullable(output);
+    results.set(original, converted !== output || changed ? converted : original);
+    states.set(original, 2);
   }
-  let changed = false;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) {
-    const n = normalizeSchemaRefs(v);
-    if (n !== v) changed = true;
-    setOwn(out, k, n);
-  }
-  const converted = applyNullable(out);
-  return converted !== out || changed ? converted : obj;
+  return results.get(node);
+}
+
+const MAX_SCHEMA_DEPTH = 512;
+const MAX_SCHEMA_NODES = 1_000_000;
+
+function isExternalRef(value: object): boolean {
+  const reference = (value as Record<string, unknown>).$ref;
+  return typeof reference === "string" && !reference.match(SCHEMA_REF_RE);
 }
 
 /**
@@ -134,89 +166,120 @@ export function collectReachableDefs(
   const queue = [...wanted];
   for (let i = 0; i < queue.length; i += 1) {
     const name = queue[i]!;
-    if (name in result) continue;
+    if (Object.prototype.hasOwnProperty.call(result, name)) continue;
+    if (!Object.prototype.hasOwnProperty.call(defs, name)) continue;
     const def = defs[name];
-    if (!def) continue;
+    if (def === undefined) continue;
     setOwn(result, name, def);
     const next = new Set<string>();
     collectRefNames(def, next);
     for (const ref of next) {
-      if (!(ref in result)) queue.push(ref);
+      if (!Object.prototype.hasOwnProperty.call(result, ref)) queue.push(ref);
     }
   }
   return result;
 }
 
-/** Collect the names of every schema ref reachable in `node`, without resolving.
- *  Only `$ref` KEY values count — a description/enum/example string that merely
- *  looks like a ref must not pull defs into a tool's closure (G10). Bare
- *  strings are never refs (a `$ref` value is always reached via its key). */
+/** Collect refs with an explicit stack so hostile schema depth cannot overflow. */
 export function collectRefNames(node: unknown, into: Set<string>): void {
-  if (Array.isArray(node)) {
-    for (const item of node) collectRefNames(item, into);
-    return;
-  }
   if (node === null || typeof node !== "object") return;
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    if (key === "$ref") {
-      if (typeof value === "string") {
-        const m = value.match(SCHEMA_REF_RE);
-        if (m) into.add(decodeRefSegment(m[1]!));
+  const pending: unknown[] = [node];
+  const visited = new WeakSet<object>();
+  let count = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current === null || typeof current !== "object") continue;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    count += 1;
+    if (count > MAX_SCHEMA_NODES) throw new Error("Schema exceeds the supported node limit");
+    if (Array.isArray(current)) {
+      for (const item of current) pending.push(item);
+      continue;
+    }
+    for (const [key, value] of Object.entries(current)) {
+      if (key === "$ref") {
+        if (typeof value === "string") {
+          const match = value.match(SCHEMA_REF_RE);
+          if (match) into.add(decodeRefSegment(match[1]!));
+        }
+      } else {
+        pending.push(value);
       }
-    } else {
-      collectRefNames(value, into);
     }
   }
 }
 
-/**
- * Remove dangling $refs (pointing at names missing from `valid`) from a
- * schema graph, replacing them with `{}` (anything allowed) so the schema
- * stays Ajv-compilable. Returns a NEW graph when anything changed, else the
- * same node (mirrors normalizeSchemaRefs' no-clone-on-no-change path — the
- * memory model depends on it). Pruned names are collected into `pruned`.
- *
- * `skipKey` (e.g. "$defs") stops recursion into one subtree, keeping it by
- * reference — used by the per-tool pass, which relies on the shared defs
- * having been pruned once globally (P1).
- */
+/** Remove dangling refs with an explicit stack and bounded traversal. */
 export function removeDanglingRefs(
   node: unknown,
   valid: ReadonlySet<string>,
   pruned: Set<string>,
   skipKey?: string,
 ): unknown {
-  if (Array.isArray(node)) {
-    let changed = false;
-    const out = node.map((item) => {
-      const n = removeDanglingRefs(item, valid, pruned, skipKey);
-      if (n !== item) changed = true;
-      return n;
-    });
-    return changed ? out : node;
-  }
   if (node === null || typeof node !== "object") return node;
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.$ref === "string" && obj.$ref.startsWith("#/$defs/")) {
-    const name = decodeRefSegment(obj.$ref.slice("#/$defs/".length));
-    if (!valid.has(name)) {
-      pruned.add(obj.$ref);
-      return {}; // dangling ref → unconstrained rather than broken
-    }
-    return obj;
-  }
-  let changed = false;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === skipKey) {
-      setOwn(out, k, v);
+  const states = new WeakMap<object, 1 | 2>();
+  const results = new WeakMap<object, unknown>();
+  const pending: Array<{ value: object; exit: boolean; depth: number }> = [
+    { value: node, exit: false, depth: 0 },
+  ];
+  let visited = 0;
+  while (pending.length > 0) {
+    const frame = pending.pop()!;
+    const current = frame.value;
+    if (frame.depth > MAX_SCHEMA_DEPTH) throw new Error("Schema nesting exceeds the supported depth");
+    if (!frame.exit) {
+      const state = states.get(current);
+      if (state === 1) throw new Error("Cyclic schema object is not supported");
+      if (state === 2) continue;
+      states.set(current, 1);
+      visited += 1;
+      if (visited > MAX_SCHEMA_NODES) throw new Error("Schema exceeds the supported node limit");
+      if (!Array.isArray(current)) {
+        const reference = (current as Record<string, unknown>).$ref;
+        if (typeof reference === "string" && reference.startsWith("#/$defs/")) {
+          const name = decodeRefSegment(reference.slice("#/$defs/".length));
+          if (!valid.has(name)) {
+            pruned.add(reference);
+            results.set(current, {});
+            states.set(current, 2);
+            continue;
+          }
+        }
+      }
+      pending.push({ value: current, exit: true, depth: frame.depth });
+      const children = Array.isArray(current)
+        ? current.map((value) => value)
+        : Object.entries(current).filter(([key]) => key !== skipKey).map(([, value]) => value);
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        const child = children[index];
+        if (child !== null && typeof child === "object") pending.push({ value: child, exit: false, depth: frame.depth + 1 });
+      }
       continue;
     }
-    const n = removeDanglingRefs(v, valid, pruned, skipKey);
-    if (n !== v) changed = true;
-    setOwn(out, k, n);
+    let changed = false;
+    if (Array.isArray(current)) {
+      const output = current.map((child) => {
+        const replacement = child !== null && typeof child === "object" ? results.get(child) : child;
+        if (replacement !== child) changed = true;
+        return replacement;
+      });
+      results.set(current, changed ? output : current);
+      states.set(current, 2);
+      continue;
+    }
+    const output: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(current)) {
+      const replacement = key === skipKey
+        ? value
+        : value !== null && typeof value === "object" ? results.get(value) : value;
+      if (replacement !== value) changed = true;
+      setOwn(output, key, replacement);
+    }
+    results.set(current, changed ? output : current);
+    states.set(current, 2);
   }
-  return changed ? out : obj;
+  return results.get(node);
 }
 
 /** JSON Pointer tilde-unescape for schema names embedded in refs. */

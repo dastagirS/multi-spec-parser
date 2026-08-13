@@ -22,6 +22,17 @@ export interface BuiltRequest {
   body?: string | FormData | Uint8Array;
 }
 
+export interface TransportRequest {
+  url: string;
+  method: HttpMethod;
+  headers: Record<string, string>;
+  body?: BodyInit;
+  signal: AbortSignal;
+}
+
+/** Optional request transport. The default adapter uses global fetch. */
+export type RequestTransport = (request: TransportRequest) => Promise<Response>;
+
 export interface RequestBuildOptions {
   /** Base URL override; spec server (with {variables} substituted) is default. */
   baseUrl?: string;
@@ -37,6 +48,7 @@ export interface RequestBuildOptions {
 }
 
 const RESERVED_UNENCODED_RE = /[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=]/;
+const DEFAULT_MAX_RESPONSE_BODY_BYTES = 50 * 1024 * 1024;
 
 /** RFC 3986 reserved-aware encoding: allowReserved:true passes reserved chars. */
 function encodeReservedAware(raw: string, allowReserved: boolean): string {
@@ -54,7 +66,8 @@ export function buildRequest(
   options: RequestBuildOptions = {},
 ): BuiltRequest {
   const headers: Record<string, string> = { ...(options.headers ?? {}) };
-  const baseUrl = resolveBaseUrl(options.baseUrl, op.servers, args.server);
+  const serverArgument = hasOwn(args, "server") ? args.server : undefined;
+  const baseUrl = resolveBaseUrl(options.baseUrl, op.servers, serverArgument);
 
   const pathTemplate = options.path ?? op.path;
   const resolvedPath = resolvePath(pathTemplate, args, op.parameters);
@@ -79,7 +92,7 @@ export function buildRequest(
     if (param.in !== "header") continue;
     const value = readParamValue(args, param);
     if (value === undefined || value === null) continue;
-    headers[param.name] = String(value);
+    setOwn(headers, param.name, String(value));
   }
 
   const cookieValues: string[] = [];
@@ -113,7 +126,8 @@ export function buildRequest(
 
 /** Read a param from args — direct name, or nested in a container key. */
 function readParamValue(args: Record<string, unknown>, param: NormalizedParameter): unknown {
-  const direct = args[param.name];
+  const inputName = param.inputName ?? param.name;
+  const direct = Object.hasOwn(args, inputName) ? args[inputName] : undefined;
   if (direct !== undefined) return direct;
   const containers: Record<NormalizedParameter["in"], string[]> = {
     path: ["path", "pathParams", "params"],
@@ -124,7 +138,9 @@ function readParamValue(args: Record<string, unknown>, param: NormalizedParamete
   for (const key of containers[param.in] ?? []) {
     const container = args[key];
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
-      const nested = (container as Record<string, unknown>)[param.name];
+      const nested = Object.hasOwn(container, inputName)
+        ? (container as Record<string, unknown>)[inputName]
+        : undefined;
       if (nested !== undefined) return nested;
     }
   }
@@ -196,7 +212,7 @@ function resolvePath(
     .map((m) => m[1])
     .filter((v): v is string => typeof v === "string");
   for (const name of remaining) {
-    const value = args[name];
+    const value = Object.hasOwn(args, name) ? args[name] : undefined;
     if (value !== undefined && value !== null) {
       resolved = resolved.replaceAll(`{${name}}`, encodeURIComponent(String(value)));
     }
@@ -220,7 +236,9 @@ function encodeBody(
   args: Record<string, unknown>,
 ): { body?: string | FormData | Uint8Array; contentType: string } {
   const rb = op.requestBody!;
-  const contentType = (args.contentType as string | undefined) ?? rb.contentType;
+  const contentType = (hasOwn(args, "contentType") && typeof args.contentType === "string"
+    ? args.contentType
+    : undefined) ?? rb.contentType;
   const base = baseContentType(contentType);
 
   // Flattened form bodies (Slack-style formData): the tool schema exposes form
@@ -232,12 +250,12 @@ function encodeBody(
   const pickedForm = formFieldNames.length > 0 ? pickKeys(args, formFieldNames) : undefined;
   // args.body only — `input` was an undocumented backdoor that silently became
   // the body for consumers guessing at naming (G3).
-  const bodyValue = args.body ?? pickedForm;
+  const bodyValue = (hasOwn(args, "body") ? args.body : undefined) ?? pickedForm;
 
   if (base === "application/octet-stream") {
     if (typeof bodyValue === "string") return { body: bodyValue, contentType };
     if (bodyValue instanceof Uint8Array) return { body: bodyValue, contentType };
-    const raw = args.bodyBase64;
+    const raw = hasOwn(args, "bodyBase64") ? args.bodyBase64 : undefined;
     if (typeof raw === "string") {
       const bytes = base64ToUint8Array(raw);
       if (bytes) return { body: bytes, contentType };
@@ -306,8 +324,8 @@ function pickKeys(
   const out: Record<string, unknown> = {};
   let picked = 0;
   for (const key of keys) {
-    if (source[key] !== undefined) {
-      out[key] = source[key];
+    if (hasOwn(source, key) && source[key] !== undefined) {
+      setOwn(out, key, source[key]);
       picked += 1;
     }
   }
@@ -366,12 +384,8 @@ function resolveBaseUrl(
   const server = servers?.[0];
   if (!server) return "";
   let url = server.url;
-  const arg = (
-    typeof serverArg === "object" && serverArg !== null && !Array.isArray(serverArg)
-      ? serverArg
-      : {}
-  ) as { url?: unknown; variables?: Record<string, unknown> };
-  const chosen = servers!.find((s) => s.url === arg.url) ?? server;
+  const arg = normalizeServerArgument(serverArg);
+  const chosen = servers!.find((candidate) => candidate.url === arg.url) ?? server;
   url = chosen.url;
   const values: Record<string, string> = {};
   for (const [name, v] of Object.entries(chosen.variables ?? {})) {
@@ -386,8 +400,45 @@ function resolveBaseUrl(
   return url.replace(/\/+$/, "");
 }
 
+export type ExecuteErrorCode =
+  | "TIMEOUT"
+  | "ABORTED"
+  | "NETWORK_ERROR"
+  | "HTTP_ERROR"
+  | "RESPONSE_TOO_LARGE"
+  | "INVALID_RESPONSE"
+  | "INVALID_REQUEST";
+
+export interface ExecuteErrorDetails {
+  code: ExecuteErrorCode;
+  message: string;
+  httpStatus?: number;
+  url: string;
+  method: HttpMethod;
+  contentType?: string;
+  retryCount: number;
+  causeMessage?: string;
+}
+
+export interface ExecuteResponseMetadata {
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+  contentType?: string;
+}
+
 export interface ExecuteOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
+  maxResponseBodyBytes?: number;
+  retryCount?: number;
+  transport?: RequestTransport;
+}
+
+export interface ExecuteRequestOptions extends RequestBuildOptions {
+  timeoutMs?: number;
+  maxResponseBodyBytes?: number;
+  signal?: AbortSignal;
 }
 
 export interface ExecuteResult {
@@ -395,6 +446,8 @@ export interface ExecuteResult {
   data: unknown;
   httpStatus: number;
   error?: string;
+  errorDetails?: ExecuteErrorDetails;
+  response?: ExecuteResponseMetadata;
   /** Item 4: serialized size that exceeded maxResponseBytes (truncated only). */
   size?: number;
   /** Item 4: tool whose result was truncated (truncated only). */
@@ -410,52 +463,169 @@ export async function executeRequest(
   request: BuiltRequest,
   options: ExecuteOptions = {},
 ): Promise<ExecuteResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000);
+  const retryCount = options.retryCount ?? 0;
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const signal = combineSignals(options.signal, timeoutMs);
   try {
-    const res = await fetch(request.url, {
+    const responseTransport = options.transport ?? defaultRequestTransport;
+    const response = await responseTransport({
+      url: request.url,
       method: request.method,
       headers: request.headers,
       body: toBodyInit(request.body),
-      signal: controller.signal,
+      signal,
     });
-    if (res.status === 204) {
-      clearTimeout(timer);
-      return { status: "success", data: null, httpStatus: 204 };
+    const metadata = responseMetadata(response, request);
+    if (response.status === 204) {
+      return { status: "success", data: null, httpStatus: 204, response: metadata };
     }
-    const contentType = res.headers.get("content-type") ?? "";
-    let data: unknown;
-    if (contentType.includes("json")) {
-      try {
-        data = await res.json();
-      } catch {
-        data = await res.text();
-      }
-    } else {
-      data = await res.text();
+    const body = await readResponseBody(response, options.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES);
+    if (body.tooLarge) {
+      return {
+        status: "truncated",
+        data: null,
+        httpStatus: response.status,
+        response: metadata,
+        size: body.size,
+        message: `Response exceeded the ${body.limit}-byte body limit.`,
+        errorDetails: errorDetails("RESPONSE_TOO_LARGE", `Response exceeded the ${body.limit}-byte body limit.`, request, response, retryCount, metadata.contentType),
+      };
     }
-    clearTimeout(timer);
-    if (!res.ok) {
+    const data = decodeResponseBody(body.bytes, metadata.contentType);
+    if (!response.ok) {
+      const message = extractErrorMessage(data, response.status);
       return {
         status: "error",
         data,
-        httpStatus: res.status,
-        error: extractErrorMessage(data, res.status),
+        httpStatus: response.status,
+        error: message,
+        response: metadata,
+        errorDetails: errorDetails("HTTP_ERROR", message, request, response, retryCount, metadata.contentType),
       };
     }
-    return { status: "success", data, httpStatus: res.status };
-  } catch (err) {
-    clearTimeout(timer);
-    if (err instanceof DOMException && err.name === "AbortError") {
-      return { status: "error", data: null, httpStatus: 0, error: "Request timed out" };
-    }
+    return { status: "success", data, httpStatus: response.status, response: metadata };
+  } catch (error: unknown) {
+    const aborted = error instanceof DOMException && error.name === "AbortError";
+    const callerAborted = options.signal?.aborted === true;
+    const code: ExecuteErrorCode = callerAborted ? "ABORTED" : aborted ? "TIMEOUT" : "NETWORK_ERROR";
+    const message = callerAborted ? "Request aborted" : aborted ? "Request timed out" : error instanceof Error ? error.message : String(error);
     return {
       status: "error",
       data: null,
       httpStatus: 0,
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
+      errorDetails: { code, message, url: request.url, method: request.method, retryCount, causeMessage: error instanceof Error ? error.message : String(error) },
     };
   }
+}
+
+interface BoundedResponseBody {
+  bytes: Uint8Array;
+  size: number;
+  tooLarge: boolean;
+  limit: number;
+}
+
+const defaultRequestTransport: RequestTransport = async (request) =>
+  fetch(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: request.signal,
+  });
+
+function combineSignals(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+}
+
+async function readResponseBody(response: Response, limit: number): Promise<BoundedResponseBody> {
+  if (!response.body) return { bytes: new Uint8Array(), size: 0, tooLarge: false, limit };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        return { bytes: new Uint8Array(), size, tooLarge: true, limit };
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, size, tooLarge: false, limit };
+}
+
+function decodeResponseBody(bytes: Uint8Array, contentType: string | undefined): unknown {
+  const text = new TextDecoder().decode(bytes);
+  if (!contentType?.includes("json")) return text;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function responseMetadata(response: Response, request: BuiltRequest): ExecuteResponseMetadata {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of response.headers) setOwn(headers, name, value);
+  const contentType = response.headers.get("content-type") ?? undefined;
+  return {
+    url: response.url || request.url,
+    status: response.status,
+    headers,
+    ...(contentType ? { contentType } : {}),
+  };
+}
+
+function errorDetails(
+  code: ExecuteErrorCode,
+  message: string,
+  request: BuiltRequest,
+  response: Response,
+  retryCount: number,
+  contentType: string | undefined,
+): ExecuteErrorDetails {
+  return {
+    code,
+    message,
+    httpStatus: response.status,
+    url: request.url,
+    method: request.method,
+    ...(contentType ? { contentType } : {}),
+    retryCount,
+  };
+}
+
+function normalizeServerArgument(serverArgument: unknown): {
+  url?: unknown;
+  variables?: Record<string, unknown>;
+} {
+  if (typeof serverArgument !== "object" || serverArgument === null || Array.isArray(serverArgument)) {
+    return {};
+  }
+  const source = serverArgument as Record<string, unknown>;
+  const result: { url?: unknown; variables?: Record<string, unknown> } = {};
+  if (hasOwn(source, "url")) result.url = source.url;
+  if (hasOwn(source, "variables") && isRecord(source.variables)) {
+    result.variables = source.variables;
+  }
+  return result;
+}
+
+function hasOwn(object: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
 }
 
 function extractErrorMessage(data: unknown, status: number): string {

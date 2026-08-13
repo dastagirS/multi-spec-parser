@@ -8,23 +8,38 @@
 export { MultiSpecParser } from "./multi-spec-parser.js";
 export type {
   ExecuteProcessor,
+  ProcessorRule,
   MultiSpecParserConfig,
   MultiSpecParserOptions,
   SpecSource,
   ToolDescription,
   ValidationResult,
+  CacheOptions,
+  ParseOptions,
 } from "./multi-spec-parser.js";
 export type {
   CompileOptions,
   CompiledTool,
   CompileResult,
   ExtraParameter,
+  TransformOptions,
+  SchemaTransformContext,
+  RequestTransformContext,
+  ResponseTransformContext,
+  SourceCacheOptions,
+  SpecCacheStats,
 } from "./factory.js";
 export type {
   BuiltRequest,
   ExecuteOptions,
+  ExecuteErrorCode,
+  ExecuteErrorDetails,
+  ExecuteResponseMetadata,
+  ExecuteRequestOptions,
   ExecuteResult,
   RequestBuildOptions,
+  RequestTransport,
+  TransportRequest,
 } from "./request-builder.js";
 export type {
   ExtractedOperation,
@@ -50,6 +65,8 @@ export type {
   ServerInfo,
   ServerVariable,
   SpecFormat,
+  NormalizedSecurityRequirement,
+  NormalizedSecurityScheme,
   Swagger2Operation,
   Swagger2Parameter,
   Swagger2PathItem,

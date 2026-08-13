@@ -74,6 +74,39 @@ const res = await parser.execute("findPetsByStatus", { status: "available" });
 The internal functions (`parseSpec`, `compileSpecToTools`, …) are not part of
 the public API — the exports map blocks them; everything hangs off the class.
 
+### Cancellation, limits, and cache controls
+
+Parsing and execution accept caller cancellation. Execution also supports a
+per-call timeout and raw response-body limit:
+
+```ts
+const controller = new AbortController();
+const result = await parser.execute("listPets", {}, {
+  signal: controller.signal,
+  timeoutMs: 10_000,
+  maxResponseBodyBytes: 5_000_000,
+});
+```
+
+Execution results include response metadata and structured `errorDetails` with
+codes such as `ABORTED`, `TIMEOUT`, `NETWORK_ERROR`, `HTTP_ERROR`, and
+`RESPONSE_TOO_LARGE`. API execution uses the library's default `fetch`
+transport unless `options.transport` is supplied:
+
+```ts
+const parser = new MultiSpecParser({
+  spec: { spec: document },
+  options: {
+    transport: ({ url, method, headers, body, signal }) =>
+      fetch(url, { method, headers, body, signal }),
+  },
+});
+```
+
+Configure parsed-source caching with
+`options.cache.enabled`, `maxEntries`, and `ttlMs`; `parser.clearCache()` and
+`parser.cacheStats()` control and inspect the shared cache.
+
 ## Examples
 
 Runnable, copy-pasteable usage lives in [`examples/`](examples/) (also shipped in the npm tarball):
@@ -155,14 +188,39 @@ JSON-variant URL).
   tool as `unresolvedRefs`.
 - **`__proto__` keys** (schema/property/param names) are preserved as own
   properties — the parser never trips the prototype trap.
+- Security metadata preserves OpenAPI semantics: alternatives are OR-ed, and
+  schemes inside one alternative are AND-ed. The parser exposes declarations;
+  consumers own authentication policy.
 - The `method` (GET/POST/…) is exposed on every tool so approval/gating
   layers can derive read-only semantics themselves (`!["POST","PUT","PATCH","DELETE"].includes(tool.method)`).
 
 ## Policies & hooks
 
-All optional, all additive — the defaults behave exactly like the bare parser.
-Whatever is stack-specific (S3, OAuth, storage budgets) lives in **your**
-closure; the package only calls the hooks.
+`options.transforms` provides generic consumer-owned seams for operation,
+schema, request, and response changes. Transforms do not add authentication or
+provider-specific protocols; they let a consumer adapt metadata or transport
+without forking the parser.
+
+```ts
+const parser = new MultiSpecParser({
+  spec: { text: openApiText },
+  options: {
+    transforms: {
+      operation: (operation) => ({ ...operation, tags: [...operation.tags, "internal"] }),
+      request: (request) => ({
+        ...request,
+        headers: { ...request.headers, "X-Request-Source": "agent" },
+      }),
+    },
+  },
+});
+```
+
+All hooks are optional, and omitted hooks preserve the default behavior.
+`processors` is intentionally a pattern-matching pipeline rather than a
+name-keyed map; this WIP package may make breaking API changes. Whatever is
+stack-specific (S3, OAuth, storage budgets) lives in **your** closure; the
+package only calls the hooks.
 
 ```ts
 const parser = new MultiSpecParser({
@@ -186,14 +244,18 @@ const parser = new MultiSpecParser({
     // LLM-side schema budget for describeTools().
     describeMaxBytes: 20_000,
 
-    // Per-tool response post-processors (S3 upload, PII strip, …).
-    processors: {
-      gmail_users_messages_attachments_get: async (result, { args }) => {
-        if (result.status !== "success" || !result.data?.data) return result;
-        const s3Url = await s3.upload(`attachments/${args.userId}/${args.id}`, result.data.data);
-        return { status: "success", data: { s3Url }, httpStatus: 200 };
+    // Ordered response processor rules. Every matching rule runs.
+    processors: [
+      {
+        matches: (tool) =>
+          tool.operation.tags.includes("attachments") && tool.method === "GET",
+        process: async (result, { args }) => {
+          if (result.status !== "success" || !result.data?.data) return result;
+          const s3Url = await s3.upload(`attachments/${args.userId}/${args.id}`, result.data.data);
+          return { status: "success", data: { s3Url }, httpStatus: 200 };
+        },
       },
-    },
+    ],
 
     // Extra LLM-visible inputs that buildRequest ignores (processor metadata).
     extraParameters: {
@@ -207,6 +269,10 @@ const parser = new MultiSpecParser({
 
 Semantics:
 
+- **`processors`** is an ordered pipeline. Each `matches(tool)` predicate
+  receives compiled metadata such as method, path, tags, scopes, and vendor
+  extensions. Every matching rule runs in declaration order; a matcher or
+  processor failure stops the pipeline with an explicit error.
 - **`filterOps(op) → boolean`** filters at compile time, before name dedup —
   a filtered op consumes no name slot, it never appears in `tools()` /
   `describeTools()`, and `execute()`/`tool()` by its name throws "unknown
@@ -244,12 +310,16 @@ tool" (the safety boundary: a tool that doesn't exist can't be called).
 | `extraParameters` | `parse()` (compile) | none |
 | `baseUrl` | `buildRequest()` / `execute()` | spec server |
 | `headers` | `buildRequest()` / `execute()` | none |
+| `transport` | `execute()` | global `fetch` |
 | `executeTimeoutMs` | `execute()` | 30s |
+| `maxResponseBodyBytes` | `execute()` (raw body) | 50MiB |
 | `processors` | `execute()` (after fetch) | none |
 | `onUnauthorized` | `execute()` (on 401) | disabled |
 | `maxAuthRetries` | `execute()` (on 401) | 1 |
 | `maxResponseBytes` | `execute()` (after processors) | no cap |
 | `onTruncate` | `execute()` (on truncate) | none |
+| `transforms` | parse/build/execute | none |
+| `cache` | `parse()` | enabled, bounded cache |
 | `describeMaxBytes` | `describeTools()` | 64KB |
 
 ## Consumer-side protocols
@@ -287,8 +357,8 @@ exchange, S3 storage — you build it on top of what the parser gives you:
   local server).
 
 - **The hooks** (`filterOps`, `processors`, `onUnauthorized`, `onTruncate`,
-  `extraParameters`) are the seams where your policy plugs in — S3/OAuth/etc.
-  live in your closures, never in the package.
+  `extraParameters`, `transforms`, `transport`) are the seams where your
+  policy plugs in — S3/OAuth/etc. live in your closures, never in the package.
 
 ## Releasing
 
@@ -308,6 +378,25 @@ The workflow validates the input against `package.json`, runs the full test
 gate (build + unit + battle suite), publishes to npm, and creates a GitHub
 Release with an auto-generated changelog. CI runs the same gate on every
 push/PR to `master`.
+
+## Performance benchmark
+
+```sh
+npm run benchmark
+BENCHMARK_ITERATIONS=5 npm run benchmark
+```
+
+The benchmark fetches the latest official upstream documents at runtime and
+runs each case in a fresh heap-capped child process. It measures the public
+`parse()` lifecycle (text decoding, normalization, and per-tool compilation),
+not network time; download time, document size, tool count, median/p95 parse
+time, and heap usage are reported separately. Cases currently include Slack,
+Microsoft Graph v1.0 (including Outlook), Gmail, Google Drive, Stripe, and
+GitHub. Because upstream documents and network conditions change, benchmark
+numbers are observational rather than CI pass/fail thresholds.
+
+`npm test` and `npm run check` remain deterministic and do not fetch benchmark
+sources.
 
 ## Tests
 
