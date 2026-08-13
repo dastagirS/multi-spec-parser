@@ -15,6 +15,7 @@ const MAX_HEADERS_ARCHIVE_BYTES = 25 * 1024 * 1024;
 const MAX_HEADERS_UNCOMPRESSED_BYTES = 100 * 1024 * 1024;
 const MAX_HEADER_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_HEADER_CHUNKS = 100_000;
+const MAX_NODE_LIBRARY_BYTES = 10 * 1024 * 1024;
 const HEADER_DOWNLOAD_TIMEOUT_MS = 60_000;
 const NODE_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
@@ -149,6 +150,47 @@ async function nodeIncludeDirectory() {
   return downloadNodeHeaders();
 }
 
+async function downloadNodeLibrary() {
+  const version = process.versions.node;
+  assertCondition(NODE_VERSION_PATTERN.test(version), `Unsupported Node.js version: ${version}`);
+  const target = process.arch === "x64" ? "win-x64" : process.arch === "arm64" ? "win-arm64" : undefined;
+  assertCondition(target !== undefined, `Windows native build does not support ${process.arch}`);
+  const cacheDirectory = join(homedir(), ".cache", "multi-spec-parser", "node-headers", version);
+  const libraryPath = join(cacheDirectory, "node.lib");
+  if (existsSync(libraryPath)) return libraryPath;
+  const url = `https://nodejs.org/download/release/v${version}/${target}/node.lib`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(HEADER_DOWNLOAD_TIMEOUT_MS) });
+  assertCondition(response.ok, `Could not download Node library: ${response.status} ${response.statusText}`);
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  assertCondition(contentLength === 0 || contentLength <= MAX_NODE_LIBRARY_BYTES, "Node library download is too large");
+  const libraryBytes = await readBoundedResponse(response, MAX_NODE_LIBRARY_BYTES);
+  mkdirSync(cacheDirectory, { recursive: true });
+  const temporaryPath = `${libraryPath}.tmp-${process.pid}`;
+  rmSync(temporaryPath, { force: true });
+  writeFileSync(temporaryPath, libraryBytes, { mode: 0o644 });
+  try {
+    if (!existsSync(libraryPath)) renameSync(temporaryPath, libraryPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+  assertCondition(existsSync(libraryPath), `Node library was not cached at ${libraryPath}`);
+  return libraryPath;
+}
+
+async function nodeLibraryPath() {
+  if (process.platform !== "win32") return undefined;
+  const candidates = [
+    process.env.MULTI_SPEC_PARSER_NODE_LIB,
+    join(dirname(process.execPath), "node.lib"),
+  ].filter((candidate) => candidate !== undefined && candidate.length > 0);
+  const result = candidates.find((candidate) => existsSync(candidate));
+  if (result !== undefined) {
+    assertCondition(isAbsolute(result), "Node library path must be absolute");
+    return result;
+  }
+  return downloadNodeLibrary();
+}
+
 function compilerCommand() {
   const configured = process.env.CC;
   const candidates = configured ? [configured] : process.platform === "win32" ? ["clang-cl", "cl"] : ["cc", "clang", "gcc"];
@@ -168,18 +210,20 @@ function compileUnix(includeDirectory) {
   return ["-O3", "-std=c11", "-Wall", "-Wextra", "-Werror", ...linkerArguments, `-I${includeDirectory}`, "-o", outputPath, sourcePath];
 }
 
-function compileWindows(includeDirectory) {
+function compileWindows(includeDirectory, libraryPath) {
   assertCondition(process.platform === "win32", "Windows compilation selected on another platform");
   assertCondition(includeDirectory.length > 0, "Windows Node include directory is empty");
-  return ["/LD", "/O2", "/W4", `/I${includeDirectory}`, `/Fe:${outputPath}`, sourcePath];
+  assertCondition(libraryPath !== undefined && isAbsolute(libraryPath), "Windows Node library path is invalid");
+  return ["/LD", "/O2", "/W4", `/I${includeDirectory}`, `/Fe:${outputPath}`, sourcePath, "/link", libraryPath];
 }
 
 async function build() {
   assertCondition(existsSync(sourcePath), `Native source is missing: ${sourcePath}`);
   const includeDirectory = await nodeIncludeDirectory();
   const compiler = compilerCommand();
+  const libraryPath = await nodeLibraryPath();
   const commandArguments = process.platform === "win32"
-    ? compileWindows(includeDirectory)
+    ? compileWindows(includeDirectory, libraryPath)
     : compileUnix(includeDirectory);
   mkdirSync(dirname(outputPath), { recursive: true });
   const result = spawnSync(compiler, commandArguments, { stdio: "inherit", windowsHide: true });

@@ -31,9 +31,11 @@ A matching native prebuild is used when available. Otherwise installation
 compiles bundled `native/parser.c` with a local C compiler. If Node.js headers
 are missing, it downloads, verifies, and caches the exact matching headers.
 
-Set `CC` to select a compiler or
-`MULTI_SPEC_PARSER_NODE_HEADERS` to provide an absolute headers directory.
-Node-API keeps the addon compatible across supported Node.js versions.
+Set `CC` to select a compiler,
+`MULTI_SPEC_PARSER_NODE_HEADERS` for an absolute headers directory, or
+`MULTI_SPEC_PARSER_NODE_LIB` for an explicit Windows `node.lib` path. Windows
+builds download and cache the matching import library when needed. Node-API
+keeps the addon compatible across supported Node.js versions.
 
 ## Quick start
 
