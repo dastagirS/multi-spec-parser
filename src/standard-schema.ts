@@ -7,18 +7,23 @@
  */
 import assert from "node:assert/strict";
 import { Ajv } from "ajv";
-import type { ErrorObject } from "ajv";
+import type { ErrorObject, ValidateFunction } from "ajv";
 import type { CompiledTool } from "./factory.js";
 import {
+  cloneForDefaultApplication,
   createStandardSchemaAdapter,
+  type DefaultPolicy,
+  type StandardSchemaAdapterOptions,
   type StandardSchemaIssue,
   type StandardSchemaLike,
 } from "./standard-schema-adapter.js";
 
 export type {
+  DefaultPolicy,
   StandardJSONSchemaV1,
   StandardJsonSchemaOptions,
   StandardJsonSchemaTarget,
+  StandardSchemaAdapterOptions,
   StandardSchemaIssue,
   StandardSchemaLike,
   StandardSchemaOptions,
@@ -29,22 +34,55 @@ export type {
 const MAX_AJV_ERRORS = 1_000_000;
 const MAX_INSTANCE_PATH_LENGTH = 16 * 1024;
 const ajv = new Ajv({ strict: false, allErrors: true });
-const wrappers = new WeakMap<CompiledTool, StandardSchemaLike>();
+const defaultingAjv = new Ajv({ strict: false, allErrors: true, useDefaults: true });
+const wrappers = new WeakMap<CompiledTool, Map<DefaultPolicy, StandardSchemaLike>>();
+const validators = new WeakMap<CompiledTool, Map<DefaultPolicy, ValidateFunction>>();
 
 /** Wrap a compiled tool's input schema with synchronous validation and JSON
  *  Schema projections. Memoization avoids recompiling Ajv for the same tool. */
-export function toStandardSchema(tool: CompiledTool): StandardSchemaLike {
+export function toStandardSchema(
+  tool: CompiledTool,
+  options: StandardSchemaAdapterOptions = {},
+): StandardSchemaLike {
   assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
   assert(typeof tool.name === "string" && tool.name.length > 0, "compiled tool name must be non-empty");
-  const cached = wrappers.get(tool);
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
+  const defaultPolicy = options.defaultPolicy ?? "preserve";
+  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+  let cachedWrappers = wrappers.get(tool);
+  if (!cachedWrappers) {
+    cachedWrappers = new Map();
+    wrappers.set(tool, cachedWrappers);
+  }
+  const cached = cachedWrappers.get(defaultPolicy);
   if (cached) return cached;
-  const validate = ajv.compile(tool.inputSchema as object);
+  const validate = getValidator(tool, defaultPolicy);
   const wrapper = createStandardSchemaAdapter(tool, (value) => {
-    if (validate(value)) return { value };
-    return { issues: toIssues(validate.errors) };
+    try {
+      const candidate = defaultPolicy === "apply" ? cloneForDefaultApplication(value) : value;
+      if (validate(candidate)) return { value: candidate };
+      return { issues: toIssues(validate.errors) };
+    } catch (error: unknown) {
+      return { issues: [{ message: error instanceof Error ? error.message : String(error) }] };
+    }
   });
-  wrappers.set(tool, wrapper);
+  cachedWrappers.set(defaultPolicy, wrapper);
   return wrapper;
+}
+
+function getValidator(tool: CompiledTool, defaultPolicy: DefaultPolicy): ValidateFunction {
+  assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
+  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+  let cachedValidators = validators.get(tool);
+  if (!cachedValidators) {
+    cachedValidators = new Map();
+    validators.set(tool, cachedValidators);
+  }
+  const cached = cachedValidators.get(defaultPolicy);
+  if (cached) return cached;
+  const compiled = (defaultPolicy === "apply" ? defaultingAjv : ajv).compile(tool.inputSchema as object);
+  cachedValidators.set(defaultPolicy, compiled);
+  return compiled;
 }
 
 function toIssues(errors: ErrorObject[] | null | undefined): ReadonlyArray<StandardSchemaIssue> {

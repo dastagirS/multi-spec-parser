@@ -16,6 +16,8 @@
  *   const res = await parser.execute(tool, { status: "available" });
  */
 
+import assert from "node:assert/strict";
+
 import { loadSpecSource, clearSpecCache, specCacheStats } from "./factory.js";
 import type {
   CompileResult,
@@ -34,7 +36,9 @@ import type {
 import type { ExtractedOperation, ParsedSpec, SchemaObject, SpecFormat } from "./types.js";
 import type { ValidateFunction } from "ajv";
 import {
+  cloneForDefaultApplication,
   createStandardSchemaAdapter,
+  type DefaultPolicy,
   type StandardSchemaLike,
 } from "./standard-schema-adapter.js";
 
@@ -87,6 +91,8 @@ export interface MultiSpecParserOptions {
   cache?: CacheOptions;
   /** Item 8: per-tool inputSchema byte budget for describeTools() (default 64KB). */
   describeMaxBytes?: number;
+  /** Whether validation/execution preserves or applies schema defaults. */
+  defaultPolicy?: DefaultPolicy;
 }
 
 /** Item 2: result transformer; may be async; may not throw (a throw degrades
@@ -120,7 +126,7 @@ export interface ToolDescription {
 
 /** Result of parser.validate() — never throws; issues carry Ajv messages. */
 export type ValidationResult =
-  | { valid: true }
+  | { valid: true; value?: unknown }
   | { valid: false; issues: Array<{ message: string }> };
 
 export interface CacheOptions {
@@ -131,6 +137,10 @@ export interface CacheOptions {
 
 export interface ParseOptions {
   signal?: AbortSignal;
+}
+
+export interface ValidationOptions {
+  defaultPolicy?: DefaultPolicy;
 }
 
 export interface MultiSpecParserConfig<T = Record<string, unknown>> {
@@ -147,7 +157,7 @@ const DEFAULT_DESCRIBE_MAX_BYTES = 64 * 1024;
 // validate() lazily loads ajv only when first called (dynamic import), so the
 // core module never statically imports it — the standard-schema subpath is
 // the only place ajv is required at module load.
-const validators = new WeakMap<CompiledTool, ValidateFunction>();
+const validators = new WeakMap<CompiledTool, Map<DefaultPolicy, ValidateFunction>>();
 
 export class MultiSpecParser<
   T extends Record<string, unknown> = Record<string, unknown>,
@@ -233,16 +243,24 @@ export class MultiSpecParser<
 
   /** Return a combined Standard Schema + Standard JSON Schema adapter. The
    *  validator is asynchronous here so the core keeps Ajv lazy-loaded. */
-  toStandardSchema(tool: string | CompiledTool): StandardSchemaLike {
+  toStandardSchema(
+    tool: string | CompiledTool,
+    options: ValidationOptions = {},
+  ): StandardSchemaLike {
+    assert(options !== null && typeof options === "object" && !Array.isArray(options), "validation options must be an object");
+    const defaultPolicy = options.defaultPolicy ?? this.options.defaultPolicy ?? "preserve";
+    assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
     const resolved = this.resolveTool(tool);
     const cached = this.standardSchemaWrappers.get(resolved);
-    if (cached) return cached;
+    if (cached && defaultPolicy === (this.options.defaultPolicy ?? "preserve")) return cached;
     const wrapper = createStandardSchemaAdapter(resolved, async (value) => {
-      const result = await this.validate(resolved, value);
-      if (result.valid) return { value };
+      const result = await this.validate(resolved, value, { defaultPolicy });
+      if (result.valid) return { value: "value" in result ? result.value : value };
       return { issues: result.issues };
     });
-    this.standardSchemaWrappers.set(resolved, wrapper);
+    if (defaultPolicy === (this.options.defaultPolicy ?? "preserve")) {
+      this.standardSchemaWrappers.set(resolved, wrapper);
+    }
     return wrapper;
   }
 
@@ -251,18 +269,18 @@ export class MultiSpecParser<
   async validate(
     tool: string | CompiledTool,
     args: unknown,
+    options: ValidationOptions = {},
   ): Promise<ValidationResult> {
     const resolved = this.resolveTool(tool);
     try {
-      let validate = validators.get(resolved);
-      if (!validate) {
-        const { Ajv } = await import("ajv");
-        validate = new Ajv({ strict: false, allErrors: true }).compile(
-          resolved.inputSchema as object,
-        );
-        validators.set(resolved, validate);
+      assert(options !== null && typeof options === "object" && !Array.isArray(options), "validation options must be an object");
+      const defaultPolicy = options.defaultPolicy ?? this.options.defaultPolicy ?? "preserve";
+      assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+      const validate = await this.getValidator(resolved, defaultPolicy);
+      const candidate = defaultPolicy === "apply" ? cloneForDefaultApplication(args) : args;
+      if (validate(candidate)) {
+        return defaultPolicy === "apply" ? { valid: true, value: candidate } : { valid: true };
       }
-      if (validate(args)) return { valid: true };
       return {
         valid: false,
         issues:
@@ -278,6 +296,39 @@ export class MultiSpecParser<
         ],
       };
     }
+  }
+
+  private async getValidator(tool: CompiledTool, defaultPolicy: DefaultPolicy): Promise<ValidateFunction> {
+    assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
+    assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+    let cached = validators.get(tool);
+    if (!cached) {
+      cached = new Map();
+      validators.set(tool, cached);
+    }
+    const existing = cached.get(defaultPolicy);
+    if (existing) return existing;
+    const { Ajv } = await import("ajv");
+    const validator = new Ajv({
+      strict: false,
+      allErrors: true,
+      ...(defaultPolicy === "apply" ? { useDefaults: true } : {}),
+    }).compile(tool.inputSchema as object);
+    cached.set(defaultPolicy, validator);
+    return validator;
+  }
+
+  private async applyConfiguredDefaults(
+    tool: CompiledTool,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
+    assert(args !== null && typeof args === "object" && !Array.isArray(args), "execution args must be an object");
+    if ((this.options.defaultPolicy ?? "preserve") === "preserve") return args;
+    const candidate = cloneForDefaultApplication(args);
+    const validate = await this.getValidator(tool, "apply");
+    validate(candidate);
+    return candidate;
   }
 
   /** The tool with the given name, or undefined. */
@@ -330,6 +381,12 @@ export class MultiSpecParser<
     const resolved = this.resolveTool(tool);
     const timeoutMs = options.timeoutMs ?? this.options.executeTimeoutMs;
     const maxResponseBodyBytes = options.maxResponseBodyBytes ?? this.options.maxResponseBodyBytes;
+    let effectiveArgs: Record<string, unknown>;
+    try {
+      effectiveArgs = await this.applyConfiguredDefaults(resolved, args);
+    } catch (error: unknown) {
+      return requestFailure(resolved, error);
+    }
 
     // Item 3: 401 → onUnauthorized() → retry (maxAuthRetries times). The
     // retried request rebuilds with the new Authorization header; per-call
@@ -340,7 +397,7 @@ export class MultiSpecParser<
     let retries = 0;
     let request: BuiltRequest;
     try {
-      request = this.buildRequest(resolved, args, options);
+      request = this.buildRequest(resolved, effectiveArgs, options);
     } catch (error: unknown) {
       return requestFailure(resolved, error);
     }
@@ -380,7 +437,7 @@ export class MultiSpecParser<
         };
       }
       try {
-        request = this.buildRequest(resolved, args, {
+        request = this.buildRequest(resolved, effectiveArgs, {
           ...options,
           headers: { ...(options.headers ?? {}), Authorization: header },
         });
@@ -396,9 +453,9 @@ export class MultiSpecParser<
       });
     }
 
-    result = await this.applyResponseTransform(resolved, args, request, result, retries, options.signal);
+    result = await this.applyResponseTransform(resolved, effectiveArgs, request, result, retries, options.signal);
     // Item 2: post-process (consumer closure owns S3/PII/etc.).
-    result = await this.applyProcessor(resolved, args, result, request, retries, options.signal);
+    result = await this.applyProcessor(resolved, effectiveArgs, result, request, retries, options.signal);
 
     // Item 4: uniform size guarantee AFTER processors (a processor can shrink
     // the result — truncating first would destroy its input).
@@ -602,7 +659,10 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new TypeError("MultiSpecParser: options must be an object.");
   }
-  const { maxDefsBytes, baseUrl, headers, executeTimeoutMs } = options;
+  const { maxDefsBytes, baseUrl, headers, executeTimeoutMs, defaultPolicy } = options;
+  if (defaultPolicy !== undefined && defaultPolicy !== "preserve" && defaultPolicy !== "apply") {
+    throw new TypeError("MultiSpecParser: options.defaultPolicy must be preserve or apply.");
+  }
   if (
     maxDefsBytes !== undefined &&
     (typeof maxDefsBytes !== "number" || !Number.isFinite(maxDefsBytes) || maxDefsBytes <= 0)

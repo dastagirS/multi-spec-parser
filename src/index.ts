@@ -13,6 +13,7 @@ export type {
   MultiSpecParserOptions,
   SpecSource,
   ToolDescription,
+  ValidationOptions,
   ValidationResult,
   CacheOptions,
   ParseOptions,
@@ -42,9 +43,11 @@ export type {
   TransportRequest,
 } from "./request-builder.js";
 export type {
+  DefaultPolicy,
   StandardJSONSchemaV1,
   StandardJsonSchemaOptions,
   StandardJsonSchemaTarget,
+  StandardSchemaAdapterOptions,
   StandardSchemaIssue,
   StandardSchemaLike,
   StandardSchemaOptions,

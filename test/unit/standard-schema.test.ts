@@ -8,6 +8,20 @@ import assert from "node:assert/strict";
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
 import { toStandardSchema } from "../../src/standard-schema.js";
 
+const DEFAULT_SPEC = {
+  openapi: "3.0.3",
+  info: { title: "T", version: "1" },
+  paths: {
+    "/users": {
+      get: {
+        operationId: "getUser",
+        parameters: [{ name: "userId", in: "query", required: true, schema: { type: "string", default: "me" } }],
+        responses: { "200": { description: "ok" } },
+      },
+    },
+  },
+};
+
 const SPEC = {
   openapi: "3.0.3",
   info: { title: "T", version: "1" },
@@ -49,6 +63,19 @@ describe("toStandardSchema (item 6)", () => {
     assert.equal(draft07.$schema, "http://json-schema.org/draft-07/schema#");
     const draft2020 = std["~standard"].jsonSchema.input({ target: "draft-2020-12" });
     assert.equal(draft2020.$schema, "https://json-schema.org/draft/2020-12/schema");
+  });
+
+  it("applies defaults only when explicitly requested and does not mutate input", async () => {
+    const parser = new MultiSpecParser({ spec: { spec: DEFAULT_SPEC } });
+    await parser.parse();
+    const tool = parser.tool("getUser")!;
+    const input = {};
+    const applied = toStandardSchema(tool, { defaultPolicy: "apply" });
+    assert.deepEqual(await applied["~standard"].validate(input), { value: { userId: "me" } });
+    assert.deepEqual(input, {});
+    const preserved = toStandardSchema(tool);
+    const result = preserved["~standard"].validate(input) as { issues?: Array<{ message: string }> };
+    assert.ok(result.issues?.some((issue) => /userId/.test(issue.message)));
   });
 
   it("returns { value } for valid input and { issues } with messages for invalid", async () => {

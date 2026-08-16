@@ -275,6 +275,44 @@ paths:
     assert.ok(inputSchema.definitions);
   });
 
+  it("applies configured defaults to validation and execution without mutating args", async () => {
+    const spec = {
+      openapi: "3.0.3",
+      info: { title: "T", version: "1" },
+      servers: [{ url: "https://api.example.com" }],
+      paths: {
+        "/users": {
+          get: {
+            operationId: "getUserWithDefault",
+            parameters: [{ name: "userId", in: "query", required: true, schema: { type: "string", default: "me" } }],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    };
+    let requestUrl = "";
+    const parser = new MultiSpecParser({
+      spec: { spec },
+      options: {
+        defaultPolicy: "apply",
+        transport: async (request) => {
+          requestUrl = request.url;
+          return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+        },
+      },
+    });
+    await parser.parse();
+    const input: Record<string, unknown> = {};
+    const validation = await parser.validate("getUserWithDefault", input);
+    assert.deepEqual(validation, { valid: true, value: { userId: "me" } });
+    assert.deepEqual(input, {});
+    const standardValidation = await parser.toStandardSchema("getUserWithDefault")["~standard"].validate(input);
+    assert.deepEqual(standardValidation, { value: { userId: "me" } });
+    const result = await parser.execute("getUserWithDefault", input);
+    assert.equal(result.status, "success");
+    assert.equal(requestUrl, "https://api.example.com/users?userId=me");
+  });
+
   it("applies config baseUrl/headers as buildRequest defaults, per-call wins", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },

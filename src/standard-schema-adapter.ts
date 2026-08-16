@@ -10,6 +10,8 @@ const DEFS_KEY = "$defs";
 const DRAFT_07_SCHEMA_URI = "http://json-schema.org/draft-07/schema#";
 const DRAFT_2020_12_SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema";
 
+export type DefaultPolicy = "preserve" | "apply";
+
 export type StandardJsonSchemaTarget =
   | typeof DRAFT_07
   | typeof DRAFT_2020_12
@@ -31,6 +33,16 @@ export type StandardSchemaResult<T> =
 
 export interface StandardSchemaOptions {
   readonly libraryOptions?: Record<string, unknown>;
+}
+
+export interface StandardSchemaAdapterOptions {
+  readonly defaultPolicy?: DefaultPolicy;
+}
+
+export function cloneForDefaultApplication<T>(value: T): T {
+  assert(typeof value !== "function", "default input must not be a function");
+  assert(typeof value !== "symbol", "default input must not be a symbol");
+  return structuredClone(value);
 }
 
 export interface StandardSchemaV1<T = unknown> {

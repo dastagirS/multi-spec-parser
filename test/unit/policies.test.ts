@@ -637,6 +637,7 @@ describe("option validation guards", () => {
       { maxAuthRetries: -1 },
       { maxResponseBytes: 0 },
       { describeMaxBytes: -5 },
+      { defaultPolicy: "other" },
       { onTruncate: "not a fn" },
     ] as never[]) {
       assert.throws(

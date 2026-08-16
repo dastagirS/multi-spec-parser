@@ -214,6 +214,10 @@ Hook semantics:
 const schema = parser.toStandardSchema("createPet");
 const validation = await schema["~standard"].validate({ body: { name: "Rex" } });
 const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" });
+
+// Opt in to non-mutating default application:
+const applied = parser.toStandardSchema("createPet", { defaultPolicy: "apply" });
+const normalized = await applied["~standard"].validate({});
 ```
 
 ## Options reference
@@ -230,6 +234,7 @@ const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" })
 | `maxResponseBytes`, `onTruncate` | `execute()` | no cap / none |
 | `transforms` | parse/build/execute | none |
 | `cache` | `parse()` | enabled, bounded |
+| `defaultPolicy` | validate/execute/Standard Schema | preserve |
 | `describeMaxBytes` | `describeTools()` | 64KB |
 
 ## Consumer-side protocols
