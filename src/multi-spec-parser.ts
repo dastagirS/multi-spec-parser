@@ -33,6 +33,10 @@ import type {
 } from "./request-builder.js";
 import type { ExtractedOperation, ParsedSpec, SchemaObject, SpecFormat } from "./types.js";
 import type { ValidateFunction } from "ajv";
+import {
+  createStandardSchemaAdapter,
+  type StandardSchemaLike,
+} from "./standard-schema-adapter.js";
 
 /** Exactly one spec source. URL fetches (content-addressed cache); text is raw
  *  JSON or YAML (sniffed, never extension-guessed); spec is a pre-parsed object.
@@ -155,6 +159,7 @@ export class MultiSpecParser<
   /** The raw parsed document (JSON/YAML → object, pre-normalization) that
    *  parse() returns — typed as T for object sources. */
   private raw: T | undefined;
+  private readonly standardSchemaWrappers = new WeakMap<CompiledTool, StandardSchemaLike>();
 
   constructor(config: MultiSpecParserConfig<T>) {
     validateConfig(config);
@@ -226,11 +231,26 @@ export class MultiSpecParser<
     }));
   }
 
+  /** Return a combined Standard Schema + Standard JSON Schema adapter. The
+   *  validator is asynchronous here so the core keeps Ajv lazy-loaded. */
+  toStandardSchema(tool: string | CompiledTool): StandardSchemaLike {
+    const resolved = this.resolveTool(tool);
+    const cached = this.standardSchemaWrappers.get(resolved);
+    if (cached) return cached;
+    const wrapper = createStandardSchemaAdapter(resolved, async (value) => {
+      const result = await this.validate(resolved, value);
+      if (result.valid) return { value };
+      return { issues: result.issues };
+    });
+    this.standardSchemaWrappers.set(resolved, wrapper);
+    return wrapper;
+  }
+
   /** Validate args against a tool's input schema. Never throws; ajv is loaded
    *  lazily on first call (the core module has no static ajv import). */
   async validate(
     tool: string | CompiledTool,
-    args: Record<string, unknown>,
+    args: unknown,
   ): Promise<ValidationResult> {
     const resolved = this.resolveTool(tool);
     try {

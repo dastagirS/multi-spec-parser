@@ -262,6 +262,19 @@ paths:
     assert.equal(parser.operation("getPet").path, "/pets/{petId}");
   });
 
+  it("exposes a combined Standard Schema adapter through the parser", async () => {
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    await parser.parse();
+    const tool = parser.tool("createPet")!;
+    const schema = parser.toStandardSchema(tool);
+    assert.equal(schema, parser.toStandardSchema("createPet"));
+    const valid = await schema["~standard"].validate({ body: { name: "Rex" } });
+    assert.deepEqual(valid, { value: { body: { name: "Rex" } } });
+    const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" });
+    assert.equal(inputSchema.$schema, "http://json-schema.org/draft-07/schema#");
+    assert.ok(inputSchema.definitions);
+  });
+
   it("applies config baseUrl/headers as buildRequest defaults, per-call wins", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },

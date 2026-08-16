@@ -57,6 +57,7 @@ console.log(parser.format); // openapi3 | swagger2 | google-discovery
 
 const tool = parser.tool("findPetsByStatus");
 // tool.inputSchema, tool.outputSchema, tool.operation
+// tool.operationKey is the stable `METHOD /path` identity; tool.name is the LLM-facing name.
 
 const request = parser.buildRequest("findPetsByStatus", { status: "available" });
 const result = await parser.execute("findPetsByStatus", { status: "available" });
@@ -205,8 +206,15 @@ Hook semantics:
 - `describeTools()` projects schemas for LLM budgets, replacing over-budget
   `$defs` with reference names in `$refs`.
 - `validate()` returns `{ valid: true }` or `{ valid: false, issues }` and loads
-  Ajv lazily. `toStandardSchema(tool)` is available from
-  `multi-spec-parser/standard-schema`.
+  Ajv lazily. `parser.toStandardSchema(tool)` returns a combined Standard
+  Schema + Standard JSON Schema adapter; the synchronous low-level helper is
+  also available from `multi-spec-parser/standard-schema`.
+
+```ts
+const schema = parser.toStandardSchema("createPet");
+const validation = await schema["~standard"].validate({ body: { name: "Rex" } });
+const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" });
+```
 
 ## Options reference
 

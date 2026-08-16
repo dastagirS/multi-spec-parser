@@ -35,3 +35,12 @@ jobs:
       # Sanity: the tarball must be exactly what ships (dist/src + examples).
       - name: Verify publishable tarball
         run: npm pack --dry-run
+
+      - name: Build current native prebuild
+        run: npm run native:prebuild
+
+      - name: Verify installable package
+        run: |
+          package_file="$(npm pack --silent --pack-destination "$RUNNER_TEMP")"
+          PACKAGE_VERSION="$(node -p 'require("./package.json").version')" \
+            node scripts/verify-package.mjs "$RUNNER_TEMP/$package_file" "linux-x64"

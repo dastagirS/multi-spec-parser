@@ -116,7 +116,9 @@ export interface ServerInfo {
 }
 
 export interface ExtractedOperation {
-  /** Stable tool name derived from operationId or method+path. */
+  /** Stable operation identity derived from method + path, independent of display naming. */
+  operationKey: string;
+  /** LLM-facing tool name derived from operationId or method+path. */
   toolName: string;
   method: HttpMethod;
   /** Path template, e.g. /users/{userId}/messages. */

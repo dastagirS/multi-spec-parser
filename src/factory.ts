@@ -11,6 +11,7 @@
  *     shared $defs across tools are safe).
  */
 
+import { assertValidParsedSpecModel } from "./model-validation.js";
 import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
 import { fetchSpecText, MAX_SPEC_BYTES, parseSpec, parseSpecText } from "./parse-spec.js";
 import type {
@@ -24,6 +25,8 @@ import type { BuiltRequest, ExecuteResult } from "./request-builder.js";
 
 export interface CompiledTool {
   name: string;
+  /** Stable method + path identity, independent of the LLM-facing name. */
+  operationKey: string;
   description: string;
   method: ExtractedOperation["method"];
   path: string;
@@ -111,6 +114,7 @@ export function compileSpecToTools(
   parsed: ParsedSpec,
   options: CompileOptions = {},
 ): CompileResult {
+  assertValidParsedSpecModel(parsed);
   const maxDefsBytes = options.maxDefsBytes ?? DEFAULT_MAX_DEFS_BYTES;
   const transformedSchemas: Record<string, SchemaObject> = {};
   for (const [name, schema] of Object.entries(parsed.schemas)) {
@@ -219,6 +223,7 @@ export function compileSpecToTools(
 
     tools.push({
       name,
+      operationKey: operation.operationKey,
       description: buildDescription(operation),
       method: operation.method,
       path: operation.path,
@@ -510,7 +515,8 @@ function applySchemaTransform(
 function isExtractedOperation(value: unknown): value is ExtractedOperation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const operation = value as Partial<ExtractedOperation>;
-  return typeof operation.toolName === "string" && typeof operation.path === "string" &&
+  return typeof operation.operationKey === "string" && operation.operationKey.length > 0 &&
+    typeof operation.toolName === "string" && typeof operation.path === "string" &&
     Array.isArray(operation.parameters);
 }
 

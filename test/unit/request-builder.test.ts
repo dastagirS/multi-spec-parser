@@ -6,6 +6,7 @@ import type { ExtractedOperation } from "../../src/types.js";
 
 function op(overrides: Partial<ExtractedOperation> = {}): ExtractedOperation {
   return {
+    operationKey: "GET /x",
     toolName: "test",
     method: "GET",
     path: "/x",

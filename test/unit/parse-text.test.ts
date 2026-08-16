@@ -4,6 +4,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { parseSpec, parseSpecText } from "../../src/parse-spec.js";
+import { validateSpecText, validateSpecUrl } from "../../src/spec-validation.js";
 import { parseYaml } from "../../src/yaml-parser.js";
 
 const YAML_SPEC = `openapi: 3.1.0
@@ -35,6 +36,25 @@ describe("parseSpecText", () => {
     // A YAML doc whose first non-space char is not { or [ uses the YAML loader.
     const parsed = parseSpecText("openapi: '3.0.0'\ninfo: {}\npaths: {}\n");
     assert.equal(parsed.openapi, "3.0.0");
+  });
+
+  it("reports stable operation identity separately from the tool name", () => {
+    const parsed = parseSpec(parseSpecText(YAML_SPEC));
+    assert.equal(parsed.operations[0]?.operationKey, "GET /ping");
+    assert.equal(parsed.operations[0]?.toolName, "get_ping");
+  });
+
+  it("rejects obvious non-spec responses with actionable errors", () => {
+    assert.deepEqual(validateSpecText("<html><body>Docs</body></html>", "text/html"), {
+      ok: false,
+      reason: "the response is an HTML page, not a specification",
+    });
+    assert.throws(() => parseSpecText("asyncapi: 3.0.0\nchannels: {}\n"), /AsyncAPI/);
+  });
+
+  it("validates specification URL shape before fetching", () => {
+    assert.doesNotThrow(() => validateSpecUrl("https://example.com/openapi.json"));
+    assert.throws(() => validateSpecUrl("https://example.com/oauth/authorize"), /OAuth/);
   });
 
   it("rejects empty input", () => {

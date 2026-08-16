@@ -6,6 +6,8 @@
 
 import { parseYaml } from "./yaml-parser.js";
 
+import { assertValidParsedSpecModel } from "./model-validation.js";
+import { assertValidSpecText, validateSpecUrl } from "./spec-validation.js";
 import { DocResolver, isRef } from "./ref-resolver.js";
 import { setOwn } from "./schema-closure.js";
 import type {
@@ -67,6 +69,7 @@ function isNdjsonMediaType(mediaType: string): boolean {
 
 /** Fetch spec text — never res.json(): YAML specs (Booking) fail JSON parsing. */
 export async function fetchSpecText(url: string, signal?: AbortSignal): Promise<string> {
+  validateSpecUrl(url);
   const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(FETCH_TIMEOUT_MS);
   const res = await fetch(url, {
     headers: { Accept: "application/json, application/yaml, text/yaml, */*" },
@@ -81,11 +84,14 @@ export async function fetchSpecText(url: string, signal?: AbortSignal): Promise<
       `Spec too large: content-length ${contentLength} bytes exceeds ${MAX_SPEC_BYTES} byte limit`,
     );
   }
-  return await readBoundedResponseText(res, MAX_SPEC_BYTES);
+  const text = await readBoundedResponseText(res, MAX_SPEC_BYTES);
+  assertValidSpecText(text, res.headers.get("content-type"));
+  return text;
 }
 
 /** Parse spec text as JSON when it looks like JSON, else YAML. */
 export function parseSpecText(text: string): Record<string, unknown> {
+  assertValidSpecText(text);
   if (new TextEncoder().encode(text).byteLength > MAX_SPEC_BYTES) {
     throw new Error(`Spec too large: text exceeds ${MAX_SPEC_BYTES} byte limit`);
   }
@@ -168,14 +174,20 @@ export function detectSpecFormat(obj: Record<string, unknown>): SpecFormat {
 export function parseSpec(specObj: Record<string, unknown>): ParsedSpec {
   const specFormat = detectSpecFormat(specObj);
   validateSpecShape(specObj, specFormat);
+  let parsed: ParsedSpec;
   switch (specFormat) {
     case "openapi3":
-      return parseOpenApi3(specObj as unknown as OpenApi3Spec);
+      parsed = parseOpenApi3(specObj as unknown as OpenApi3Spec);
+      break;
     case "swagger2":
-      return parseSwagger2(specObj as unknown as Swagger2Spec);
+      parsed = parseSwagger2(specObj as unknown as Swagger2Spec);
+      break;
     case "google-discovery":
-      return parseGoogleDiscovery(specObj as unknown as GoogleDiscoveryDoc);
+      parsed = parseGoogleDiscovery(specObj as unknown as GoogleDiscoveryDoc);
+      break;
   }
+  assertValidParsedSpecModel(parsed);
+  return parsed;
 }
 
 function validateSpecShape(spec: Record<string, unknown>, format: SpecFormat): void {
@@ -267,6 +279,7 @@ function openApi3Operation(
   const operationUnresolved = unresolved.size > 0 ? [...unresolved] : undefined;
 
   return {
+    operationKey: deriveOperationKey(method, path),
     toolName,
     method: method.toUpperCase() as HttpMethod,
     path,
@@ -462,6 +475,7 @@ function swagger2Operation(
   const outputSchema = swagger2OutputSchema(op, r, unresolved);
 
   return {
+    operationKey: deriveOperationKey(method, path),
     toolName,
     method: method.toUpperCase() as HttpMethod,
     path,
@@ -695,10 +709,13 @@ function googleMethodToOperation(
     ? { $ref: `#/components/schemas/${method.response.$ref}` }
     : undefined;
 
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const normalizedMethod = (method.httpMethod || "GET").toUpperCase();
   return {
+    operationKey: deriveOperationKey(normalizedMethod, normalizedPath),
     toolName,
-    method: (method.httpMethod || "GET").toUpperCase() as HttpMethod,
-    path: rawPath.startsWith("/") ? rawPath : `/${rawPath}`,
+    method: normalizedMethod as HttpMethod,
+    path: normalizedPath,
     summary: method.description?.split("\n")[0] ?? method.id,
     description: method.description,
     tags,
@@ -893,6 +910,12 @@ function deriveToolName(op: OperationObject, method: string, path: string): stri
   if (op.operationId) return sanitizeToolName(op.operationId);
   const segments = path.replace(/[{}]/g, "").split("/").filter(Boolean);
   return sanitizeToolName(`${method}_${segments.join("_")}`);
+}
+
+function deriveOperationKey(method: string, path: string): string {
+  if (typeof method !== "string" || method.length === 0) throw new TypeError("Operation method must be non-empty.");
+  if (typeof path !== "string" || !path.startsWith("/")) throw new TypeError("Operation path must start with /.");
+  return `${method.toUpperCase()} ${path}`;
 }
 
 function sanitizeToolName(name: string): string {

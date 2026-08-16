@@ -39,12 +39,16 @@ describe("toStandardSchema (item 6)", () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
     const tool = parser.tool("createPet")!;
-    const std = toStandardSchema(tool) as {
-      "~standard": { version: number; vendor: string; validate: (v: unknown) => unknown };
-    };
+    const std = toStandardSchema(tool);
     assert.equal(std["~standard"].version, 1);
     assert.equal(std["~standard"].vendor, "multi-spec-parser");
     assert.equal(typeof std["~standard"].validate, "function");
+    assert.equal(typeof std["~standard"].jsonSchema.input, "function");
+    assert.equal(typeof std["~standard"].jsonSchema.output, "function");
+    const draft07 = std["~standard"].jsonSchema.input({ target: "draft-07" });
+    assert.equal(draft07.$schema, "http://json-schema.org/draft-07/schema#");
+    const draft2020 = std["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+    assert.equal(draft2020.$schema, "https://json-schema.org/draft/2020-12/schema");
   });
 
   it("returns { value } for valid input and { issues } with messages for invalid", async () => {
@@ -109,7 +113,13 @@ describe("toStandardSchema (item 6)", () => {
     const parser = new MultiSpecParser({ spec: { spec: specWithRef } });
     await parser.parse();
     const tool = parser.tool("updatePet")!;
-    const { validate } = toStandardSchema(tool)["~standard"];
+    const std = toStandardSchema(tool);
+    const draft07 = std["~standard"].jsonSchema.input({ target: "draft-07" });
+    assert.ok(draft07.definitions);
+    assert.equal(draft07.$defs, undefined);
+    assert.equal(draft07.$ref, undefined);
+    assert.deepEqual(std["~standard"].jsonSchema.output({ target: "draft-07" }).$schema, "http://json-schema.org/draft-07/schema#");
+    const { validate } = std["~standard"];
     assert.deepEqual(validate({ id: "1", body: { name: "ok" } }), {
       value: { id: "1", body: { name: "ok" } },
     });

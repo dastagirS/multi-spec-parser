@@ -42,6 +42,16 @@ export type {
   TransportRequest,
 } from "./request-builder.js";
 export type {
+  StandardJSONSchemaV1,
+  StandardJsonSchemaOptions,
+  StandardJsonSchemaTarget,
+  StandardSchemaIssue,
+  StandardSchemaLike,
+  StandardSchemaOptions,
+  StandardSchemaResult,
+  StandardSchemaV1,
+} from "./standard-schema.js";
+export type {
   ExtractedOperation,
   GoogleDiscoveryDoc,
   GoogleMethodObject,
