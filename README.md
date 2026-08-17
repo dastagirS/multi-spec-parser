@@ -237,6 +237,10 @@ const normalized = await applied["~standard"].validate({});
 | `defaultPolicy` | validate/execute/Standard Schema | preserve |
 | `describeMaxBytes` | `describeTools()` | 64KB |
 
+Ajv validation recognizes standard JSON Schema formats plus OpenAPI formats such
+as `int32`, `int64`, and `byte`. `int64` validation accepts only JavaScript-safe
+integers because wider JSON numbers cannot be represented exactly by Node.js.
+
 ## Consumer-side protocols
 
 The package provides primitives, not vendor protocols or policies. Use

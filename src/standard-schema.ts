@@ -6,6 +6,7 @@
  * changing the MCP/Executor-facing inputSchema object.
  */
 import assert from "node:assert/strict";
+import addFormatsModule from "ajv-formats";
 import { Ajv } from "ajv";
 import type { ErrorObject, ValidateFunction } from "ajv";
 import type { CompiledTool } from "./factory.js";
@@ -17,6 +18,7 @@ import {
   type StandardSchemaIssue,
   type StandardSchemaLike,
 } from "./standard-schema-adapter.js";
+import { registerOpenApiFormats, resolveAjvFormatsPlugin } from "./openapi-formats.js";
 
 export type {
   DefaultPolicy,
@@ -33,8 +35,8 @@ export type {
 
 const MAX_AJV_ERRORS = 1_000_000;
 const MAX_INSTANCE_PATH_LENGTH = 16 * 1024;
-const ajv = new Ajv({ strict: false, allErrors: true });
-const defaultingAjv = new Ajv({ strict: false, allErrors: true, useDefaults: true });
+const ajv = createAjv(false);
+const defaultingAjv = createAjv(true);
 const wrappers = new WeakMap<CompiledTool, Map<DefaultPolicy, StandardSchemaLike>>();
 const validators = new WeakMap<CompiledTool, Map<DefaultPolicy, ValidateFunction>>();
 
@@ -68,6 +70,15 @@ export function toStandardSchema(
   });
   cachedWrappers.set(defaultPolicy, wrapper);
   return wrapper;
+}
+
+function createAjv(useDefaults: boolean): Ajv {
+  assert(typeof useDefaults === "boolean", "useDefaults must be a boolean");
+  const instance = new Ajv({ strict: false, allErrors: true, ...(useDefaults ? { useDefaults: true } : {}) });
+  resolveAjvFormatsPlugin(addFormatsModule)(instance);
+  registerOpenApiFormats(instance);
+  assert(instance !== null && typeof instance.addFormat === "function", "configured Ajv must support formats");
+  return instance;
 }
 
 function getValidator(tool: CompiledTool, defaultPolicy: DefaultPolicy): ValidateFunction {

@@ -65,6 +65,47 @@ describe("toStandardSchema (item 6)", () => {
     assert.equal(draft2020.$schema, "https://json-schema.org/draft/2020-12/schema");
   });
 
+  it("enforces OpenAPI formats consistently without Ajv warnings", async () => {
+    const formatSpec = {
+      openapi: "3.0.3",
+      info: { title: "T", version: "1" },
+      paths: {
+        "/formats": {
+          get: {
+            operationId: "formatCheck",
+            parameters: [
+              { name: "count", in: "query", required: true, schema: { type: "integer", format: "int32" } },
+              { name: "payload", in: "query", required: true, schema: { type: "string", format: "byte" } },
+              { name: "when", in: "query", required: true, schema: { type: "string", format: "date-time" } },
+            ],
+            responses: { "200": { description: "ok" } },
+          },
+        },
+      },
+    };
+    const parser = new MultiSpecParser({ spec: { spec: formatSpec } });
+    await parser.parse();
+    const tool = parser.tool("formatCheck")!;
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: Parameters<typeof console.warn>): void => {
+      warnings.push(args);
+    };
+    try {
+      const synchronous = toStandardSchema(tool);
+      assert.deepEqual(synchronous["~standard"].validate({ count: 7, payload: "aGVsbG8=", when: "2025-01-01T00:00:00Z" }), {
+        value: { count: 7, payload: "aGVsbG8=", when: "2025-01-01T00:00:00Z" },
+      });
+      const invalid = synchronous["~standard"].validate({ count: 2147483648, payload: "not-base64", when: "not-a-date" });
+      assert.ok("issues" in invalid && invalid.issues !== undefined && invalid.issues.length >= 3);
+      const asyncInvalid = await parser.validate(tool, { count: 2147483648, payload: "not-base64", when: "not-a-date" });
+      assert.equal(asyncInvalid.valid, false);
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.deepEqual(warnings, []);
+  });
+
   it("applies defaults only when explicitly requested and does not mutate input", async () => {
     const parser = new MultiSpecParser({ spec: { spec: DEFAULT_SPEC } });
     await parser.parse();

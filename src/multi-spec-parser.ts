@@ -41,6 +41,7 @@ import {
   type DefaultPolicy,
   type StandardSchemaLike,
 } from "./standard-schema-adapter.js";
+import { registerOpenApiFormats, resolveAjvFormatsPlugin } from "./openapi-formats.js";
 
 /** Exactly one spec source. URL fetches (content-addressed cache); text is raw
  *  JSON or YAML (sniffed, never extension-guessed); spec is a pre-parsed object.
@@ -308,12 +309,18 @@ export class MultiSpecParser<
     }
     const existing = cached.get(defaultPolicy);
     if (existing) return existing;
-    const { Ajv } = await import("ajv");
-    const validator = new Ajv({
+    const [{ Ajv }, addFormatsModule] = await Promise.all([
+      import("ajv"),
+      import("ajv-formats"),
+    ]);
+    const instance = new Ajv({
       strict: false,
       allErrors: true,
       ...(defaultPolicy === "apply" ? { useDefaults: true } : {}),
-    }).compile(tool.inputSchema as object);
+    });
+    resolveAjvFormatsPlugin(addFormatsModule)(instance);
+    registerOpenApiFormats(instance);
+    const validator = instance.compile(tool.inputSchema as object);
     cached.set(defaultPolicy, validator);
     return validator;
   }
