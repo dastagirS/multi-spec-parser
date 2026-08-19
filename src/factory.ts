@@ -11,6 +11,8 @@
  *     shared $defs across tools are safe).
  */
 
+import assert from "node:assert/strict";
+
 import { assertValidParsedSpecModel } from "./model-validation.js";
 import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
 import { fetchSpecText, MAX_SPEC_BYTES, parseSpec, parseSpecText } from "./parse-spec.js";
@@ -64,9 +66,9 @@ export interface CompileOptions {
    *  ones. Examples: readOnly → op => !["POST","PUT","PATCH","DELETE"].includes(op.method); denylist → op =>
    *  !BLOCKED.has(op.toolName); scope-gate → op => op.requiredScopes?.includes(x). */
   filterOps?: (op: ExtractedOperation) => boolean;
-  /** Item 5: per-tool extra input-schema properties (LLM-visible, ignored by
-   *  buildRequest, readable by processors via ctx.args). */
-  extraParameters?: Record<string, ExtraParameter[]>;
+  /** Item 5: ordered rules for consumer-supplied input properties. Every
+   *  matching rule adds LLM-visible fields ignored by buildRequest. */
+  extraParameterRules?: ExtraParameterRule[];
   /** Consumer-owned compile and request/response transformation seams. */
   transforms?: TransformOptions;
 }
@@ -108,7 +110,14 @@ export interface ExtraParameter {
   required?: boolean;
 }
 
+export interface ExtraParameterRule {
+  matches: (operation: ExtractedOperation) => boolean;
+  parameters: ExtraParameter[];
+}
+
 const DEFAULT_MAX_DEFS_BYTES = 1_000_000;
+const MAX_EXTRA_PARAMETER_RULES = 1_000;
+const MAX_EXTRA_PARAMETERS_PER_RULE = 100;
 
 export function compileSpecToTools(
   parsed: ParsedSpec,
@@ -163,10 +172,10 @@ export function compileSpecToTools(
     if (options.filterOps && !options.filterOps(transformedOperation)) continue;
     const name = ensureUniqueName(transformedOperation.toolName, seen, used);
     const operation = assignInputNames(transformedOperation, parsed.servers);
-    // Item 5: merge consumer extras into the RAW input (before normalization)
-    // so their $refs get rewritten, closed over, and pruned like any other.
+    // Item 5: merge matching consumer extras into the RAW input (before
+    // normalization) so their $refs are handled like any other input schema.
     const rawInput = buildInputSchema(operation, parsed.servers, options.transforms);
-    mergeExtraParameters(rawInput, options.extraParameters?.[transformedOperation.toolName]);
+    mergeExtraParameters(rawInput, resolveExtraParameters(operation, options.extraParameterRules));
     // Op-level schemas carry native refs (#/components/schemas, #/definitions);
     // rewrite them at the boundary so $refs resolve against the hoisted $defs.
     const inputSchema = normalizeSchemaRefs(rawInput) as Record<string, unknown>;
@@ -461,26 +470,94 @@ function buildDescription(op: ExtractedOperation): string {
   return parts.join("\n\n");
 }
 
+function resolveExtraParameters(
+  operation: ExtractedOperation,
+  rules: ExtraParameterRule[] | undefined,
+): ExtraParameter[] | undefined {
+  if (!operation || typeof operation !== "object") {
+    throw new TypeError("compileSpecToTools: operation must be an object.");
+  }
+  if (rules === undefined) return undefined;
+  if (!Array.isArray(rules)) {
+    throw new TypeError("compileSpecToTools: extraParameterRules must be an array of rules.");
+  }
+  assert(operation !== null && typeof operation === "object", "operation must be an object");
+  assert(Array.isArray(rules), "extraParameterRules must be an array");
+  if (rules.length > MAX_EXTRA_PARAMETER_RULES) {
+    throw new RangeError(
+      `compileSpecToTools: extraParameterRules exceeds ${MAX_EXTRA_PARAMETER_RULES} rules.`,
+    );
+  }
+  const matched: ExtraParameter[] = [];
+  for (const [index, rule] of rules.entries()) {
+    if (
+      rule === null ||
+      typeof rule !== "object" ||
+      typeof rule.matches !== "function" ||
+      !Array.isArray(rule.parameters)
+    ) {
+      throw new TypeError(
+        `compileSpecToTools: extraParameterRules[${index}] must contain matches and parameters[].`,
+      );
+    }
+    if (rule.parameters.length > MAX_EXTRA_PARAMETERS_PER_RULE) {
+      throw new RangeError(
+        `compileSpecToTools: extraParameterRules[${index}] exceeds ${MAX_EXTRA_PARAMETERS_PER_RULE} parameters.`,
+      );
+    }
+    for (const [parameterIndex, parameter] of rule.parameters.entries()) {
+      validateExtraParameter(parameter, `extraParameterRules[${index}].parameters[${parameterIndex}]`);
+    }
+    let matches: unknown;
+    try {
+      matches = rule.matches(operation);
+    } catch (error: unknown) {
+      throw new Error(`extraParameterRules[${index}].matches failed.`, { cause: error });
+    }
+    if (typeof matches !== "boolean") {
+      throw new TypeError(`extraParameterRules[${index}].matches must return a boolean.`);
+    }
+    if (matches) matched.push(...rule.parameters);
+  }
+  return matched;
+}
+
+function validateExtraParameter(extra: unknown, location: string): asserts extra is ExtraParameter {
+  assert(typeof location === "string" && location.length > 0, "parameter location must be named");
+  assert(extra !== undefined, "extra parameter must be provided");
+  if (
+    !extra ||
+    typeof extra !== "object" ||
+    typeof (extra as Record<string, unknown>).name !== "string" ||
+    (extra as Record<string, unknown>).name === "" ||
+    typeof (extra as Record<string, unknown>).schema !== "object" ||
+    (extra as Record<string, unknown>).schema === null ||
+    Array.isArray((extra as Record<string, unknown>).schema)
+  ) {
+    throw new TypeError(
+      `compileSpecToTools: ${location} must be { name, schema } — got ${JSON.stringify(extra)}.`,
+    );
+  }
+}
+
 /** Item 5: merge consumer-supplied input properties into a tool's schema. */
 function mergeExtraParameters(
   input: Record<string, unknown>,
   extras: ExtraParameter[] | undefined,
 ): void {
+  assert(input !== null && typeof input === "object" && !Array.isArray(input), "input schema must be an object");
+  assert(extras === undefined || Array.isArray(extras), "extra parameters must be an array");
   if (!extras || extras.length === 0) return;
   const properties = (input.properties ??= {}) as Record<string, unknown>;
+  const seen = new Set<string>();
   for (const extra of extras) {
-    if (
-      !extra ||
-      typeof extra.name !== "string" ||
-      extra.name.length === 0 ||
-      typeof extra.schema !== "object" ||
-      extra.schema === null ||
-      Array.isArray(extra.schema)
-    ) {
+    validateExtraParameter(extra, "extraParameter");
+    if (seen.has(extra.name)) {
       throw new TypeError(
-        `compileSpecToTools: extraParameter must be { name, schema } — got ${JSON.stringify(extra)}.`,
+        `compileSpecToTools: duplicate extraParameter "${extra.name}" matched multiple rules.`,
       );
     }
+    seen.add(extra.name);
     if (Object.prototype.hasOwnProperty.call(properties, extra.name)) {
       throw new TypeError(
         `compileSpecToTools: extraParameter "${extra.name}" collides with a spec-declared input.`,

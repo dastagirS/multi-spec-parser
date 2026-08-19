@@ -23,6 +23,7 @@ export type {
   CompiledTool,
   CompileResult,
   ExtraParameter,
+  ExtraParameterRule,
   TransformOptions,
   SchemaTransformContext,
   RequestTransformContext,

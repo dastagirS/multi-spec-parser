@@ -114,7 +114,9 @@ describe("toStandardSchema (item 6)", () => {
     const applied = toStandardSchema(tool, { defaultPolicy: "apply" });
     assert.deepEqual(await applied["~standard"].validate(input), { value: { userId: "me" } });
     assert.deepEqual(input, {});
+    assert.equal(applied["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, undefined);
     const preserved = toStandardSchema(tool);
+    assert.deepEqual(preserved["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["userId"]);
     const result = preserved["~standard"].validate(input) as { issues?: Array<{ message: string }> };
     assert.ok(result.issues?.some((issue) => /userId/.test(issue.message)));
   });
@@ -123,6 +125,8 @@ describe("toStandardSchema (item 6)", () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
     const tool = parser.tool("createPet")!;
+    const appliedSchema = toStandardSchema(tool, { defaultPolicy: "apply" });
+    assert.deepEqual(appliedSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["body"]);
     const { validate } = toStandardSchema(tool)["~standard"];
 
     // The JSON request body nests under `body` in the tool schema.

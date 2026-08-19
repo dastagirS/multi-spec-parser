@@ -153,16 +153,19 @@ describe("filterOps (item 1 — open compile-time filter)", () => {
   });
 });
 
-describe("extraParameters (item 5)", () => {
-  it("merges into the input schema (LLM-visible), ignored by buildRequest", async () => {
+describe("extraParameterRules (item 5)", () => {
+  it("matches operations and merges LLM-only fields", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
       options: {
-        extraParameters: {
-          getPet: [
-            { name: "fileName", schema: { type: "string" }, description: "For storage." },
-          ],
-        },
+        extraParameterRules: [
+          {
+            matches: (operation) => operation.method === "GET" && operation.path === "/pets/{petId}",
+            parameters: [
+              { name: "fileName", schema: { type: "string" }, description: "For storage." },
+            ],
+          },
+        ],
       },
     });
     await parser.parse();
@@ -174,13 +177,41 @@ describe("extraParameters (item 5)", () => {
     assert.equal(req.url, "https://api.example.com/v1/pets/1");
   });
 
+  it("applies every matching rule in declaration order", async () => {
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        extraParameterRules: [
+          {
+            matches: (operation) => operation.method === "GET",
+            parameters: [{ name: "traceId", schema: { type: "string" } }],
+          },
+          {
+            matches: (operation) => operation.path === "/pets",
+            parameters: [{ name: "pageSize", schema: { type: "integer" } }],
+          },
+        ],
+      },
+    });
+    await parser.parse();
+    const listPets = parser.tool("listPets")!;
+    const properties = listPets.inputSchema.properties as Record<string, unknown>;
+    assert.ok(properties.traceId);
+    assert.ok(properties.pageSize);
+    const getPetProperties = parser.tool("getPet")!.inputSchema.properties as Record<string, unknown>;
+    assert.equal(getPetProperties.pageSize, undefined);
+  });
+
   it("pushes required extras into inputSchema.required", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
       options: {
-        extraParameters: {
-          listPets: [{ name: "traceId", schema: { type: "string" }, required: true }],
-        },
+        extraParameterRules: [
+          {
+            matches: (operation) => operation.method === "GET" && operation.path === "/pets",
+            parameters: [{ name: "traceId", schema: { type: "string" }, required: true }],
+          },
+        ],
       },
     });
     await parser.parse();
@@ -192,9 +223,12 @@ describe("extraParameters (item 5)", () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
       options: {
-        extraParameters: {
-          getPet: [{ name: "petId", schema: { type: "string" } }],
-        },
+        extraParameterRules: [
+          {
+            matches: (operation) => operation.method === "GET",
+            parameters: [{ name: "petId", schema: { type: "string" } }],
+          },
+        ],
       },
     });
     await assert.rejects(() => parser.parse(), /collides/);
@@ -203,9 +237,26 @@ describe("extraParameters (item 5)", () => {
   it("throws on a malformed extraParameter", async () => {
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
-      options: { extraParameters: { getPet: [{ name: "" } as never] } },
+      options: {
+        extraParameterRules: [
+          { matches: () => true, parameters: [{ name: "" } as never] },
+        ],
+      },
     });
-    await assert.rejects(() => parser.parse(), /extraParameter must be/);
+    await assert.rejects(() => parser.parse(), /extraParameterRules.*must be/);
+  });
+
+  it("throws when matching rules define the same extra field", async () => {
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        extraParameterRules: [
+          { matches: () => true, parameters: [{ name: "traceId", schema: { type: "string" } }] },
+          { matches: () => true, parameters: [{ name: "traceId", schema: { type: "string" } }] },
+        ],
+      },
+    });
+    await assert.rejects(() => parser.parse(), /duplicate extraParameter/);
   });
 });
 
@@ -632,7 +683,7 @@ describe("option validation guards", () => {
       { filterOps: "not a fn" },
       { processors: { x: "not a fn" } },
       { processors: [{ matches: "not a fn", process: async () => ({ status: "success", data: null, httpStatus: 200 }) }] },
-      { extraParameters: [] },
+      { extraParameterRules: {} },
       { onUnauthorized: "not a fn" },
       { maxAuthRetries: -1 },
       { maxResponseBytes: 0 },
@@ -649,16 +700,16 @@ describe("option validation guards", () => {
   });
 
   it("rejects top-level config keys that belong inside options (fail loud, not silent)", () => {
-    // The report.md bug: README once placed processors/extraParameters at the
-    // top level; they'd be silently dropped. The guard turns that into an
+    // The report.md bug: README once placed processors/extraParameterRules at
+    // the top level; they'd be silently dropped. The guard turns that into an
     // immediate TypeError with a hint.
     for (const config of [
       { spec: { spec: SPEC }, processors: { x: async () => ({ status: "success" as const, data: null, httpStatus: 200 }) } },
-      { spec: { spec: SPEC }, extraParameters: { x: [] } },
+      { spec: { spec: SPEC }, extraParameterRules: [{ matches: () => true, parameters: [] }] },
     ] as never[]) {
       assert.throws(
         () => new MultiSpecParser(config),
-        /unknown config key "(processors|extraParameters)".*put it inside options/,
+        /unknown config key "(processors|extraParameterRules)".*put it inside options/,
         `expected unknown-key guard for ${JSON.stringify(config)}`,
       );
     }
@@ -670,7 +721,12 @@ describe("compile-time helpers stay coherent", () => {
     const parsed = parseSpec(SPEC);
     const { tools } = compileSpecToTools(parsed, {
       filterOps: (op) => !["POST", "PUT", "PATCH", "DELETE"].includes(op.method),
-      extraParameters: { listPets: [{ name: "traceId", schema: { type: "string" } }] },
+      extraParameterRules: [
+      {
+        matches: (operation) => operation.path === "/pets",
+        parameters: [{ name: "traceId", schema: { type: "string" } }],
+      },
+    ],
     });
     assert.deepEqual(tools.map((t) => t.name).sort(), ["getPet", "listPets"]);
     const list = tools.find((t) => t.name === "listPets")!;

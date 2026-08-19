@@ -67,7 +67,7 @@ export function toStandardSchema(
     } catch (error: unknown) {
       return { issues: [{ message: error instanceof Error ? error.message : String(error) }] };
     }
-  });
+  }, { defaultPolicy });
   cachedWrappers.set(defaultPolicy, wrapper);
   return wrapper;
 }

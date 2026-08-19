@@ -1,5 +1,5 @@
 /**
- * The policy surface, end to end: filterOps, extraParameters, the
+ * The policy surface, end to end: filterOps, extraParameterRules, the
  * execute() pipeline (401 retry → processors → truncation), describeTools(),
  * validate(), and the Standard Schema adapter.
  *
@@ -107,13 +107,16 @@ const parser = new MultiSpecParser({
     // method; a denylist is just another predicate.
     filterOps: (op) => !["POST", "PUT", "PATCH", "DELETE"].includes(op.method), // keeps getPet + listPets, drops createPet
 
-    // extraParameters: LLM-visible inputs that buildRequest ignores —
+    // extraParameterRules: LLM-visible inputs that buildRequest ignores —
     // metadata only your processor cares about.
-    extraParameters: {
-      getPet: [
-        { name: "traceId", schema: { type: "string" }, description: "Propagate a trace id." },
-      ],
-    },
+    extraParameterRules: [
+      {
+        matches: (operation) => operation.path === "/pets/{petId}",
+        parameters: [
+          { name: "traceId", schema: { type: "string" }, description: "Propagate a trace id." },
+        ],
+      },
+    ],
 
     // 401 → onUnauthorized() → retry once (maxAuthRetries).
     onUnauthorized: async () => "Bearer fresh-token",
@@ -151,9 +154,9 @@ try {
   console.log("  execute('createPet') →", err.message);
 }
 
-// 4. extraParameters: visible to the LLM, ignored by buildRequest.
+// 4. extraParameterRules: visible to the LLM, ignored by buildRequest.
 const getPet = parser.tool("getPet");
-console.log("extraParameters in inputSchema:", Object.keys(getPet.inputSchema.properties).join(", "));
+console.log("extraParameterRules in inputSchema:", Object.keys(getPet.inputSchema.properties).join(", "));
 console.log("buildRequest ignores extras:", parser.buildRequest("getPet", { petId: "1", traceId: "abc" }).url);
 
 // 5. validate(): real Ajv check, never throws.

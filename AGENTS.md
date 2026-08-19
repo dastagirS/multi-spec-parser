@@ -8,6 +8,11 @@
 
 - All initialization/bootstrap code (Mastra instance, service init, storage/vector wiring) goes in `src/lib/`. No init logic outside `src/lib/`.
 
+## API Decisions
+
+- Consumer-added model inputs use ordered `extraParameterRules`, matching
+  `ExtractedOperation` predicates; generated tool names are never selectors.
+
 ## Naming
 
 - Class names/constructors: PascalCase.

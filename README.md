@@ -186,19 +186,29 @@ const parser = new MultiSpecParser({
         },
       },
     ],
-    extraParameters: {
-      gmail_users_messages_attachments_get: [
-        { name: "fileName", schema: { type: "string" } },
-      ],
-    },
+    extraParameterRules: [
+      {
+        matches: (operation) => operation.tags.includes("attachments"),
+        parameters: [
+          { name: "fileName", schema: { type: "string" } },
+          { name: "mimeType", schema: { type: "string" } },
+        ],
+      },
+    ],
   },
 });
 ```
 
 Hook semantics:
 
+- `extraParameterRules` is compile-time and matches an `ExtractedOperation`, not
+  the final generated tool name. Prefer tags, method, and path predicates; use
+  `operationKey` when an exact stable operation selector is needed. The former
+  name-keyed `extraParameters` map is not supported.
 - `filterOps` runs before name dedup; filtered operations cannot be listed or
   executed.
+- `extraParameterRules` matches normalized operations before name dedup; every
+  matching rule contributes its LLM-visible parameters.
 - `processors` run in declaration order after fetch and before truncation;
   failures become explicit error results and `execute()` does not throw.
 - `onUnauthorized` replaces `Authorization` and retries up to
@@ -225,7 +235,7 @@ const normalized = await applied["~standard"].validate({});
 | Option | Applies at | Default |
 |---|---|---|
 | `maxDefsBytes` | `parse()` | 1MB |
-| `filterOps`, `extraParameters` | `parse()` | keep all / none |
+| `filterOps`, `extraParameterRules` | `parse()` | keep all / none |
 | `baseUrl`, `headers` | build/execute | spec server / none |
 | `transport` | `execute()` | global `fetch` |
 | `executeTimeoutMs` | `execute()` | 30s |
@@ -237,9 +247,12 @@ const normalized = await applied["~standard"].validate({});
 | `defaultPolicy` | validate/execute/Standard Schema | preserve |
 | `describeMaxBytes` | `describeTools()` | 64KB |
 
-Ajv validation recognizes standard JSON Schema formats plus OpenAPI formats such
-as `int32`, `int64`, and `byte`. `int64` validation accepts only JavaScript-safe
-integers because wider JSON numbers cannot be represented exactly by Node.js.
+With `defaultPolicy: "apply"`, Standard Schema input projections omit
+`required` entries whose properties define defaults; the canonical tool schema
+remains unchanged. Ajv validation recognizes standard JSON Schema formats plus
+OpenAPI formats such as `int32`, `int64`, and `byte`. `int64` validation accepts
+only JavaScript-safe integers because wider JSON numbers cannot be represented
+exactly by Node.js.
 
 ## Consumer-side protocols
 

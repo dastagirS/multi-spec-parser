@@ -306,8 +306,10 @@ paths:
     const validation = await parser.validate("getUserWithDefault", input);
     assert.deepEqual(validation, { valid: true, value: { userId: "me" } });
     assert.deepEqual(input, {});
-    const standardValidation = await parser.toStandardSchema("getUserWithDefault")["~standard"].validate(input);
+    const standard = parser.toStandardSchema("getUserWithDefault");
+    const standardValidation = await standard["~standard"].validate(input);
     assert.deepEqual(standardValidation, { value: { userId: "me" } });
+    assert.equal(standard["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, undefined);
     const result = await parser.execute("getUserWithDefault", input);
     assert.equal(result.status, "success");
     assert.equal(requestUrl, "https://api.example.com/users?userId=me");

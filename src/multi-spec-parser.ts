@@ -22,7 +22,7 @@ import { loadSpecSource, clearSpecCache, specCacheStats } from "./factory.js";
 import type {
   CompileResult,
   CompiledTool,
-  ExtraParameter,
+  ExtraParameterRule,
   TransformOptions,
 } from "./factory.js";
 import { buildRequest as buildRequestFor, executeRequest } from "./request-builder.js";
@@ -69,8 +69,8 @@ export interface MultiSpecParserOptions {
    *  denylist → op => !BLOCKED.has(op.toolName); scope-gate → op =>
    *  op.requiredScopes?.includes(x). */
   filterOps?: (op: ExtractedOperation) => boolean;
-  /** Item 5: per-tool extra input-schema properties. */
-  extraParameters?: Record<string, ExtraParameter[]>;
+  /** Item 5: ordered rules for consumer-supplied input properties. */
+  extraParameterRules?: ExtraParameterRule[];
   /** Ordered response processor rules. Every matching rule runs in
    *  declaration order, after response transforms and before truncation. */
   processors?: ProcessorRule[];
@@ -193,7 +193,7 @@ export class MultiSpecParser<
     const { document, parsed, compiled } = await loadSpecSource(source, {
       maxDefsBytes: this.options.maxDefsBytes,
       filterOps: this.options.filterOps,
-      extraParameters: this.options.extraParameters,
+      extraParameterRules: this.options.extraParameterRules,
       transforms: this.options.transforms,
       signal: parseOptions.signal,
       cache: this.options.cache,
@@ -258,7 +258,7 @@ export class MultiSpecParser<
       const result = await this.validate(resolved, value, { defaultPolicy });
       if (result.valid) return { value: "value" in result ? result.value : value };
       return { issues: result.issues };
-    });
+    }, { defaultPolicy });
     if (defaultPolicy === (this.options.defaultPolicy ?? "preserve")) {
       this.standardSchemaWrappers.set(resolved, wrapper);
     }
@@ -622,8 +622,8 @@ function validateConfig(config: MultiSpecParserConfig): void {
     throw new TypeError("MultiSpecParser: config object required.");
   }
   // Fail loud on unknown top-level keys: a key that the implementation
-  // never reads (e.g. processors/extraParameters at the top level instead of
-  // inside options) would otherwise no-op forever with zero signal.
+  // never reads (e.g. processors/extraParameterRules at the top level instead
+  // of inside options) would otherwise no-op forever with zero signal.
   const knownConfigKeys = ["spec", "options"];
   for (const key of Object.keys(config)) {
     if (!knownConfigKeys.includes(key)) {
@@ -726,15 +726,24 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
       }
     }
   }
-  if (
-    options.extraParameters !== undefined &&
-    (typeof options.extraParameters !== "object" ||
-      options.extraParameters === null ||
-      Array.isArray(options.extraParameters))
-  ) {
-    throw new TypeError(
-      "MultiSpecParser: options.extraParameters must be a map of toolName → array.",
-    );
+  if (options.extraParameterRules !== undefined) {
+    if (!Array.isArray(options.extraParameterRules)) {
+      throw new TypeError(
+        "MultiSpecParser: options.extraParameterRules must be an array of rules.",
+      );
+    }
+    for (const [index, rule] of options.extraParameterRules.entries()) {
+      if (
+        rule === null ||
+        typeof rule !== "object" ||
+        typeof rule.matches !== "function" ||
+        !Array.isArray(rule.parameters)
+      ) {
+        throw new TypeError(
+          `MultiSpecParser: options.extraParameterRules[${index}] must contain matches and parameters[].`,
+        );
+      }
+    }
   }
   if (options.transport !== undefined && typeof options.transport !== "function") {
     throw new TypeError("MultiSpecParser: options.transport must be a function.");

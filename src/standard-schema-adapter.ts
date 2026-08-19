@@ -78,17 +78,21 @@ type StandardSchemaValidator = (
 export function createStandardSchemaAdapter(
   tool: CompiledTool,
   validate: StandardSchemaValidator,
+  options: StandardSchemaAdapterOptions = {},
 ): StandardSchemaLike {
   assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
   assert(typeof validate === "function", "standard schema validator must be a function");
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
+  const defaultPolicy = options.defaultPolicy ?? "preserve";
+  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
   return {
     "~standard": {
       version: 1,
       vendor: "multi-spec-parser",
       validate,
       jsonSchema: {
-        input: (options) => projectSchema(tool.inputSchema, options.target),
-        output: (options) => projectSchema(tool.outputSchema ?? {}, options.target),
+        input: (options) => projectSchema(tool.inputSchema, options.target, defaultPolicy),
+        output: (options) => projectSchema(tool.outputSchema ?? {}, options.target, "preserve"),
       },
     },
   };
@@ -97,43 +101,73 @@ export function createStandardSchemaAdapter(
 function projectSchema(
   source: Record<string, unknown>,
   target: StandardJsonSchemaTarget,
+  defaultPolicy: DefaultPolicy,
 ): Record<string, unknown> {
   assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
   assert(typeof target === "string", "JSON Schema target must be a string");
+  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
   assertSupportedTarget(target);
+  if (defaultPolicy === "apply") {
+    const projected = optionalizeDefaultedRequired(source);
+    projected.$schema = target === DRAFT_07 ? DRAFT_07_SCHEMA_URI : DRAFT_2020_12_SCHEMA_URI;
+    if (target === DRAFT_2020_12) return projected;
+    return rewriteProjectedSchema(projected, target);
+  }
   // The internal schema already uses 2020-12-compatible $defs; a shallow
   // copy avoids duplicating large shared closures just to add the dialect URI.
   if (target === DRAFT_2020_12) return { ...source, $schema: DRAFT_2020_12_SCHEMA_URI };
   assertSchemaWithinLimit(source);
   const projected = structuredClone(source) as Record<string, unknown>;
   projected.$schema = target === DRAFT_07 ? DRAFT_07_SCHEMA_URI : DRAFT_2020_12_SCHEMA_URI;
-  const pending: unknown[] = [projected];
-  let processed = 0;
-  while (pending.length > 0) {
-    const current = pending.pop();
-    assert(current !== undefined, "schema traversal entry must exist");
-    assert(processed < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} nodes`);
-    processed += 1;
-    if (isRecord(current)) {
-      rewriteDefinitions(current, target);
-      rewriteReference(current, target);
-      for (const value of Object.values(current)) {
-        assert(pending.length < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} pending nodes`);
-        pending.push(value);
-      }
-    } else if (Array.isArray(current)) {
-      for (const value of current) {
-        assert(pending.length < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} pending nodes`);
-        pending.push(value);
-      }
-    }
-  }
+  return rewriteProjectedSchema(projected, target);
+}
+
+function optionalizeDefaultedRequired(source: Record<string, unknown>): Record<string, unknown> {
+  assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
+  assertSchemaWithinLimit(source);
+  const projected = structuredClone(source) as Record<string, unknown>;
+  walkSchema(projected, (current) => {
+    const required = current.required;
+    const properties = current.properties;
+    if (!Array.isArray(required) || !isRecord(properties)) return;
+    const remaining = required.filter((name): boolean => {
+      const property =
+        typeof name === "string" && Object.prototype.hasOwnProperty.call(properties, name)
+          ? properties[name]
+          : undefined;
+      return !(isRecord(property) && Object.prototype.hasOwnProperty.call(property, "default"));
+    });
+    if (remaining.length === 0) delete current.required;
+    else if (remaining.length !== required.length) current.required = remaining;
+  });
+  return projected;
+}
+
+function rewriteProjectedSchema(
+  projected: Record<string, unknown>,
+  target: StandardJsonSchemaTarget,
+): Record<string, unknown> {
+  assert(projected !== null && typeof projected === "object" && !Array.isArray(projected), "projected schema must be an object");
+  assert(target === DRAFT_07, "only draft-07 projections require rewriting");
+  walkSchema(projected, (current) => {
+    rewriteDefinitions(current, target);
+    rewriteReference(current, target);
+  });
   return projected;
 }
 
 function assertSchemaWithinLimit(source: Record<string, unknown>): void {
   assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
   assert(MAX_SCHEMA_NODES > 0, "schema node limit must be positive");
+  walkSchema(source, () => undefined);
+}
+
+function walkSchema(
+  source: Record<string, unknown>,
+  visit: (current: Record<string, unknown>) => void,
+): void {
+  assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
+  assert(typeof visit === "function", "schema visitor must be a function");
   const pending: unknown[] = [source];
   let processed = 0;
   while (pending.length > 0) {
@@ -141,13 +175,9 @@ function assertSchemaWithinLimit(source: Record<string, unknown>): void {
     assert(current !== undefined, "schema traversal entry must exist");
     assert(processed < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} nodes`);
     processed += 1;
-    if (isRecord(current)) {
+    if (isRecord(current)) visit(current);
+    if (isRecord(current) || Array.isArray(current)) {
       for (const value of Object.values(current)) {
-        assert(pending.length < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} pending nodes`);
-        pending.push(value);
-      }
-    } else if (Array.isArray(current)) {
-      for (const value of current) {
         assert(pending.length < MAX_SCHEMA_NODES, `schema exceeds ${MAX_SCHEMA_NODES} pending nodes`);
         pending.push(value);
       }
