@@ -9,6 +9,7 @@ export { MultiSpecParser } from "./multi-spec-parser.js";
 export type {
   ExecuteProcessor,
   ProcessorRule,
+  ProcessorMatchContext,
   MultiSpecParserConfig,
   MultiSpecParserOptions,
   SpecSource,

@@ -92,11 +92,15 @@ export interface SchemaTransformContext {
 export interface RequestTransformContext {
   tool: CompiledTool;
   args: Record<string, unknown>;
+  /** Opaque execution-local dependencies; absent during public buildRequest(). */
+  runtimeContext?: unknown;
 }
 
 export interface ResponseTransformContext {
   tool: CompiledTool;
   args: Record<string, unknown>;
+  /** Opaque execution-local dependencies for this execution. */
+  runtimeContext?: unknown;
   request: BuiltRequest;
   retryCount: number;
   signal?: AbortSignal;

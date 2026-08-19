@@ -439,6 +439,8 @@ export interface ExecuteRequestOptions extends RequestBuildOptions {
   timeoutMs?: number;
   maxResponseBodyBytes?: number;
   signal?: AbortSignal;
+  /** Opaque execution-local dependencies for runtime hooks only. */
+  runtimeContext?: unknown;
   /** Execution-local transport; overrides the parser default. */
   transport?: RequestTransport;
   /** Execution-local 401 refresh callback; returns an Authorization value. */

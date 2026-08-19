@@ -12,6 +12,8 @@
 
 - Consumer-added model inputs use ordered `extraParameterRules`, matching
   `ExtractedOperation` predicates; generated tool names are never selectors.
+- `runtimeContext` is execution-local opaque data for runtime transforms and
+  processors only; it never enters schemas, model arguments, or parser state.
 
 ## Naming
 

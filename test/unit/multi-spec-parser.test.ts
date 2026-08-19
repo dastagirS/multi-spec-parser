@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
+import type { TransportRequest } from "../../src/request-builder.js";
 
 const SPEC = {
   openapi: "3.0.3",
@@ -192,7 +193,13 @@ paths:
           schema: (schema, context) => context.kind === "parameter"
             ? { ...schema, description: "parameter transformed" }
             : schema,
-          request: (request) => ({ ...request, headers: { ...request.headers, "X-Transform": "yes" } }),
+          request: (request, context) => ({
+            ...request,
+            headers: {
+              ...request.headers,
+              "X-Transform": context.runtimeContext === undefined ? "yes" : "wrong",
+            },
+          }),
           response: (result) => ({ ...result, data: { transformed: result.data } }),
         },
       },
@@ -201,6 +208,69 @@ paths:
     const request = parser.buildRequest("getPet", { petId: "one" });
     assert.equal(request.headers["X-Transform"], "yes");
     assert.equal(parser.tool("getPet")?.description, "transformed");
+  });
+
+  it("passes execution context through runtime hooks without cross-execution leakage", async () => {
+    const requestContexts: unknown[] = [];
+    const responseContexts: unknown[] = [];
+    const matchContexts: unknown[] = [];
+    const processContexts: unknown[] = [];
+    const attempts: Record<"A" | "B", number> = { A: 0, B: 0 };
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        transforms: {
+          request: (request, context) => {
+            requestContexts.push(context.runtimeContext);
+            return request;
+          },
+          response: (result, context) => {
+            responseContexts.push(context.runtimeContext);
+            return result;
+          },
+        },
+        processors: [
+          {
+            matches: (_tool, context) => {
+              matchContexts.push(context.runtimeContext);
+              return true;
+            },
+            process: (result, context) => {
+              processContexts.push(context.runtimeContext);
+              assert.deepEqual(context.args, {});
+              return result;
+            },
+          },
+        ],
+      },
+    });
+    await parser.parse();
+    const contexts = {
+      A: { userId: "user-a", dependency: "a" },
+      B: { userId: "user-b", dependency: "b" },
+    } as const;
+    const executeForUser = async (user: "A" | "B") =>
+      parser.execute("listPets", {}, {
+        runtimeContext: contexts[user],
+        transport: async (_request: TransportRequest) => {
+          attempts[user] += 1;
+          if (attempts[user] === 1) return new Response("expired", { status: 401 });
+          return new Response(JSON.stringify({ user }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+        onUnauthorized: () => `Bearer ${user}-fresh`,
+      });
+    const [resultA, resultB] = await Promise.all([executeForUser("A"), executeForUser("B")]);
+    assert.equal(resultA.status, "success");
+    assert.equal(resultB.status, "success");
+    assert.equal(requestContexts.filter((context) => context === contexts.A).length, 2);
+    assert.equal(requestContexts.filter((context) => context === contexts.B).length, 2);
+    for (const observed of [responseContexts, matchContexts, processContexts]) {
+      assert.equal(observed.filter((context) => context === contexts.A).length, 1);
+      assert.equal(observed.filter((context) => context === contexts.B).length, 1);
+    }
   });
 
   it("uses the optional custom transport and keeps the default when omitted", async () => {

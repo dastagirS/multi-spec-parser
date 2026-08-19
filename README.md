@@ -239,12 +239,15 @@ const result = await parser.execute("listPets", {}, {
   headers: await userClient.getHeaders(),
   transport: (request) => userClient.transport(request),
   onUnauthorized: () => userClient.refreshAuthorization(),
+  runtimeContext: { userId, storageClient },
 });
 ```
 
 Execution-local values take precedence over parser defaults and remain isolated
-from concurrent executions. The parser still owns retries, processors,
-truncation, and response handling.
+from concurrent executions. `runtimeContext` is opaque and is passed only to
+request/response transforms and processor hooks; it never enters tool schemas,
+model arguments, logs, or serialized results. The parser still owns retries,
+processors, truncation, and response handling.
 
 ## Options reference
 
@@ -254,6 +257,7 @@ truncation, and response handling.
 | `filterOps`, `extraParameterRules` | `parse()` | keep all / none |
 | `baseUrl`, `headers` | build/execute | spec server / none |
 | `transport` | execute / per-execution override | global `fetch` |
+| `runtimeContext` | runtime hooks during `execute()` | absent |
 | `executeTimeoutMs` | `execute()` | 30s |
 | `maxResponseBodyBytes` | `execute()` | 50MiB |
 | `processors`, `onUnauthorized`, `maxAuthRetries` | `execute()` | none / disabled / 1 |

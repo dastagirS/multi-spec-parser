@@ -103,6 +103,8 @@ export type ExecuteProcessor = (
   ctx: {
     tool: CompiledTool;
     args: Record<string, unknown>;
+    /** Opaque execution-local dependencies; never part of tool input. */
+    runtimeContext?: unknown;
     request: BuiltRequest;
     response?: ExecuteResult["response"];
     retryCount: number;
@@ -110,8 +112,13 @@ export type ExecuteProcessor = (
   },
 ) => ExecuteResult | Promise<ExecuteResult>;
 
+export interface ProcessorMatchContext {
+  /** Opaque execution-local dependencies for this execution. */
+  runtimeContext?: unknown;
+}
+
 export interface ProcessorRule {
-  matches: (tool: CompiledTool) => boolean;
+  matches: (tool: CompiledTool, context: ProcessorMatchContext) => boolean;
   process: ExecuteProcessor;
 }
 
@@ -355,19 +362,32 @@ export class MultiSpecParser<
     args: Record<string, unknown>,
     options: RequestBuildOptions = {},
   ): BuiltRequest {
-    const resolved = this.resolveTool(tool);
+    return this.buildRequestWithRuntimeContext(
+      this.resolveTool(tool),
+      args,
+      options,
+      undefined,
+    );
+  }
+
+  private buildRequestWithRuntimeContext(
+    tool: CompiledTool,
+    args: Record<string, unknown>,
+    options: RequestBuildOptions,
+    runtimeContext: unknown,
+  ): BuiltRequest {
     const defaults: RequestBuildOptions = {
       ...(this.options.baseUrl !== undefined ? { baseUrl: this.options.baseUrl } : {}),
       headers: { ...(this.options.headers ?? {}) },
     };
-    const request = buildRequestFor(resolved.operation, args, {
+    const request = buildRequestFor(tool.operation, args, {
       ...defaults,
       ...options,
       headers: { ...defaults.headers, ...(options.headers ?? {}) },
     });
     const transform = this.options.transforms?.request;
     if (!transform) return request;
-    const transformed = transform(request, { tool: resolved, args });
+    const transformed = transform(request, { tool, args, runtimeContext });
     if (!isBuiltRequest(transformed)) {
       throw new TypeError("Request transform returned an invalid request.");
     }
@@ -403,7 +423,12 @@ export class MultiSpecParser<
     let retries = 0;
     let request: BuiltRequest;
     try {
-      request = this.buildRequest(resolved, effectiveArgs, options);
+      request = this.buildRequestWithRuntimeContext(
+        resolved,
+        effectiveArgs,
+        options,
+        options.runtimeContext,
+      );
     } catch (error: unknown) {
       return requestFailure(resolved, error);
     }
@@ -443,10 +468,15 @@ export class MultiSpecParser<
         };
       }
       try {
-        request = this.buildRequest(resolved, effectiveArgs, {
-          ...options,
-          headers: { ...(options.headers ?? {}), Authorization: header },
-        });
+        request = this.buildRequestWithRuntimeContext(
+          resolved,
+          effectiveArgs,
+          {
+            ...options,
+            headers: { ...(options.headers ?? {}), Authorization: header },
+          },
+          options.runtimeContext,
+        );
       } catch (error: unknown) {
         return requestFailure(resolved, error);
       }
@@ -459,9 +489,25 @@ export class MultiSpecParser<
       });
     }
 
-    result = await this.applyResponseTransform(resolved, effectiveArgs, request, result, retries, options.signal);
+    result = await this.applyResponseTransform(
+      resolved,
+      effectiveArgs,
+      request,
+      result,
+      retries,
+      options.signal,
+      options.runtimeContext,
+    );
     // Item 2: post-process (consumer closure owns S3/PII/etc.).
-    result = await this.applyProcessor(resolved, effectiveArgs, result, request, retries, options.signal);
+    result = await this.applyProcessor(
+      resolved,
+      effectiveArgs,
+      result,
+      request,
+      retries,
+      options.signal,
+      options.runtimeContext,
+    );
 
     // Item 4: uniform size guarantee AFTER processors (a processor can shrink
     // the result — truncating first would destroy its input).
@@ -475,11 +521,19 @@ export class MultiSpecParser<
     result: ExecuteResult,
     retryCount: number,
     signal: AbortSignal | undefined,
+    runtimeContext: unknown,
   ): Promise<ExecuteResult> {
     const transform = this.options.transforms?.response;
     if (!transform) return result;
     try {
-      const transformed = await transform(result, { tool, args, request, retryCount, signal });
+      const transformed = await transform(result, {
+        tool,
+        args,
+        request,
+        retryCount,
+        signal,
+        runtimeContext,
+      });
       return isExecuteResult(transformed) ? transformed : processorFailure(result, `Response transform for "${tool.name}" returned an invalid result.`);
     } catch (error: unknown) {
       return processorFailure(result, `Response transform for "${tool.name}" failed: ${errorMessage(error)}`);
@@ -493,12 +547,13 @@ export class MultiSpecParser<
     request: BuiltRequest,
     retryCount: number,
     signal: AbortSignal | undefined,
+    runtimeContext: unknown,
   ): Promise<ExecuteResult> {
     const rules = this.options.processors ?? [];
     for (const rule of rules) {
       let matches = false;
       try {
-        matches = rule.matches(tool);
+        matches = rule.matches(tool, { runtimeContext });
       } catch (error: unknown) {
         return processorFailure(
           result,
@@ -510,6 +565,7 @@ export class MultiSpecParser<
         const processed = await rule.process(result, {
           tool,
           args,
+          runtimeContext,
           request,
           response: result.response,
           retryCount,
