@@ -230,6 +230,22 @@ const applied = parser.toStandardSchema("createPet", { defaultPolicy: "apply" })
 const normalized = await applied["~standard"].validate({});
 ```
 
+Authentication and transport can also be overridden for one execution without
+mutating the parser. This is useful when one compiled parser serves multiple
+users or clients:
+
+```ts
+const result = await parser.execute("listPets", {}, {
+  headers: await userClient.getHeaders(),
+  transport: (request) => userClient.transport(request),
+  onUnauthorized: () => userClient.refreshAuthorization(),
+});
+```
+
+Execution-local values take precedence over parser defaults and remain isolated
+from concurrent executions. The parser still owns retries, processors,
+truncation, and response handling.
+
 ## Options reference
 
 | Option | Applies at | Default |
@@ -237,7 +253,7 @@ const normalized = await applied["~standard"].validate({});
 | `maxDefsBytes` | `parse()` | 1MB |
 | `filterOps`, `extraParameterRules` | `parse()` | keep all / none |
 | `baseUrl`, `headers` | build/execute | spec server / none |
-| `transport` | `execute()` | global `fetch` |
+| `transport` | execute / per-execution override | global `fetch` |
 | `executeTimeoutMs` | `execute()` | 30s |
 | `maxResponseBodyBytes` | `execute()` | 50MiB |
 | `processors`, `onUnauthorized`, `maxAuthRetries` | `execute()` | none / disabled / 1 |

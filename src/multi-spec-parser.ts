@@ -395,12 +395,11 @@ export class MultiSpecParser<
       return requestFailure(resolved, error);
     }
 
-    // Item 3: 401 → onUnauthorized() → retry (maxAuthRetries times). The
-    // retried request rebuilds with the new Authorization header; per-call
-    // headers win over config defaults in buildRequest, so this overrides
-    // any stale config Authorization. A failing refresher never loops — it
-    // degrades to an explicit error result.
+    // Item 3: 401 → onUnauthorized() → retry (maxAuthRetries times). Resolve
+    // execution-local hooks once so concurrent calls never share client state.
     const maxAuthRetries = this.options.maxAuthRetries ?? 1;
+    const transport = options.transport ?? this.options.transport;
+    const onUnauthorized = options.onUnauthorized ?? this.options.onUnauthorized;
     let retries = 0;
     let request: BuiltRequest;
     try {
@@ -413,18 +412,18 @@ export class MultiSpecParser<
       signal: options.signal,
       maxResponseBodyBytes,
       retryCount: 0,
-      transport: this.options.transport,
+      transport,
     });
     while (
       result.status === "error" &&
       result.httpStatus === 401 &&
       retries < maxAuthRetries &&
-      this.options.onUnauthorized
+      onUnauthorized
     ) {
       retries += 1;
       let header: string;
       try {
-        header = await this.options.onUnauthorized();
+        header = await onUnauthorized();
       } catch (err) {
         const message = `onUnauthorized failed: ${errorMessage(err)}`;
         return {
@@ -456,7 +455,7 @@ export class MultiSpecParser<
         signal: options.signal,
         maxResponseBodyBytes,
         retryCount: retries,
-        transport: this.options.transport,
+        transport,
       });
     }
 

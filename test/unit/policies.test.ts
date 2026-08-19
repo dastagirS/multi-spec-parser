@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
 import { compileSpecToTools } from "../../src/factory.js";
 import { parseSpec } from "../../src/parse-spec.js";
+import type { TransportRequest } from "../../src/request-builder.js";
 
 const SPEC = {
   openapi: "3.0.3",
@@ -421,6 +422,117 @@ describe("processors (item 2)", () => {
 });
 
 describe("401 retry (item 3)", () => {
+  it("uses an execution-local transport instead of the parser transport", async () => {
+    let parserTransportCalls = 0;
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        transport: async () => {
+          parserTransportCalls += 1;
+          return new Response(JSON.stringify({ source: "parser" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      },
+    });
+    await parser.parse();
+    const result = await parser.execute("listPets", {}, {
+      transport: async () =>
+        new Response(JSON.stringify({ source: "execution" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    assert.equal(result.status, "success");
+    assert.deepEqual(result.data, { source: "execution" });
+    assert.equal(parserTransportCalls, 0);
+  });
+
+  it("uses the parser transport when no execution transport is supplied", async () => {
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        transport: async () =>
+          new Response(JSON.stringify({ source: "parser" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      },
+    });
+    await parser.parse();
+    const result = await parser.execute("listPets", {});
+    assert.equal(result.status, "success");
+    assert.deepEqual(result.data, { source: "parser" });
+  });
+
+  it("uses the execution transport and refresh callback for both retry attempts", async () => {
+    const seenAuthorization: string[] = [];
+    let attempts = 0;
+    let parserTransportCalls = 0;
+    let parserRefreshCalls = 0;
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        headers: { Authorization: "Bearer parser-stale" },
+        transport: async () => {
+          parserTransportCalls += 1;
+          throw new Error("parser transport must not be used");
+        },
+        onUnauthorized: () => {
+          parserRefreshCalls += 1;
+          return "Bearer parser-fresh";
+        },
+      },
+    });
+    await parser.parse();
+    const result = await parser.execute("listPets", {}, {
+      transport: async (request: TransportRequest) => {
+        attempts += 1;
+        seenAuthorization.push(request.headers.Authorization ?? "(none)");
+        if (attempts === 1) return new Response("expired", { status: 401 });
+        return new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      onUnauthorized: () => "Bearer execution-fresh",
+    });
+    assert.equal(result.status, "success");
+    assert.equal(parserTransportCalls, 0);
+    assert.equal(parserRefreshCalls, 0);
+    assert.deepEqual(seenAuthorization, ["Bearer parser-stale", "Bearer execution-fresh"]);
+  });
+
+  it("isolates transports and refresh callbacks across concurrent executions", async () => {
+    const seenAuthorization: Record<"A" | "B", string[]> = { A: [], B: [] };
+    const attempts: Record<"A" | "B", number> = { A: 0, B: 0 };
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    await parser.parse();
+    const executeForUser = async (user: "A" | "B") =>
+      parser.execute("listPets", {}, {
+        headers: { Authorization: `Bearer ${user}-stale` },
+        transport: async (request: TransportRequest) => {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          attempts[user] += 1;
+          seenAuthorization[user]!.push(request.headers.Authorization ?? "(none)");
+          if (attempts[user] === 1) return new Response("expired", { status: 401 });
+          return new Response(JSON.stringify({ user }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+        onUnauthorized: () => `Bearer ${user}-fresh`,
+      });
+    const [resultA, resultB] = await Promise.all([executeForUser("A"), executeForUser("B")]);
+    assert.equal(resultA.status, "success");
+    assert.equal(resultB.status, "success");
+    assert.deepEqual(resultA.data, { user: "A" });
+    assert.deepEqual(resultB.data, { user: "B" });
+    assert.deepEqual(seenAuthorization.A, ["Bearer A-stale", "Bearer A-fresh"]);
+    assert.deepEqual(seenAuthorization.B, ["Bearer B-stale", "Bearer B-fresh"]);
+  });
+
   it("retries once with the refreshed Authorization header", async () => {
     let requests = 0;
     const seenAuth: string[] = [];
@@ -457,6 +569,34 @@ describe("401 retry (item 3)", () => {
         assert.deepEqual(seenAuth, ["Bearer stale", "Bearer fresh"]);
       },
     );
+  });
+
+  it("a failed execution-local refresher returns an error without looping", async () => {
+    let attempts = 0;
+    let parserRefreshCalls = 0;
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        onUnauthorized: () => {
+          parserRefreshCalls += 1;
+          return "Bearer parser-fresh";
+        },
+      },
+    });
+    await parser.parse();
+    const result = await parser.execute("listPets", {}, {
+      transport: async () => {
+        attempts += 1;
+        return new Response("expired", { status: 401 });
+      },
+      onUnauthorized: () => {
+        throw new Error("execution refresh failed");
+      },
+    });
+    assert.equal(result.status, "error");
+    assert.match(result.error ?? "", /execution refresh failed/);
+    assert.equal(attempts, 1);
+    assert.equal(parserRefreshCalls, 0);
   });
 
   it("maxAuthRetries: 0 disables the retry", async () => {
