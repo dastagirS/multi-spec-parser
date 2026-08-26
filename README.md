@@ -94,6 +94,33 @@ const parser = new MultiSpecParser({
 Configure parsed-source caching with `options.cache.enabled`, `maxEntries`, and
 `ttlMs`; use `parser.clearCache()` and `parser.cacheStats()` to manage it.
 
+Set `options.lazy: true` to experiment with on-demand source and tool loading.
+For the lowest retained memory, use `load()` instead of `parse()`:
+
+```js
+const parser = new MultiSpecParser({
+  spec: { url: "https://example.com/openapi.yaml" },
+  options: { lazy: true },
+});
+await parser.load();
+const tool = parser.tool("getPet");
+```
+
+`load()` returns nothing and indexes supported OpenAPI YAML without constructing
+the complete raw or normalized document. The first access to a tool extracts its
+path item and transitive local component references, compiles it, and caches the
+result. Unsupported text layouts and formats fall back to full materialization
+through `parse()`; strict low-memory `load()` rejects them instead. Text-source
+`load()` also rejects operation filters/transforms because deriving the final
+name index would require evaluating every complete operation. Schema transforms
+and `extraParameterRules` still run when each tool compiles.
+
+`tools()`, `describeTools()`, and `defs` intentionally materialize the complete
+specification. Object sources remain caller-owned, so lazy mode cannot release
+the source object. Compile-time transforms must be deterministic because lazy
+materialization may reapply them. This mode is experimental and is intended for
+large specifications where callers access only a subset of operations.
+
 ## Examples
 
 Runnable examples are in [`examples/`](examples/) and ship in the npm tarball:
@@ -268,6 +295,7 @@ processors, truncation, and response handling.
 | `maxResponseBytes`, `onTruncate` | `execute()` | no cap / none |
 | `transforms` | parse/build/execute | none |
 | `cache` | `parse()` | enabled, bounded |
+| `lazy` | parse/tool access | false |
 | `defaultPolicy` | validate/execute/Standard Schema | preserve |
 | `describeMaxBytes` | `describeTools()` | 64KB |
 

@@ -18,10 +18,20 @@
 
 import assert from "node:assert/strict";
 
-import { loadSpecSource, clearSpecCache, specCacheStats } from "./factory.js";
+import {
+  loadSpecSource,
+  loadSpecTextSource,
+  clearSpecCache,
+  specCacheStats,
+  createToolNameIndex,
+  createLazyToolCompiler,
+} from "./factory.js";
 import type {
   CompileResult,
   CompiledTool,
+  ToolNameIndex,
+  ToolLocator,
+  LazyToolCompiler,
   ExtraParameterRule,
   TransformOptions,
 } from "./factory.js";
@@ -33,6 +43,10 @@ import type {
   RequestBuildOptions,
   RequestTransport,
 } from "./request-builder.js";
+import { parseSpec, parseSpecText } from "./parse-spec.js";
+import { TOOL_NAME_LOOKUP_LENGTH_MAX } from "./tool-names.js";
+import { createLazySourceIndex } from "./lazy-source-index.js";
+import type { LazySourceIndex } from "./lazy-source-index.js";
 import type { ExtractedOperation, ParsedSpec, SchemaObject, SpecFormat } from "./types.js";
 import type { ValidateFunction } from "ajv";
 import {
@@ -94,6 +108,8 @@ export interface MultiSpecParserOptions {
   describeMaxBytes?: number;
   /** Whether validation/execution preserves or applies schema defaults. */
   defaultPolicy?: DefaultPolicy;
+  /** Enable experimental low-memory source indexing and on-demand tools. */
+  lazy?: boolean;
 }
 
 /** Item 2: result transformer; may be async; may not throw (a throw degrades
@@ -157,7 +173,7 @@ export interface MultiSpecParserConfig<T = Record<string, unknown>> {
 }
 
 const NOT_PARSED =
-  "MultiSpecParser: call await parser.parse() before using tools/requests.";
+  "MultiSpecParser: call await parser.parse() or await parser.load() before using tools/requests.";
 
 /** Item 8: default per-tool schema budget for describeTools(). */
 const DEFAULT_DESCRIBE_MAX_BYTES = 64 * 1024;
@@ -175,6 +191,14 @@ export class MultiSpecParser<
   private readonly options: MultiSpecParserOptions;
   private parsed: ParsedSpec | undefined;
   private compiled: CompileResult | undefined;
+  private lazyNameIndex: ToolNameIndex | undefined;
+  private lazyCompiler: LazyToolCompiler | undefined;
+  private lazySourceIndex: LazySourceIndex | undefined;
+  private lazySourceText: string | undefined;
+  private lazyFormat: SpecFormat | undefined;
+  private lazyBaseUrl = "";
+  private readonly lazyTools = new Map<string, CompiledTool>();
+  private lazyDefs: Record<string, unknown> | undefined;
   /** The raw parsed document (JSON/YAML → object, pre-normalization) that
    *  parse() returns — typed as T for object sources. */
   private raw: T | undefined;
@@ -186,8 +210,9 @@ export class MultiSpecParser<
     this.options = config.options ?? {};
   }
 
-  /** Load (fetch if URL) + parse. Memoized: repeated calls return the cached
-   *  model. Returns the RAW parsed document, typed to the input spec for
+  /** Load (fetch if URL) + parse. Eager mode is memoized. Lazy mode keeps a
+   *  compact name index and may rematerialize the raw document on later calls.
+   *  Returns the RAW parsed document, typed to the input spec for
    *  object sources — the parser's view of the underlying schema:
    *
    *     const { resources } = await parser.parse();
@@ -196,6 +221,7 @@ export class MultiSpecParser<
    *  to type them: new MultiSpecParser<MyType>({ spec: { url } })). */
   async parse(parseOptions: ParseOptions = {}): Promise<T> {
     if (parseOptions.signal?.aborted) throw new Error("MultiSpecParser: parse aborted.");
+    if (this.options.lazy) return this.parseLazy(parseOptions);
     if (this.parsed) return this.raw as T;
     const source = this.sourceAsInput();
     const { document, parsed, compiled } = await loadSpecSource(source, {
@@ -205,6 +231,7 @@ export class MultiSpecParser<
       transforms: this.options.transforms,
       signal: parseOptions.signal,
       cache: this.options.cache,
+      compile: true,
     });
     this.raw = document as T;
     this.parsed = parsed;
@@ -212,19 +239,99 @@ export class MultiSpecParser<
     return this.raw;
   }
 
+  /** Prepare low-memory lazy mode without materializing the raw document. */
+  async load(parseOptions: ParseOptions = {}): Promise<void> {
+    if (!this.options.lazy) throw new Error("MultiSpecParser: load() requires options.lazy=true.");
+    if (parseOptions.signal?.aborted) throw new Error("MultiSpecParser: load aborted.");
+    if (this.lazyNameIndex) return;
+    const hasOperationHooks = this.options.filterOps !== undefined || this.options.transforms?.operation !== undefined;
+    if (hasOperationHooks && (isUrlSource(this.source) || isTextSource(this.source))) {
+      throw new Error("MultiSpecParser: load() cannot index filterOps or operation transforms for text sources; use parse().");
+    }
+    if (!await this.tryLoadLowMemory(parseOptions)) {
+      throw new Error("MultiSpecParser: load() requires an indexable OpenAPI YAML source; use parse() for this source.");
+    }
+  }
+
+  private async tryLoadLowMemory(parseOptions: ParseOptions): Promise<boolean> {
+    assert(this.options.lazy === true, "low-memory loading requires lazy mode");
+    assert(parseOptions !== null && typeof parseOptions === "object", "parse options must be an object");
+    if (this.lazyNameIndex) return true;
+    const loadedSource = await loadSpecTextSource(
+      this.lazySourceText ?? this.sourceAsInput(),
+      parseOptions.signal,
+    );
+    if (typeof loadedSource !== "string") {
+      const parsed = parseSpec(loadedSource);
+      this.parsed = parsed;
+      this.lazyNameIndex = createToolNameIndex(parsed, this.compileOptions());
+      this.lazyFormat = parsed.specFormat;
+      this.lazyBaseUrl = parsed.baseUrl ?? "";
+      return true;
+    }
+    this.lazySourceText = loadedSource;
+    const sourceIndex = createLazySourceIndex(loadedSource);
+    if (!sourceIndex) return false;
+    this.lazySourceIndex = sourceIndex;
+    this.lazyNameIndex = sourceIndex.createToolNameIndex();
+    this.lazyFormat = sourceIndex.specFormat;
+    this.lazyBaseUrl = sourceIndex.baseUrl;
+    return true;
+  }
+
+  private async parseLazy(parseOptions: ParseOptions): Promise<T> {
+    if (this.canUseLowMemoryLazy() && await this.tryLoadLowMemory(parseOptions)) {
+      if (this.lazySourceText !== undefined) return parseSpecText(this.lazySourceText) as T;
+      const source = this.sourceAsInput();
+      assert(typeof source !== "string", "lazy object source must be an object");
+      return source as T;
+    }
+    if (this.raw !== undefined) return this.raw;
+    const source = this.lazySourceText ?? this.sourceAsInput();
+    const loaded = await loadSpecSource(source, {
+      maxDefsBytes: this.options.maxDefsBytes,
+      filterOps: this.options.filterOps,
+      extraParameterRules: this.options.extraParameterRules,
+      transforms: this.options.transforms,
+      signal: parseOptions.signal,
+      cache: this.options.cache,
+      compile: false,
+      cacheParsed: false,
+    });
+    this.parsed = loaded.parsed;
+    this.raw = loaded.document as T;
+    this.lazyNameIndex = createToolNameIndex(loaded.parsed, this.compileOptions());
+    this.lazySourceIndex = loaded.sourceText
+      ? createLazySourceIndex(loaded.sourceText, loaded.parsed.specFormat)
+      : undefined;
+    this.lazySourceText = this.lazySourceIndex ? loaded.sourceText : undefined;
+    this.lazyFormat = loaded.parsed.specFormat;
+    this.lazyBaseUrl = loaded.parsed.baseUrl ?? "";
+    return this.raw;
+  }
+
   /** Detected dialect (openapi3 / swagger2 / google-discovery). */
   get format(): SpecFormat {
+    if (this.options.lazy) {
+      if (!this.lazyFormat) throw new Error(NOT_PARSED);
+      return this.lazyFormat;
+    }
     return this.requireParsed().specFormat;
   }
 
   /** First declared server URL (relative servers stay relative — pair with the
    *  options.baseUrl origin when building requests). Empty when none declared. */
   get baseUrl(): string {
+    if (this.options.lazy) {
+      if (!this.lazyNameIndex) throw new Error(NOT_PARSED);
+      return this.lazyBaseUrl;
+    }
     return this.requireParsed().baseUrl ?? "";
   }
 
   /** Hoisted shared defs map referenced by every tool's $defs closure. */
   get defs(): Record<string, unknown> {
+    if (this.options.lazy) return this.requireLazyDefs();
     return this.requireCompiled().defs;
   }
 
@@ -348,6 +455,7 @@ export class MultiSpecParser<
 
   /** The tool with the given name, or undefined. */
   tool(name: string): CompiledTool | undefined {
+    if (this.options.lazy) return this.getLazyTool(name);
     return this.tools().find((t) => t.name === name);
   }
 
@@ -661,8 +769,89 @@ export class MultiSpecParser<
   }
 
   private requireCompiled(): CompileResult {
+    if (this.options.lazy && !this.compiled) {
+      if (!this.lazyCompiler && this.parsed) {
+        this.lazyCompiler = createLazyToolCompiler(this.parsed, this.compileOptions());
+      }
+      if (this.lazyCompiler) this.compiled = this.lazyCompiler.compileAll();
+      else {
+        const parsed = this.parseLazyModel();
+        this.compiled = createLazyToolCompiler(parsed, this.compileOptions()).compileAll();
+      }
+    }
     if (!this.compiled) throw new Error(NOT_PARSED);
     return this.compiled;
+  }
+
+  private requireLazyDefs(): Record<string, unknown> {
+    if (!this.lazyNameIndex) throw new Error(NOT_PARSED);
+    if (this.lazyDefs) return this.lazyDefs;
+    if (!this.lazyCompiler && this.parsed) {
+      this.lazyCompiler = createLazyToolCompiler(this.parsed, this.compileOptions());
+    }
+    if (this.lazyCompiler) this.lazyDefs = this.lazyCompiler.defs;
+    else {
+      const parsed = this.parseLazyModel();
+      this.lazyDefs = createLazyToolCompiler(parsed, this.compileOptions()).defs;
+    }
+    return this.lazyDefs;
+  }
+
+  private getLazyTool(name: string): CompiledTool | undefined {
+    assert(typeof name === "string", "tool name must be a string");
+    assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
+    if (!this.lazyNameIndex) throw new Error(NOT_PARSED);
+    const cached = this.lazyTools.get(name);
+    if (cached) return cached;
+    if (!this.lazyNameIndex.has(name)) return undefined;
+    if (!this.lazyCompiler && this.parsed) {
+      this.lazyCompiler = createLazyToolCompiler(this.parsed, this.compileOptions());
+    }
+    if (this.lazyCompiler) {
+      const tool = this.lazyCompiler.getTool(name);
+      assert(tool !== undefined, "indexed fallback tool must compile");
+      this.lazyTools.set(name, tool);
+      return tool;
+    }
+    const locator = this.lazyNameIndex.get(name);
+    if (!locator) return undefined;
+    const parsed = this.parseLazyModel(locator);
+    const compiler = createLazyToolCompiler(parsed, this.compileOptions());
+    const compiled = compiler.getToolByOperationKey(locator.operationKey);
+    assert(compiled !== undefined, "indexed tool must compile");
+    const tool = compiled.name === name ? compiled : { ...compiled, name };
+    this.lazyTools.set(name, tool);
+    return tool;
+  }
+
+  private canUseLowMemoryLazy(): boolean {
+    return this.options.lazy === true && this.options.filterOps === undefined && this.options.transforms?.operation === undefined;
+  }
+
+  private parseLazyModel(locator?: ToolLocator): ParsedSpec {
+    assert(this.options.lazy === true, "lazy mode must be enabled");
+    assert(this.lazyNameIndex !== undefined, NOT_PARSED);
+    if (locator && this.lazySourceIndex) {
+      return parseSpec(this.lazySourceIndex.materialize(locator));
+    }
+    if (this.lazySourceText !== undefined) return parseSpec(parseSpecText(this.lazySourceText));
+    const source = this.sourceAsInput();
+    assert(typeof source !== "string", "lazy source text must be available after parse");
+    return parseSpec(source);
+  }
+
+  private compileOptions(): {
+    maxDefsBytes?: number;
+    filterOps?: (op: ExtractedOperation) => boolean;
+    extraParameterRules?: ExtraParameterRule[];
+    transforms?: TransformOptions;
+  } {
+    return {
+      maxDefsBytes: this.options.maxDefsBytes,
+      filterOps: this.options.filterOps,
+      extraParameterRules: this.options.extraParameterRules,
+      transforms: this.options.transforms,
+    };
   }
 
   private resolveTool(tool: string | CompiledTool): CompiledTool {
@@ -722,7 +911,10 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new TypeError("MultiSpecParser: options must be an object.");
   }
-  const { maxDefsBytes, baseUrl, headers, executeTimeoutMs, defaultPolicy } = options;
+  const { maxDefsBytes, baseUrl, headers, executeTimeoutMs, defaultPolicy, lazy } = options;
+  if (lazy !== undefined && typeof lazy !== "boolean") {
+    throw new TypeError("MultiSpecParser: options.lazy must be a boolean.");
+  }
   if (defaultPolicy !== undefined && defaultPolicy !== "preserve" && defaultPolicy !== "apply") {
     throw new TypeError("MultiSpecParser: options.defaultPolicy must be preserve or apply.");
   }

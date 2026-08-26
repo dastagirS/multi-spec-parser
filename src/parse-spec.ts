@@ -10,6 +10,7 @@ import { assertValidParsedSpecModel } from "./model-validation.js";
 import { assertValidSpecText, validateSpecUrl } from "./spec-validation.js";
 import { DocResolver, isRef } from "./ref-resolver.js";
 import { setOwn } from "./schema-closure.js";
+import { deriveOperationKey, deriveToolName, sanitizeToolName } from "./tool-names.js";
 import type {
   ExtractedOperation,
   GoogleDiscoveryDoc,
@@ -266,7 +267,7 @@ function openApi3Operation(
   docServers: ServerInfo[],
   pathUnresolved: Set<string>,
 ): ExtractedOperation {
-  const toolName = deriveToolName(op, method, path);
+  const toolName = deriveToolName(op.operationId, method, path);
   // Per-op tracking: an op must only report refs IT touched, not refs other
   // ops left dangling (B3). Path-level misses (a $ref path item) carry over.
   const unresolved = new Set<string>(pathUnresolved);
@@ -452,7 +453,7 @@ function swagger2Operation(
   r: DocResolver,
   docServers: ServerInfo[],
 ): ExtractedOperation {
-  const toolName = deriveToolName(op as OperationObject, method, path);
+  const toolName = deriveToolName(op.operationId, method, path);
   // Per-op unresolved tracking (B3) — same discipline as the OAS3 adapter.
   const unresolved = new Set<string>();
   const bodyParams: Swagger2Parameter[] = [];
@@ -903,28 +904,6 @@ function operationServers(
   const pathLevel = extractServers(pathItem.servers);
   if (pathLevel.length > 0) return pathLevel;
   return docServers;
-}
-
-/** Stable tool name from operationId, else method + path segments. */
-function deriveToolName(op: OperationObject, method: string, path: string): string {
-  if (op.operationId) return sanitizeToolName(op.operationId);
-  const segments = path.replace(/[{}]/g, "").split("/").filter(Boolean);
-  return sanitizeToolName(`${method}_${segments.join("_")}`);
-}
-
-function deriveOperationKey(method: string, path: string): string {
-  if (typeof method !== "string" || method.length === 0) throw new TypeError("Operation method must be non-empty.");
-  if (typeof path !== "string" || !path.startsWith("/")) throw new TypeError("Operation path must start with /.");
-  return `${method.toUpperCase()} ${path}`;
-}
-
-function sanitizeToolName(name: string): string {
-  return (
-    name
-      .replace(/[^a-zA-Z0-9_]/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .replace(/_+/g, "_") || "unnamed"
-  );
 }
 
 function normalizeSecurity(

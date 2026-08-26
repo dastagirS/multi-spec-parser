@@ -16,6 +16,11 @@ import assert from "node:assert/strict";
 import { assertValidParsedSpecModel } from "./model-validation.js";
 import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
 import { fetchSpecText, MAX_SPEC_BYTES, parseSpec, parseSpecText } from "./parse-spec.js";
+import {
+  assignUniqueToolName,
+  createUniqueToolNameState,
+  TOOL_NAME_LOOKUP_LENGTH_MAX,
+} from "./tool-names.js";
 import type {
   ExtractedOperation,
   NormalizedParameter,
@@ -125,11 +130,147 @@ const UTF8_ENCODER = new TextEncoder();
 const MAX_EXTRA_PARAMETER_RULES = 1_000;
 const MAX_EXTRA_PARAMETERS_PER_RULE = 100;
 
+interface PreparedOperation {
+  name: string;
+  sourceOperation: ExtractedOperation;
+}
+
+interface PreparedCompile {
+  defs: Record<string, unknown>;
+  prunedRefsByDef: Map<string, Set<string>>;
+  operations: PreparedOperation[];
+  maxDefsBytes: number;
+  specFormat: ParsedSpec["specFormat"];
+  baseUrl?: string;
+}
+
+export interface LazyToolCompiler {
+  readonly defs: Record<string, unknown>;
+  getTool(name: string): CompiledTool | undefined;
+  getToolByOperationKey(operationKey: string): CompiledTool | undefined;
+  compileAll(): CompileResult;
+}
+
+export interface ToolLocator {
+  name: string;
+  path: string;
+  method: string;
+  operationKey: string;
+}
+
+export interface ToolNameIndex {
+  has(name: string): boolean;
+  get(name: string): ToolLocator | undefined;
+}
+
+export function createToolNameIndex(
+  parsed: ParsedSpec,
+  options: CompileOptions = {},
+): ToolNameIndex {
+  const locators = new Map<string, ToolLocator>(prepareOperations(parsed, options).map((operation) => [
+    operation.name,
+    {
+      name: operation.name,
+      path: operation.sourceOperation.path,
+      method: operation.sourceOperation.method,
+      operationKey: operation.sourceOperation.operationKey,
+    },
+  ]));
+  return {
+    has(name: string): boolean {
+      assert(typeof name === "string", "tool name must be a string");
+      assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
+      return locators.has(name);
+    },
+    get(name: string): ToolLocator | undefined {
+      assert(typeof name === "string", "tool name must be a string");
+      assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
+      return locators.get(name);
+    },
+  };
+}
+
+export function createLazyToolCompiler(
+  parsed: ParsedSpec,
+  options: CompileOptions = {},
+): LazyToolCompiler {
+  return new PreparedToolCompiler(parsed, options);
+}
+
 export function compileSpecToTools(
   parsed: ParsedSpec,
   options: CompileOptions = {},
 ): CompileResult {
+  assert(parsed !== null && typeof parsed === "object", "parsed spec must be an object");
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "compile options must be an object");
+  return createLazyToolCompiler(parsed, options).compileAll();
+}
+
+class PreparedToolCompiler implements LazyToolCompiler {
+  private readonly parsed: ParsedSpec;
+  private readonly options: CompileOptions;
+  private readonly prepared: PreparedCompile;
+  private readonly byName = new Map<string, PreparedOperation>();
+  private readonly compiledByName = new Map<string, CompiledTool>();
+  private allResult: CompileResult | undefined;
+
+  constructor(parsed: ParsedSpec, options: CompileOptions) {
+    assert(parsed !== null && typeof parsed === "object", "parsed spec must be an object");
+    assert(options !== null && typeof options === "object" && !Array.isArray(options), "compile options must be an object");
+    this.parsed = parsed;
+    this.options = options;
+    this.prepared = prepareCompile(parsed, options);
+    for (const operation of this.prepared.operations) this.byName.set(operation.name, operation);
+  }
+
+  get defs(): Record<string, unknown> {
+    assert(this.prepared.defs !== null && typeof this.prepared.defs === "object", "prepared defs must be an object");
+    assert(typeof this.prepared.specFormat === "string", "prepared spec format must be a string");
+    return this.prepared.defs;
+  }
+
+  getTool(name: string): CompiledTool | undefined {
+    assert(typeof name === "string", "tool name must be a string");
+    assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
+    const cached = this.compiledByName.get(name);
+    if (cached) return cached;
+    const prepared = this.byName.get(name);
+    if (!prepared) return undefined;
+    const compiled = compilePreparedOperation(this.parsed, this.options, this.prepared, prepared);
+    this.compiledByName.set(name, compiled);
+    return compiled;
+  }
+
+  getToolByOperationKey(operationKey: string): CompiledTool | undefined {
+    assert(typeof operationKey === "string" && operationKey.length > 0, "operation key must be non-empty");
+    const prepared = this.prepared.operations.find((operation) => operation.sourceOperation.operationKey === operationKey);
+    if (!prepared) return undefined;
+    return this.getTool(prepared.name);
+  }
+
+  compileAll(): CompileResult {
+    assert(Array.isArray(this.prepared.operations), "prepared operations must be an array");
+    assert(this.prepared.operations.length <= 1_000_000, "prepared operations exceed the safety limit");
+    if (this.allResult) return this.allResult;
+    const tools: CompiledTool[] = [];
+    for (const prepared of this.prepared.operations) {
+      const tool = this.getTool(prepared.name);
+      assert(tool !== undefined, "prepared tool must compile");
+      tools.push(tool);
+    }
+    this.allResult = {
+      tools,
+      defs: this.prepared.defs,
+      specFormat: this.prepared.specFormat,
+      baseUrl: this.prepared.baseUrl,
+    };
+    return this.allResult;
+  }
+}
+
+function prepareCompile(parsed: ParsedSpec, options: CompileOptions): PreparedCompile {
   assertValidParsedSpecModel(parsed);
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "compile options must be an object");
   const maxDefsBytes = options.maxDefsBytes ?? DEFAULT_MAX_DEFS_BYTES;
   const transformedSchemas: Record<string, SchemaObject> = {};
   for (const [name, schema] of Object.entries(parsed.schemas)) {
@@ -138,12 +279,8 @@ export function compileSpecToTools(
       name,
     }, options.transforms));
   }
-
-  // P1: prune the shared defs ONCE per compile. Transitivity means a ref
-  // inside a def can only dangle if its name is missing from the WHOLE defs
-  // map (the closure BFS includes everything reachable), so one global pass —
-  // memoized per def object since defs are shared across tools — replaces the
-  // old per-tool walk of the attached $defs subtree (Stripe: 1.2s → 3.0s).
+  // Pruning the shared graph once avoids repeating the same walk for every
+  // tool while preserving per-tool unresolved-ref reporting below.
   const rawDefs = normalizeDefs(transformedSchemas) as unknown as Record<string, unknown>;
   const allDefNames = new Set(Object.keys(rawDefs));
   const defPruneMemo = new WeakMap<object, unknown>();
@@ -161,11 +298,22 @@ export function compileSpecToTools(
     if (prunedHere.size > 0) prunedRefsByDef.set(name, prunedHere);
     setOwn(defs, name, prunedDef);
   }
+  const operations = prepareOperations(parsed, options);
+  return {
+    defs,
+    prunedRefsByDef,
+    operations,
+    maxDefsBytes,
+    specFormat: parsed.specFormat,
+    baseUrl: parsed.baseUrl,
+  };
+}
 
-  const tools: CompiledTool[] = [];
-  const seen = new Map<string, number>();
-  const used = new Set<string>();
-
+function prepareOperations(parsed: ParsedSpec, options: CompileOptions): PreparedOperation[] {
+  assert(parsed !== null && typeof parsed === "object", "parsed spec must be an object");
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "compile options must be an object");
+  const operations: PreparedOperation[] = [];
+  const uniqueNames = createUniqueToolNameState();
   for (const sourceOperation of parsed.operations) {
     const transformedOperation = options.transforms?.operation
       ? options.transforms.operation(sourceOperation)
@@ -173,83 +321,72 @@ export function compileSpecToTools(
     if (!isExtractedOperation(transformedOperation)) {
       throw new TypeError("Operation transform must return an ExtractedOperation.");
     }
-    // Open compile-time filter: return true to keep. A filtered op never
-    // becomes a tool — invisible to the LLM AND un-callable by name.
     if (options.filterOps && !options.filterOps(transformedOperation)) continue;
-    const name = ensureUniqueName(transformedOperation.toolName, seen, used);
-    const operation = assignInputNames(transformedOperation, parsed.servers);
-    // Item 5: merge matching consumer extras into the RAW input (before
-    // normalization) so their $refs are handled like any other input schema.
-    const rawInput = buildInputSchema(operation, parsed.servers, options.transforms);
-    mergeExtraParameters(rawInput, resolveExtraParameters(operation, options.extraParameterRules));
-    // Op-level schemas carry native refs (#/components/schemas, #/definitions);
-    // rewrite them at the boundary so $refs resolve against the hoisted $defs.
-    const inputSchema = normalizeSchemaRefs(rawInput) as Record<string, unknown>;
-    const outputSchema = operation.outputSchema
-      ? (normalizeSchemaRefs(applySchemaTransform(operation.outputSchema, {
-          kind: "response",
-          operation,
-        }, options.transforms)) as Record<string, unknown>)
-      : undefined;
-
-    // Closure of input + output refs, attached to the input schema so the LLM
-    // can resolve $refs in BOTH schemas from one $defs block.
-    let reachable = collectReachableDefs(
-      [inputSchema, outputSchema as unknown],
-      defs as unknown as Record<string, SchemaObject>,
-    );
-    if (Object.keys(reachable).length > 0) {
-      if (UTF8_ENCODER.encode(JSON.stringify(reachable)).byteLength > maxDefsBytes) {
-        // Pathological tool: its closure spans most of a huge spec. Share the
-        // whole hoisted defs map by reference (never cloned) — Ajv compiles
-        // against it without mutating, so validation stays correct.
-        reachable = defs as unknown as Record<string, SchemaObject>;
-      }
-      (inputSchema.$defs as Record<string, unknown>) = reachable;
-    }
-
-    // Per-tool pruning covers ONLY the input/output graphs — the attached
-    // $defs subtree was already pruned globally (P1), so it is skipped.
-    const pruned = new Set<string>();
-    const valid = new Set(Object.keys(reachable));
-    const prunedInput = removeDanglingRefs(
-      inputSchema,
-      valid,
-      pruned,
-      "$defs",
-    ) as Record<string, unknown>;
-    const prunedOutput = outputSchema
-      ? (removeDanglingRefs(outputSchema, valid, pruned) as Record<string, unknown>)
-      : undefined;
-    if (prunedInput !== inputSchema) {
-      // Pruning returned a new graph — carry the $defs attachment over.
-      (prunedInput as Record<string, unknown>).$defs = inputSchema.$defs;
-    }
-
-    // Defs that were globally pruned AND are in this tool's closure surface
-    // their dangling refs here too (B1 + B3 discipline: per-tool reporting).
-    const unresolvedRefs = new Set<string>(operation.unresolvedRefs ?? []);
-    for (const ref of pruned) unresolvedRefs.add(ref);
-    for (const [defName, refs] of prunedRefsByDef) {
-      if (Object.prototype.hasOwnProperty.call(reachable, defName)) {
-        for (const ref of refs) unresolvedRefs.add(ref);
-      }
-    }
-
-    tools.push({
-      name,
-      operationKey: operation.operationKey,
-      description: buildDescription(operation),
-      method: operation.method,
-      path: operation.path,
-      inputSchema: prunedInput,
-      outputSchema: prunedOutput,
-      operation,
-      ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
+    operations.push({
+      name: assignUniqueToolName(transformedOperation.toolName, uniqueNames),
+      sourceOperation: transformedOperation,
     });
   }
+  return operations;
+}
 
-  return { tools, defs, specFormat: parsed.specFormat, baseUrl: parsed.baseUrl };
+function compilePreparedOperation(
+  parsed: ParsedSpec,
+  options: CompileOptions,
+  preparedCompile: PreparedCompile,
+  prepared: PreparedOperation,
+): CompiledTool {
+  assert(parsed !== null && typeof parsed === "object", "parsed spec must be an object");
+  assert(prepared !== null && typeof prepared === "object", "prepared operation must be an object");
+  const operation = assignInputNames(prepared.sourceOperation, parsed.servers);
+  const rawInput = buildInputSchema(operation, parsed.servers, options.transforms);
+  mergeExtraParameters(rawInput, resolveExtraParameters(operation, options.extraParameterRules));
+  const inputSchema = normalizeSchemaRefs(rawInput) as Record<string, unknown>;
+  const outputSchema = operation.outputSchema
+    ? (normalizeSchemaRefs(applySchemaTransform(operation.outputSchema, {
+        kind: "response",
+        operation,
+      }, options.transforms)) as Record<string, unknown>)
+    : undefined;
+  let reachable = collectReachableDefs(
+    [inputSchema, outputSchema as unknown],
+    preparedCompile.defs as unknown as Record<string, SchemaObject>,
+  );
+  if (Object.keys(reachable).length > 0) {
+    if (UTF8_ENCODER.encode(JSON.stringify(reachable)).byteLength > preparedCompile.maxDefsBytes) {
+      // The full map is shared by reference, so dense closures do not clone a
+      // large schema graph into every tool.
+      reachable = preparedCompile.defs as unknown as Record<string, SchemaObject>;
+    }
+    (inputSchema.$defs as Record<string, unknown>) = reachable;
+  }
+  // Shared definitions were already pruned; this pass only checks the tool's
+  // input/output boundary and carries its local unresolved refs forward.
+  const pruned = new Set<string>();
+  const valid = new Set(Object.keys(reachable));
+  const prunedInput = removeDanglingRefs(inputSchema, valid, pruned, "$defs") as Record<string, unknown>;
+  const prunedOutput = outputSchema
+    ? (removeDanglingRefs(outputSchema, valid, pruned) as Record<string, unknown>)
+    : undefined;
+  if (prunedInput !== inputSchema) (prunedInput as Record<string, unknown>).$defs = inputSchema.$defs;
+  const unresolvedRefs = new Set<string>(operation.unresolvedRefs ?? []);
+  for (const ref of pruned) unresolvedRefs.add(ref);
+  for (const [defName, refs] of preparedCompile.prunedRefsByDef) {
+    if (Object.prototype.hasOwnProperty.call(reachable, defName)) {
+      for (const ref of refs) unresolvedRefs.add(ref);
+    }
+  }
+  return {
+    name: prepared.name,
+    operationKey: operation.operationKey,
+    description: buildDescription(operation),
+    method: operation.method,
+    path: operation.path,
+    inputSchema: prunedInput,
+    outputSchema: prunedOutput,
+    operation,
+    ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
+  };
 }
 
 /** Per-op input schema: params + body + optional contentType/server inputs. */
@@ -603,26 +740,6 @@ function isExtractedOperation(value: unknown): value is ExtractedOperation {
     Array.isArray(operation.parameters);
 }
 
-function ensureUniqueName(
-  candidate: string,
-  seen: Map<string, number>,
-  used: Set<string>,
-): string {
-  // Occurrence k of a candidate is named `candidate` (k=0) else `candidate_k`;
-  // a real operationId may already occupy that name (getPet_1) — keep bumping
-  // the suffix until the name is free (B4).
-  const prior = seen.get(candidate) ?? 0;
-  let name = prior === 0 ? candidate : `${candidate}_${prior}`;
-  let n = prior;
-  while (used.has(name)) {
-    n += 1;
-    name = `${candidate}_${n}`;
-  }
-  seen.set(candidate, n + 1);
-  used.add(name);
-  return name;
-}
-
 // ---------------------------------------------------------------------------
 // Source-level convenience with content-addressed caching
 // ---------------------------------------------------------------------------
@@ -640,6 +757,7 @@ const MAX_SOURCE_OBJECT_NODES = 1_000_000;
 // In-flight string-source loads: two concurrent loads of the same URL must
 // fetch + parse once, not twice (PR6).
 const inflightText = new Map<string, Promise<LoadedSpec>>();
+const inflightSourceText = new Map<string, Promise<string>>();
 
 /** A loaded string source: the raw parsed document (JSON/YAML → object, pre-
  *  normalization — what parser.parse() returns for typed access) + the
@@ -647,6 +765,7 @@ const inflightText = new Map<string, Promise<LoadedSpec>>();
 interface LoadedSpec {
   document: Record<string, unknown>;
   parsed: ParsedSpec;
+  sourceText?: string;
   cachedAtMs: number;
 }
 
@@ -720,6 +839,26 @@ function textCacheSet(key: string, loaded: LoadedSpec, cache: SourceCacheOptions
   }
 }
 
+/** Load source bytes without constructing the parsed document. */
+export async function loadSpecTextSource(
+  source: string | Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<string | Record<string, unknown>> {
+  assert(source !== null && (typeof source === "string" || typeof source === "object"), "source must be text or an object");
+  assert(signal === undefined || typeof signal === "object", "signal must be an AbortSignal or undefined");
+  if (typeof source !== "string") return source;
+  if (!source.startsWith("http://") && !source.startsWith("https://")) return source;
+  const existing = inflightSourceText.get(source);
+  if (existing) return existing;
+  const pending = fetchSpecText(source, signal);
+  inflightSourceText.set(source, pending);
+  try {
+    return await pending;
+  } finally {
+    inflightSourceText.delete(source);
+  }
+}
+
 /**
  * Load a spec source (URL, raw text, or pre-parsed object) into a parsed
  * model + compiled tools. Parse is content-addressed (identical URL/text
@@ -729,34 +868,36 @@ function textCacheSet(key: string, loaded: LoadedSpec, cache: SourceCacheOptions
 export interface LoadSpecOptions extends CompileOptions {
   signal?: AbortSignal;
   cache?: SourceCacheOptions;
+  compile?: boolean;
+  cacheParsed?: boolean;
 }
 
 export async function loadSpecSource(
   source: string | Record<string, unknown>,
   options: LoadSpecOptions = {},
-): Promise<{ document: Record<string, unknown>; parsed: ParsedSpec; compiled: CompileResult }> {
+): Promise<{ document: Record<string, unknown>; parsed: ParsedSpec; sourceText?: string; compiled: CompileResult | undefined }> {
   if (typeof source !== "string") {
     // The raw document of an object source IS the passed object (identity —
     // parser.parse() returns it typed as the consumer's spec).
     assertObjectSourceWithinLimit(source);
     const cache = options.cache ?? {};
-    const cached = cache.enabled === false ? undefined : objectCache.get(source);
+    const cached = options.cacheParsed === false || cache.enabled === false ? undefined : objectCache.get(source);
     const cacheFresh = cached === undefined || cache.ttlMs === undefined ||
       cache.ttlMs <= DEFAULT_CACHE_TTL_MS || Date.now() - cached.cachedAtMs <= cache.ttlMs;
     const parsed = cached && cacheFresh ? cached.parsed : parseSpec(source);
     if (!cached || !cacheFresh) objectCache.delete(source);
-    if (cache.enabled !== false && (!cached || !cacheFresh)) {
+    if (options.cacheParsed !== false && cache.enabled !== false && (!cached || !cacheFresh)) {
       objectCache.set(source, { parsed, cachedAtMs: Date.now() });
     }
-    return { document: source, parsed, compiled: compileSpecToTools(parsed, options) };
+    return { document: source, parsed, compiled: compileLoadedSpec(parsed, options) };
   }
   const cache = options.cache ?? {};
-  const cached = textCacheGet(source, cache);
-  if (cached) return { ...cached, compiled: compileSpecToTools(cached.parsed, options) };
+  const cached = options.cacheParsed === false ? undefined : textCacheGet(source, cache);
+  if (cached) return { ...cached, compiled: compileLoadedSpec(cached.parsed, options) };
   const existing = inflightText.get(source);
   if (existing) {
     const shared = await existing;
-    return { ...shared, compiled: compileSpecToTools(shared.parsed, options) };
+    return { ...shared, compiled: compileLoadedSpec(shared.parsed, options) };
   }
   const promise = (async (): Promise<LoadedSpec> => {
     const text =
@@ -764,8 +905,15 @@ export async function loadSpecSource(
         ? await fetchSpecText(source, options.signal)
         : source;
     const document = parseSpecText(text);
-    const loaded: LoadedSpec = { document, parsed: parseSpec(document), cachedAtMs: Date.now() };
-    textCacheSet(source, loaded, cache);
+    const loaded: LoadedSpec = {
+      document,
+      parsed: parseSpec(document),
+      sourceText: text,
+      cachedAtMs: Date.now(),
+    };
+    if (options.cacheParsed !== false) {
+      textCacheSet(source, { document, parsed: loaded.parsed, cachedAtMs: loaded.cachedAtMs }, cache);
+    }
     return loaded;
   })();
   inflightText.set(source, promise);
@@ -775,7 +923,13 @@ export async function loadSpecSource(
   } finally {
     inflightText.delete(source);
   }
-  return { ...loaded, compiled: compileSpecToTools(loaded.parsed, options) };
+  return { ...loaded, compiled: compileLoadedSpec(loaded.parsed, options) };
+}
+
+function compileLoadedSpec(parsed: ParsedSpec, options: LoadSpecOptions): CompileResult | undefined {
+  assert(parsed !== null && typeof parsed === "object", "parsed spec must be an object");
+  assert(options !== null && typeof options === "object" && !Array.isArray(options), "load options must be an object");
+  return options.compile === false ? undefined : compileSpecToTools(parsed, options);
 }
 
 /**
@@ -786,7 +940,9 @@ export async function compileSpecSource(
   source: string | Record<string, unknown>,
   options: CompileOptions = {},
 ): Promise<CompileResult> {
-  return (await loadSpecSource(source, options)).compiled;
+  const compiled = (await loadSpecSource(source, options)).compiled;
+  assert(compiled !== undefined, "compileSpecSource must compile the loaded spec");
+  return compiled;
 }
 
 /** Test-only: drop cached entries so tests observe cold-cache behavior. */
@@ -798,9 +954,10 @@ export interface SpecCacheStats {
 export function clearSpecCache(): void {
   textCache.clear();
   inflightText.clear();
+  inflightSourceText.clear();
   objectCache = new WeakMap();
 }
 
 export function specCacheStats(): SpecCacheStats {
-  return { textEntries: textCache.size, inflightEntries: inflightText.size };
+  return { textEntries: textCache.size, inflightEntries: inflightText.size + inflightSourceText.size };
 }

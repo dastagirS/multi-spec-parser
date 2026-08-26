@@ -73,6 +73,9 @@ function startServer(): Promise<TestServer> {
     if (req.url === "/spec.json") {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(SPEC));
+    } else if (req.url === "/spec.yaml") {
+      res.setHeader("content-type", "application/yaml");
+      res.end("openapi: 3.0.3\ninfo: { title: T, version: '1' }\npaths:\n  /pets:\n    get:\n      operationId: listPets\n      responses:\n        '200': { description: ok }\n");
     } else if (req.url === "/v1/pets") {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify([{ id: 1, name: "Rex" }]));
@@ -136,6 +139,10 @@ describe("MultiSpecParser", () => {
       () => new MultiSpecParser({ spec: { spec: SPEC }, options: { cache: { maxEntries: 0 } } }),
       /cache\.maxEntries/,
     );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { lazy: "yes" } as never }),
+      /options\.lazy/,
+    );
     // Valid options pass.
     new MultiSpecParser({
       spec: { spec: SPEC },
@@ -182,6 +189,113 @@ paths:
     assert.equal(server.hits(), 1);
     await server.close();
     server = undefined;
+  });
+
+  it("deduplicates concurrent lazy URL loads without retaining a global source cache", async () => {
+    server = await startServer();
+    const specUrl = `${server.url}/spec.yaml`;
+    const first = new MultiSpecParser({ spec: { url: specUrl }, options: { lazy: true } });
+    const second = new MultiSpecParser({ spec: { url: specUrl }, options: { lazy: true } });
+    await Promise.all([first.load(), second.load()]);
+    assert.equal(server.hits(), 1);
+    assert.equal(first.tool("listPets")?.name, second.tool("listPets")?.name);
+    await server.close();
+    server = undefined;
+  });
+
+  it("defers compilation with lazy mode while preserving eager tool results", async () => {
+    let operationTransforms = 0;
+    let requestBodyTransforms = 0;
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        lazy: true,
+        transforms: {
+          operation: (operation) => {
+            operationTransforms += 1;
+            return operation;
+          },
+          schema: (schema, context) => {
+            if (context.kind === "request-body") requestBodyTransforms += 1;
+            return schema;
+          },
+        },
+      },
+    });
+    await parser.parse();
+    assert.equal(operationTransforms, 3);
+    assert.equal(requestBodyTransforms, 0);
+    const firstTool = parser.tool("getPet");
+    assert.ok(firstTool);
+    assert.equal(operationTransforms, 6);
+    assert.equal(requestBodyTransforms, 0);
+    assert.strictEqual(parser.tool("getPet"), firstTool);
+    assert.equal(parser.tool("does-not-exist"), undefined);
+    assert.equal(requestBodyTransforms, 0);
+    assert.ok(parser.tool("createPet"));
+    assert.equal(requestBodyTransforms, 1);
+
+    const eager = new MultiSpecParser({ spec: { spec: SPEC } });
+    await eager.parse();
+    assert.deepEqual(parser.tools(), eager.tools());
+  });
+
+  it("loads lazy YAML indexes without materializing the raw document", async () => {
+    const yaml = `
+openapi: 3.0.3
+info: { title: T, version: "1" }
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200": { description: ok }
+`;
+    const parser = new MultiSpecParser({ spec: { text: yaml }, options: { lazy: true } });
+    await parser.load();
+    assert.equal(parser.format, "openapi3");
+    assert.equal(parser.tool("listPets")?.path, "/pets");
+  });
+
+  it("loads lazy YAML tools from operation and reference fragments", async () => {
+    const yaml = `
+openapi: 3.0.3
+info:
+  title: T
+  version: "1"
+servers:
+  - url: https://api.example.com
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        name:
+          type: string
+`;
+    const parser = new MultiSpecParser({ spec: { text: yaml }, options: { lazy: true } });
+    await parser.parse();
+    const tool = parser.tool("getPet");
+    assert.ok(tool);
+    assert.equal(tool.path, "/pets/{petId}");
+    assert.equal((tool.inputSchema.$defs as Record<string, unknown>).Pet !== undefined, true);
   });
 
   it("supports compile, request, and response transforms", async () => {

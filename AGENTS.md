@@ -17,6 +17,14 @@
 - Canonical compiled tools retain their combined input/output definition closure;
   Standard JSON Schema projections independently expose only definitions
   reachable from their respective input or output root.
+- `options.lazy` is an opt-in experiment for URL/text source indexing and
+  on-demand tool compilation; OpenAPI YAML sources use operation/component
+  fragments while unsupported layouts fall back to full source materialization,
+  object sources remain caller-owned, and full materialization
+  is still required by `tools()`/`describeTools()`; compile-time
+  filters/transforms must be deterministic because lazy materialization may
+  reapply them; `load()` is the no-raw-document low-memory entry path and
+  rejects unsupported text layouts rather than violating that guarantee.
 
 ## Naming
 
