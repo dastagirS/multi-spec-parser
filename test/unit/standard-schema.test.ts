@@ -22,6 +22,56 @@ const DEFAULT_SPEC = {
   },
 };
 
+const SIDE_SCHEMAS = {
+  Input: { type: "object", properties: { value: { type: "string" } } },
+  Output: { type: "object", properties: { value: { type: "number" } } },
+};
+
+const FORMAT_PROJECTION_CASES = [
+  {
+    format: "swagger2",
+    toolName: "swaggerProject",
+    spec: {
+      swagger: "2.0",
+      info: { title: "T", version: "1" },
+      paths: {
+        "/items": {
+          post: {
+            operationId: "swaggerProject",
+            parameters: [{ name: "body", in: "body", schema: { $ref: "#/definitions/Input" } }],
+            responses: { "200": { description: "ok", schema: { $ref: "#/definitions/Output" } } },
+          },
+        },
+      },
+      definitions: SIDE_SCHEMAS,
+    },
+  },
+  {
+    format: "google-discovery",
+    toolName: "google_project",
+    spec: {
+      kind: "discovery#restDescription",
+      name: "google",
+      version: "v1",
+      rootUrl: "https://example.com/",
+      resources: {
+        items: {
+          methods: {
+            project: {
+              id: "google.project",
+              path: "items",
+              httpMethod: "POST",
+              request: { $ref: "Input" },
+              response: { $ref: "Output" },
+            },
+          },
+        },
+      },
+      schemas: SIDE_SCHEMAS,
+    },
+  },
+] as const;
+
 const SPEC = {
   openapi: "3.0.3",
   info: { title: "T", version: "1" },
@@ -151,6 +201,98 @@ describe("toStandardSchema (item 6)", () => {
     const a = toStandardSchema(tool);
     const b = toStandardSchema(tool);
     assert.equal(a, b, "same tool → same wrapped object (memoized)");
+  });
+
+  it("projects independent transitive input and output definition closures", async () => {
+    const projectionSpec = {
+      openapi: "3.0.3",
+      info: { title: "T", version: "1" },
+      paths: {
+        "/items": {
+          post: {
+            operationId: "projectItem",
+            requestBody: {
+              required: true,
+              content: { "application/json": { schema: { $ref: "#/components/schemas/InputRoot" } } },
+            },
+            responses: {
+              "200": {
+                description: "ok",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/OutputRoot" } } },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          InputRoot: { properties: { input: { $ref: "#/components/schemas/InputOnly" }, shared: { $ref: "#/components/schemas/Shared" } } },
+          InputOnly: { type: "string" },
+          OutputRoot: { properties: { output: { $ref: "#/components/schemas/OutputOnly" }, shared: { $ref: "#/components/schemas/Shared" } } },
+          OutputOnly: { type: "number" },
+          Shared: { properties: { leaf: { $ref: "#/components/schemas/Leaf" } } },
+          Leaf: { type: "boolean" },
+        },
+      },
+    };
+    const parser = new MultiSpecParser({ spec: { spec: projectionSpec } });
+    await parser.parse();
+    const tool = parser.tool("projectItem")!;
+    const canonicalDefinitions = tool.inputSchema.$defs as Record<string, unknown>;
+    assert.deepEqual(Object.keys(canonicalDefinitions).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    const standard = toStandardSchema(tool);
+    const input2020 = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+    const output2020 = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
+    assert.deepEqual(Object.keys(input2020.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
+    assert.deepEqual(Object.keys(output2020.$defs as Record<string, unknown>).sort(), ["Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    const input07 = standard["~standard"].jsonSchema.input({ target: "draft-07" });
+    const output07 = standard["~standard"].jsonSchema.output({ target: "draft-07" });
+    assert.equal(input07.$defs, undefined);
+    assert.equal(output07.$defs, undefined);
+    assert.deepEqual(Object.keys(input07.definitions as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
+    assert.deepEqual(Object.keys(output07.definitions as Record<string, unknown>).sort(), ["Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    assert.equal(output07.$ref, "#/definitions/OutputRoot");
+    assert.deepEqual(Object.keys(tool.inputSchema.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+  });
+
+  it("projects closures consistently for Swagger and Google Discovery", async () => {
+    for (const projectionCase of FORMAT_PROJECTION_CASES) {
+      const parser = new MultiSpecParser({ spec: { spec: projectionCase.spec } });
+      await parser.parse();
+      assert.equal(parser.format, projectionCase.format);
+      const standard = parser.toStandardSchema(projectionCase.toolName);
+      const input = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+      const output = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
+      assert.deepEqual(Object.keys(input.$defs as Record<string, unknown>), ["Input"]);
+      assert.deepEqual(Object.keys(output.$defs as Record<string, unknown>), ["Output"]);
+    }
+  });
+
+  it("keeps missing local references explicit and safe in projections", async () => {
+    const missingReferenceSpec = {
+      openapi: "3.0.3",
+      info: { title: "T", version: "1" },
+      paths: {
+        "/missing": {
+          post: {
+            operationId: "missingReferences",
+            requestBody: { content: { "application/json": { schema: { $ref: "#/components/schemas/MissingInput" } } } },
+            responses: {
+              "200": { description: "ok", content: { "application/json": { schema: { $ref: "#/components/schemas/MissingOutput" } } } },
+            },
+          },
+        },
+      },
+    };
+    const parser = new MultiSpecParser({ spec: { spec: missingReferenceSpec } });
+    await parser.parse();
+    const tool = parser.tool("missingReferences")!;
+    assert.deepEqual([...(tool.unresolvedRefs ?? [])].sort(), ["#/$defs/MissingInput", "#/$defs/MissingOutput"]);
+    const standard = parser.toStandardSchema(tool);
+    const input = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+    const output = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
+    assert.equal(JSON.stringify(input).includes("MissingInput"), false);
+    assert.equal(JSON.stringify(output).includes("MissingOutput"), false);
   });
 
   it("respects per-tool $defs closures (validates against referenced schemas)", async () => {

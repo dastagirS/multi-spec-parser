@@ -161,6 +161,7 @@ const NOT_PARSED =
 
 /** Item 8: default per-tool schema budget for describeTools(). */
 const DEFAULT_DESCRIBE_MAX_BYTES = 64 * 1024;
+const UTF8_ENCODER = new TextEncoder();
 
 // validate() lazily loads ajv only when first called (dynamic import), so the
 // core module never statically imports it — the standard-schema subpath is
@@ -901,12 +902,12 @@ function processorFailure(result: ExecuteResult, message: string): ExecuteResult
   };
 }
 
-/** Item 8: $defs-stripped projection when the full schema exceeds the budget. */
+/** Item 8: $defs-stripped projection when serialized UTF-8 exceeds the budget. */
 function boundedSchema(
   schema: Record<string, unknown>,
   maxBytes: number,
 ): Record<string, unknown> {
-  if (JSON.stringify(schema).length <= maxBytes) return schema;
+  if (UTF8_ENCODER.encode(JSON.stringify(schema)).byteLength <= maxBytes) return schema;
   const defs = schema.$defs as Record<string, unknown> | undefined;
   const refNames = defs ? Object.keys(defs).sort() : [];
   const { $defs: _dropped, ...rest } = schema;

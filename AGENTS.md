@@ -14,6 +14,9 @@
   `ExtractedOperation` predicates; generated tool names are never selectors.
 - `runtimeContext` is execution-local opaque data for runtime transforms and
   processors only; it never enters schemas, model arguments, or parser state.
+- Canonical compiled tools retain their combined input/output definition closure;
+  Standard JSON Schema projections independently expose only definitions
+  reachable from their respective input or output root.
 
 ## Naming
 

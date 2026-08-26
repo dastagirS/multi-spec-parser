@@ -143,7 +143,9 @@ other graph features that cannot be represented safely as JSON.
 ## Memory and behavior
 
 - Schemas are normalized once per spec and shared without cloning.
-- Each tool gets the transitive `$ref` closure of its input and output schemas.
+- Each canonical tool gets the combined transitive `$ref` closure of its input and
+  output schemas; Standard JSON Schema projections independently include only
+  definitions reachable from their respective roots.
 - Closures over `maxDefsBytes` (default 1MB) use the shared defs map instead.
 - Parsed objects use a `WeakMap`; text and URLs use a bounded 32-entry LRU.
 - Missing `$ref`s become `{}` and are reported as `unresolvedRefs`.
@@ -224,6 +226,8 @@ Hook semantics:
 const schema = parser.toStandardSchema("createPet");
 const validation = await schema["~standard"].validate({ body: { name: "Rex" } });
 const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" });
+const outputSchema = schema["~standard"].jsonSchema.output({ target: "draft-07" });
+// Each projection is self-contained and includes only its reachable definitions.
 
 // Opt in to non-mutating default application:
 const applied = parser.toStandardSchema("createPet", { defaultPolicy: "apply" });

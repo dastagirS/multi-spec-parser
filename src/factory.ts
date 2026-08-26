@@ -53,7 +53,8 @@ export interface CompileResult {
 
 export interface CompileOptions {
   /**
-   * Cap on a tool's per-tool $defs JSON size. When a tool's closure exceeds
+   * Cap on a tool's serialized per-tool $defs UTF-8 byte size. When a tool's
+   * closure exceeds
    * it, the FULL shared defs map is attached by reference instead (Option A:
    * Ajv-safe, zero extra memory). Default 1MB — Stripe's hyper-connected
    * schema graph (anyOf web) naturally reaches ~1MB per tool; GitHub stays
@@ -120,6 +121,7 @@ export interface ExtraParameterRule {
 }
 
 const DEFAULT_MAX_DEFS_BYTES = 1_000_000;
+const UTF8_ENCODER = new TextEncoder();
 const MAX_EXTRA_PARAMETER_RULES = 1_000;
 const MAX_EXTRA_PARAMETERS_PER_RULE = 100;
 
@@ -197,7 +199,7 @@ export function compileSpecToTools(
       defs as unknown as Record<string, SchemaObject>,
     );
     if (Object.keys(reachable).length > 0) {
-      if (JSON.stringify(reachable).length > maxDefsBytes) {
+      if (UTF8_ENCODER.encode(JSON.stringify(reachable)).byteLength > maxDefsBytes) {
         // Pathological tool: its closure spans most of a huge spec. Share the
         // whole hoisted defs map by reference (never cloned) — Ajv compiles
         // against it without mutating, so validation stays correct.

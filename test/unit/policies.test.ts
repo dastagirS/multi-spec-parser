@@ -780,13 +780,28 @@ describe("describeTools (item 8)", () => {
     assert.equal(bounded.inputSchema.$defs, undefined);
   });
 
+  it("measures schema budgets in serialized UTF-8 bytes", async () => {
+    const unicodeSpec = structuredClone(SPEC);
+    (unicodeSpec.components.schemas.NewPet as Record<string, unknown>).description = "😀".repeat(20);
+    const baseline = new MultiSpecParser({ spec: { spec: unicodeSpec } });
+    await baseline.parse();
+    const schemaCharacters = JSON.stringify(baseline.tool("createPet")!.inputSchema).length;
+    const bounded = new MultiSpecParser({
+      spec: { spec: unicodeSpec },
+      options: { describeMaxBytes: schemaCharacters },
+    });
+    await bounded.parse();
+    assert.deepEqual(bounded.describeTools().find((tool) => tool.name === "createPet")!.inputSchema.$refs, ["NewPet"]);
+    assert.ok(new TextEncoder().encode(JSON.stringify(baseline.tool("createPet")!.inputSchema)).byteLength > schemaCharacters);
+  });
+
   it("defaults to a 64KB budget", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
     const described = parser.describeTools();
     assert.ok(described.length >= 4);
     for (const d of described) {
-      assert.ok(JSON.stringify(d.inputSchema).length <= 64 * 1024);
+      assert.ok(new TextEncoder().encode(JSON.stringify(d.inputSchema)).byteLength <= 64 * 1024);
     }
   });
 });
@@ -857,6 +872,19 @@ describe("option validation guards", () => {
 });
 
 describe("compile-time helpers stay coherent", () => {
+  it("measures definition closure budgets in serialized UTF-8 bytes", () => {
+    const unicodeSpec = structuredClone(SPEC);
+    (unicodeSpec.components.schemas.NewPet as Record<string, unknown>).description = "😀".repeat(20);
+    (unicodeSpec.components.schemas as Record<string, unknown>).Unused = { type: "string" };
+    const parsed = parseSpec(unicodeSpec);
+    const baseline = compileSpecToTools(parsed).tools.find((tool) => tool.name === "createPet")!;
+    const closureCharacters = JSON.stringify(baseline.inputSchema.$defs).length;
+    const bounded = compileSpecToTools(parsed, { maxDefsBytes: closureCharacters })
+      .tools.find((tool) => tool.name === "createPet")!;
+    assert.ok(Object.prototype.hasOwnProperty.call(bounded.inputSchema.$defs, "Unused"));
+    assert.ok(new TextEncoder().encode(JSON.stringify(baseline.inputSchema.$defs)).byteLength > closureCharacters);
+  });
+
   it("compileSpecToTools honors filtering and extras directly", () => {
     const parsed = parseSpec(SPEC);
     const { tools } = compileSpecToTools(parsed, {

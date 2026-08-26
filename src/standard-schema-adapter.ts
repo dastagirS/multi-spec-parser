@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 
 import type { CompiledTool } from "./factory.js";
+import { collectReachableDefs } from "./schema-closure.js";
+import type { SchemaObject } from "./types.js";
 
 const DRAFT_07 = "draft-07" as const;
 const DRAFT_2020_12 = "draft-2020-12" as const;
@@ -85,17 +87,46 @@ export function createStandardSchemaAdapter(
   assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
   const defaultPolicy = options.defaultPolicy ?? "preserve";
   assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+  let inputProjection: Record<string, unknown> | undefined;
+  let outputProjection: Record<string, unknown> | undefined;
   return {
     "~standard": {
       version: 1,
       vendor: "multi-spec-parser",
       validate,
       jsonSchema: {
-        input: (options) => projectSchema(tool.inputSchema, options.target, defaultPolicy),
-        output: (options) => projectSchema(tool.outputSchema ?? {}, options.target, "preserve"),
+        input: (options) => projectSchema(
+          inputProjection ??= withReachableDefinitions(tool.inputSchema, tool.inputSchema.$defs),
+          options.target,
+          defaultPolicy,
+        ),
+        output: (options) => projectSchema(
+          outputProjection ??= withReachableDefinitions(tool.outputSchema ?? {}, tool.inputSchema.$defs),
+          options.target,
+          "preserve",
+        ),
       },
     },
   };
+}
+
+function withReachableDefinitions(
+  source: Record<string, unknown>,
+  definitionsValue: unknown,
+): Record<string, unknown> {
+  assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
+  assert(definitionsValue === undefined || isRecord(definitionsValue), "schema $defs must be an object or undefined");
+  const root = { ...source };
+  delete root.$defs;
+  if (isRecord(definitionsValue)) {
+    const reachableDefinitions = collectReachableDefs(
+      [root],
+      definitionsValue as Record<string, SchemaObject>,
+    );
+    if (Object.keys(reachableDefinitions).length > 0) root.$defs = reachableDefinitions;
+  }
+  assert(!Object.prototype.hasOwnProperty.call(root, "$defs") || isRecord(root.$defs), "projected $defs must be an object");
+  return root;
 }
 
 function projectSchema(
