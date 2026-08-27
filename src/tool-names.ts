@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
-export const TOOL_NAME_LOOKUP_LENGTH_MAX = 1_024;
-const RAW_TOOL_NAME_LENGTH_MAX = 200 * 1024 * 1024;
+export const TOOL_NAME_LOOKUP_LENGTH_MAX = 200 * 1024 * 1024;
+const RAW_TOOL_NAME_LENGTH_MAX = TOOL_NAME_LOOKUP_LENGTH_MAX;
 const DUPLICATE_SUFFIX_MAX = 1_000_000;
 
 export interface UniqueToolNameState {

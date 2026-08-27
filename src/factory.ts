@@ -232,20 +232,25 @@ class PreparedToolCompiler implements LazyToolCompiler {
   getTool(name: string): CompiledTool | undefined {
     assert(typeof name === "string", "tool name must be a string");
     assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
-    const cached = this.compiledByName.get(name);
-    if (cached) return cached;
     const prepared = this.byName.get(name);
-    if (!prepared) return undefined;
-    const compiled = compilePreparedOperation(this.parsed, this.options, this.prepared, prepared);
-    this.compiledByName.set(name, compiled);
-    return compiled;
+    return prepared ? this.compileOperation(prepared) : undefined;
   }
 
   getToolByOperationKey(operationKey: string): CompiledTool | undefined {
     assert(typeof operationKey === "string" && operationKey.length > 0, "operation key must be non-empty");
+    assert(operationKey.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "operation key exceeds the lookup length limit");
     const prepared = this.prepared.operations.find((operation) => operation.sourceOperation.operationKey === operationKey);
-    if (!prepared) return undefined;
-    return this.getTool(prepared.name);
+    return prepared ? this.compileOperation(prepared) : undefined;
+  }
+
+  private compileOperation(prepared: PreparedOperation): CompiledTool {
+    assert(prepared !== null && typeof prepared === "object", "prepared operation must be an object");
+    assert(typeof prepared.name === "string" && prepared.name.length > 0, "prepared operation name must be non-empty");
+    const cached = this.compiledByName.get(prepared.name);
+    if (cached) return cached;
+    const compiled = compilePreparedOperation(this.parsed, this.options, this.prepared, prepared);
+    this.compiledByName.set(prepared.name, compiled);
+    return compiled;
   }
 
   compileAll(): CompileResult {
@@ -253,11 +258,7 @@ class PreparedToolCompiler implements LazyToolCompiler {
     assert(this.prepared.operations.length <= 1_000_000, "prepared operations exceed the safety limit");
     if (this.allResult) return this.allResult;
     const tools: CompiledTool[] = [];
-    for (const prepared of this.prepared.operations) {
-      const tool = this.getTool(prepared.name);
-      assert(tool !== undefined, "prepared tool must compile");
-      tools.push(tool);
-    }
+    for (const prepared of this.prepared.operations) tools.push(this.compileOperation(prepared));
     this.allResult = {
       tools,
       defs: this.prepared.defs,

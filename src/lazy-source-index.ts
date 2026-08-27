@@ -55,6 +55,8 @@ interface ScanState {
   blockScalarIndent?: number;
   ignoredPathExtensionIndent?: number;
   operationCount?: number;
+  documentMarkerSeen?: boolean;
+  contentSeen?: boolean;
   supported: boolean;
 }
 
@@ -63,6 +65,7 @@ interface ParsedLine {
   key?: string;
   value?: string;
   blank: boolean;
+  documentMarker?: "start" | "end" | "directive";
   valid: boolean;
 }
 
@@ -309,12 +312,30 @@ function processIndexedLine(
     if (line.indent > state.blockScalarIndent) return;
     state.blockScalarIndent = undefined;
   }
+  if (line.documentMarker !== undefined) {
+    processDocumentMarker(state, line.documentMarker);
+    return;
+  }
+  state.contentSeen = true;
   closeRangesAtIndent(state, line.indent, position);
   if (line.key === undefined) return;
   if (line.indent === 0) startTopLevel(source, state, line, position);
   else if (state.topName === "paths") processPathLine(source, state, line, position);
   else if (state.topName === "components") processComponentLine(source, state, line, position);
   if (isBlockScalar(line.value)) state.blockScalarIndent = line.indent;
+}
+
+function processDocumentMarker(
+  state: ScanState,
+  marker: NonNullable<ParsedLine["documentMarker"]>,
+): void {
+  assert(state.supported === true || state.supported === false, "scanner support flag must be boolean");
+  assert(marker === "start" || marker === "end" || marker === "directive", "document marker must be recognized");
+  if (marker !== "start" || state.documentMarkerSeen || state.contentSeen) {
+    state.supported = false;
+    return;
+  }
+  state.documentMarkerSeen = true;
 }
 
 function startTopLevel(
@@ -409,6 +430,10 @@ function captureOperationId(state: ScanState, line: ParsedLine): void {
   if (!state.operation || line.key === undefined) return;
   if (state.operationChildIndent === undefined) state.operationChildIndent = line.indent;
   if (line.indent === state.operationChildIndent && line.key === "operationId" && line.value) {
+    if (isBlockScalar(line.value)) {
+      state.supported = false;
+      return;
+    }
     state.operation.operationId = decodeScalar(line.value);
   }
 }
@@ -517,6 +542,10 @@ function readLine(text: string, start: number, end: number): ParsedLine {
     return { indent: cursor - start, blank: true, valid: true };
   }
   const indent = cursor - start;
+  const documentMarker = indent === 0
+    ? readDocumentMarker(text.slice(cursor, end))
+    : undefined;
+  if (documentMarker) return { indent, blank: false, documentMarker, valid: true };
   const colon = findKeyColon(text, cursor, end);
   if (colon < 0) return { indent, blank: false, valid: true };
   const key = decodeKey(text.slice(cursor, colon).trim());
@@ -527,6 +556,16 @@ function readLine(text: string, start: number, end: number): ParsedLine {
     blank: false,
     valid: key.length > 0,
   };
+}
+
+function readDocumentMarker(value: string): ParsedLine["documentMarker"] {
+  assert(typeof value === "string", "document marker source must be a string");
+  assert(value.length <= SOURCE_BYTES_MAX, "document marker source exceeds the safety limit");
+  const content = value.split(/\s+#/, 1)[0]!.trim();
+  if (content === "---") return "start";
+  if (content === "...") return "end";
+  if (content.startsWith("%")) return "directive";
+  return undefined;
 }
 
 function findKeyColon(text: string, start: number, end: number): number {

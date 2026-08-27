@@ -770,14 +770,15 @@ export class MultiSpecParser<
 
   private requireCompiled(): CompileResult {
     if (this.options.lazy && !this.compiled) {
-      if (!this.lazyCompiler && this.parsed) {
-        this.lazyCompiler = createLazyToolCompiler(this.parsed, this.compileOptions());
+      if (!this.lazyCompiler) {
+        const parsed = this.parsed ?? this.parseLazyModel();
+        this.lazyCompiler = createLazyToolCompiler(parsed, this.compileOptions());
       }
-      if (this.lazyCompiler) this.compiled = this.lazyCompiler.compileAll();
-      else {
-        const parsed = this.parseLazyModel();
-        this.compiled = createLazyToolCompiler(parsed, this.compileOptions()).compileAll();
-      }
+      const compiled = this.lazyCompiler.compileAll();
+      this.compiled = {
+        ...compiled,
+        tools: compiled.tools.map((tool) => this.lazyTools.get(tool.name) ?? tool),
+      };
     }
     if (!this.compiled) throw new Error(NOT_PARSED);
     return this.compiled;
@@ -792,7 +793,8 @@ export class MultiSpecParser<
     if (this.lazyCompiler) this.lazyDefs = this.lazyCompiler.defs;
     else {
       const parsed = this.parseLazyModel();
-      this.lazyDefs = createLazyToolCompiler(parsed, this.compileOptions()).defs;
+      this.lazyCompiler = createLazyToolCompiler(parsed, this.compileOptions());
+      this.lazyDefs = this.lazyCompiler.defs;
     }
     return this.lazyDefs;
   }
@@ -803,6 +805,11 @@ export class MultiSpecParser<
     if (!this.lazyNameIndex) throw new Error(NOT_PARSED);
     const cached = this.lazyTools.get(name);
     if (cached) return cached;
+    const materialized = this.compiled?.tools.find((tool) => tool.name === name);
+    if (materialized) {
+      this.lazyTools.set(name, materialized);
+      return materialized;
+    }
     if (!this.lazyNameIndex.has(name)) return undefined;
     if (!this.lazyCompiler && this.parsed) {
       this.lazyCompiler = createLazyToolCompiler(this.parsed, this.compileOptions());
