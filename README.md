@@ -302,9 +302,10 @@ processors, truncation, and response handling.
 With `defaultPolicy: "apply"`, Standard Schema input projections omit
 `required` entries whose properties define defaults; the canonical tool schema
 remains unchanged. Ajv validation recognizes standard JSON Schema formats plus
-OpenAPI formats such as `int32`, `int64`, and `byte`. `int64` validation accepts
-only JavaScript-safe integers because wider JSON numbers cannot be represented
-exactly by Node.js.
+OpenAPI and Google Discovery formats including `int32`, `int64`, `uint32`,
+`uint64`, `byte`, `google-datetime`, and `google-fieldmask`. `int64` validation
+accepts only JavaScript-safe numbers; Discovery `uint64` values are validated as
+decimal strings because wider integers cannot be represented exactly by Node.js.
 
 ## Consumer-side protocols
 

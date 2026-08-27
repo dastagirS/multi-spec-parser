@@ -125,8 +125,12 @@ describe("toStandardSchema (item 6)", () => {
             operationId: "formatCheck",
             parameters: [
               { name: "count", in: "query", required: true, schema: { type: "integer", format: "int32" } },
+              { name: "pageSize", in: "query", required: true, schema: { type: "integer", format: "uint32" } },
+              { name: "historyId", in: "query", required: true, schema: { type: "string", format: "uint64" } },
               { name: "payload", in: "query", required: true, schema: { type: "string", format: "byte" } },
               { name: "when", in: "query", required: true, schema: { type: "string", format: "date-time" } },
+              { name: "refreshTime", in: "query", required: true, schema: { type: "string", format: "google-datetime" } },
+              { name: "fields", in: "query", required: true, schema: { type: "string", format: "google-fieldmask" } },
             ],
             responses: { "200": { description: "ok" } },
           },
@@ -143,12 +147,28 @@ describe("toStandardSchema (item 6)", () => {
     };
     try {
       const synchronous = toStandardSchema(tool);
-      assert.deepEqual(synchronous["~standard"].validate({ count: 7, payload: "aGVsbG8=", when: "2025-01-01T00:00:00Z" }), {
-        value: { count: 7, payload: "aGVsbG8=", when: "2025-01-01T00:00:00Z" },
-      });
-      const invalid = synchronous["~standard"].validate({ count: 2147483648, payload: "not-base64", when: "not-a-date" });
-      assert.ok("issues" in invalid && invalid.issues !== undefined && invalid.issues.length >= 3);
-      const asyncInvalid = await parser.validate(tool, { count: 2147483648, payload: "not-base64", when: "not-a-date" });
+      const valid = {
+        count: 7,
+        pageSize: 4_294_967_295,
+        historyId: "18446744073709551615",
+        payload: "aGVsbG8=",
+        when: "2025-01-01T00:00:00Z",
+        refreshTime: "2025-01-01T00:00:00Z",
+        fields: "nextPageToken,items.id",
+      };
+      assert.deepEqual(synchronous["~standard"].validate(valid), { value: valid });
+      const invalidValues = {
+        count: 2_147_483_648,
+        pageSize: 4_294_967_296,
+        historyId: "18446744073709551616",
+        payload: "not-base64",
+        when: "not-a-date",
+        refreshTime: "not-a-date",
+        fields: "items(id)",
+      };
+      const invalid = synchronous["~standard"].validate(invalidValues);
+      assert.ok("issues" in invalid && invalid.issues !== undefined && invalid.issues.length >= 6);
+      const asyncInvalid = await parser.validate(tool, invalidValues);
       assert.equal(asyncInvalid.valid, false);
     } finally {
       console.warn = originalWarn;

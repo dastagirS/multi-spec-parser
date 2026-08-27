@@ -3,6 +3,9 @@ import type { Ajv } from "ajv";
 
 const INT32_MIN = -2_147_483_648;
 const INT32_MAX = 2_147_483_647;
+const UINT32_MAX = 4_294_967_295;
+const UINT64_DIGITS_MAX = 20;
+const UINT64_VALUE_MAX = "18446744073709551615";
 const ASCII_UPPERCASE_MIN = "A".charCodeAt(0);
 const ASCII_UPPERCASE_MAX = "Z".charCodeAt(0);
 const ASCII_LOWERCASE_MIN = "a".charCodeAt(0);
@@ -24,14 +27,18 @@ export function resolveAjvFormatsPlugin(module: unknown): (instance: Ajv) => voi
   return nestedDefault as (instance: Ajv) => void;
 }
 
-/** Register OpenAPI formats that Ajv does not provide itself. Standard JSON
- *  Schema formats are installed separately through ajv-formats. */
+/** Register OpenAPI and Google Discovery formats that Ajv does not provide.
+ *  Standard JSON Schema formats are installed separately through ajv-formats. */
 export function registerOpenApiFormats(instance: Ajv): void {
   assert(instance !== null && typeof instance === "object", "Ajv instance is required");
   assert(typeof instance.addFormat === "function", "Ajv instance must support formats");
   instance.addFormat("int32", { type: "number", validate: isInt32 });
   instance.addFormat("int64", { type: "number", validate: isSafeInt64 });
+  instance.addFormat("uint32", { type: "number", validate: isUint32 });
+  instance.addFormat("uint64", { type: "string", validate: isUint64 });
   instance.addFormat("byte", { type: "string", validate: isBase64 });
+  instance.addFormat("google-datetime", instance.formats["date-time"] ?? true);
+  instance.addFormat("google-fieldmask", true);
   instance.addFormat("float", true);
   instance.addFormat("double", true);
   instance.addFormat("binary", true);
@@ -48,6 +55,19 @@ function isSafeInt64(value: number): boolean {
   assert(typeof value === "number", "int64 value must be a number");
   assert(Number.isFinite(value), "int64 value must be finite");
   return Number.isSafeInteger(value);
+}
+
+function isUint32(value: number): boolean {
+  assert(typeof value === "number", "uint32 value must be a number");
+  assert(Number.isFinite(value), "uint32 value must be finite");
+  return Number.isInteger(value) && value >= 0 && value <= UINT32_MAX;
+}
+
+function isUint64(value: string): boolean {
+  assert(typeof value === "string", "uint64 value must be a string");
+  assert(value.length <= Number.MAX_SAFE_INTEGER, "uint64 value length must be safe");
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value) || value.length > UINT64_DIGITS_MAX) return false;
+  return value.length < UINT64_DIGITS_MAX || value <= UINT64_VALUE_MAX;
 }
 
 function isBase64(value: string): boolean {
