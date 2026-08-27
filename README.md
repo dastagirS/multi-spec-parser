@@ -239,7 +239,9 @@ Hook semantics:
 - `extraParameterRules` matches normalized operations before name dedup; every
   matching rule contributes its LLM-visible parameters.
 - `processors` run in declaration order after fetch and before truncation;
-  failures become explicit error results and `execute()` does not throw.
+  failures become explicit error results and `execute()` does not throw. Their
+  context exposes the final fully-read body as read-only `responseBodyBytes`;
+  these bounded bytes never enter `ExecuteResult` unless a processor returns them.
 - `onUnauthorized` replaces `Authorization` and retries up to
   `maxAuthRetries`; refresh failures do not loop.
 - `describeTools()` projects schemas for LLM budgets, replacing over-budget

@@ -35,7 +35,7 @@ import type {
   ExtraParameterRule,
   TransformOptions,
 } from "./factory.js";
-import { buildRequest as buildRequestFor, executeRequest } from "./request-builder.js";
+import { buildRequest as buildRequestFor, executeRequestWithBody } from "./request-builder.js";
 import type {
   BuiltRequest,
   ExecuteRequestOptions,
@@ -123,6 +123,8 @@ export type ExecuteProcessor = (
     runtimeContext?: unknown;
     request: BuiltRequest;
     response?: ExecuteResult["response"];
+    /** Exact final body after maxResponseBodyBytes enforcement. Treat as read-only. */
+    responseBodyBytes?: Uint8Array;
     retryCount: number;
     signal?: AbortSignal;
   },
@@ -541,13 +543,14 @@ export class MultiSpecParser<
     } catch (error: unknown) {
       return requestFailure(resolved, error);
     }
-    let result = await executeRequest(request, {
+    let outcome = await executeRequestWithBody(request, {
       timeoutMs,
       signal: options.signal,
       maxResponseBodyBytes,
       retryCount: 0,
       transport,
     });
+    let result = outcome.result;
     while (
       result.status === "error" &&
       result.httpStatus === 401 &&
@@ -589,13 +592,14 @@ export class MultiSpecParser<
       } catch (error: unknown) {
         return requestFailure(resolved, error);
       }
-      result = await executeRequest(request, {
+      outcome = await executeRequestWithBody(request, {
         timeoutMs,
         signal: options.signal,
         maxResponseBodyBytes,
         retryCount: retries,
         transport,
       });
+      result = outcome.result;
     }
 
     result = await this.applyResponseTransform(
@@ -616,6 +620,7 @@ export class MultiSpecParser<
       retries,
       options.signal,
       options.runtimeContext,
+      outcome.responseBodyBytes,
     );
 
     // Item 4: uniform size guarantee AFTER processors (a processor can shrink
@@ -657,6 +662,7 @@ export class MultiSpecParser<
     retryCount: number,
     signal: AbortSignal | undefined,
     runtimeContext: unknown,
+    responseBodyBytes: Uint8Array | undefined,
   ): Promise<ExecuteResult> {
     const rules = this.options.processors ?? [];
     for (const rule of rules) {
@@ -677,6 +683,7 @@ export class MultiSpecParser<
           runtimeContext,
           request,
           response: result.response,
+          responseBodyBytes,
           retryCount,
           signal,
         });

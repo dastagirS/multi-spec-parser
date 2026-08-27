@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
+import type { ExecuteProcessor } from "../../src/multi-spec-parser.js";
 import type { TransportRequest } from "../../src/request-builder.js";
 
 const SPEC = {
@@ -64,6 +65,17 @@ interface TestServer {
   url: string;
   hits: () => number;
   close: () => Promise<void>;
+}
+
+async function createProcessorParser(process: ExecuteProcessor): Promise<MultiSpecParser> {
+  assert(typeof process === "function", "processor must be a function");
+  assert(SPEC !== null && typeof SPEC === "object", "test specification must be an object");
+  const parser = new MultiSpecParser({
+    spec: { spec: SPEC },
+    options: { processors: [{ matches: () => true, process }] },
+  });
+  await parser.parse();
+  return parser;
 }
 
 function startServer(): Promise<TestServer> {
@@ -385,6 +397,72 @@ components:
       assert.equal(observed.filter((context) => context === contexts.A).length, 1);
       assert.equal(observed.filter((context) => context === contexts.B).length, 1);
     }
+  });
+
+  it("exposes exact binary, JSON, and text bytes only to processors", async () => {
+    const observed: Array<Uint8Array | undefined> = [];
+    const parser = await createProcessorParser((result, context) => {
+      observed.push(context.responseBodyBytes);
+      return result;
+    });
+    const binary = new Uint8Array([0xff, 0xfe, 0x00, 0x80, 0x41]);
+    const binaryResult = await parser.execute("listPets", {}, {
+      transport: async () => new Response(binary, { headers: { "content-type": "application/octet-stream" } }),
+    });
+    const jsonText = JSON.stringify({ ok: true });
+    const jsonResult = await parser.execute("listPets", {}, {
+      transport: async () => new Response(jsonText, { headers: { "content-type": "application/json" } }),
+    });
+    const textResult = await parser.execute("listPets", {}, {
+      transport: async () => new Response("plain text", { headers: { "content-type": "text/plain" } }),
+    });
+    assert.deepEqual(observed[0], binary);
+    assert.deepEqual(observed[1], new TextEncoder().encode(jsonText));
+    assert.deepEqual(observed[2], new TextEncoder().encode("plain text"));
+    assert.deepEqual(jsonResult.data, { ok: true });
+    assert.equal(textResult.data, "plain text");
+    assert.equal(Object.prototype.hasOwnProperty.call(binaryResult, "responseBodyBytes"), false);
+    assert.equal(JSON.stringify(binaryResult).includes("responseBodyBytes"), false);
+  });
+
+  it("withholds incomplete bodies and exposes fully-read empty bodies", async () => {
+    const observed: Array<Uint8Array | undefined> = [];
+    const parser = await createProcessorParser((result, context) => {
+      observed.push(context.responseBodyBytes);
+      return result;
+    });
+    const oversized = await parser.execute("listPets", {}, {
+      maxResponseBodyBytes: 2,
+      transport: async () => new Response(new Uint8Array([1, 2, 3])),
+    });
+    const empty = await parser.execute("listPets", {}, {
+      transport: async () => new Response(null, { status: 204 }),
+    });
+    assert.equal(oversized.status, "truncated");
+    assert.equal(observed[0], undefined);
+    assert.equal(empty.status, "success");
+    assert.deepEqual(observed[1], new Uint8Array());
+  });
+
+  it("exposes only the final authentication attempt body", async () => {
+    const observed: Array<Uint8Array | undefined> = [];
+    const parser = await createProcessorParser((result, context) => {
+      observed.push(context.responseBodyBytes);
+      return result;
+    });
+    const expected = new Uint8Array([0xff, 0x00, 0x41]);
+    let attemptCount = 0;
+    const result = await parser.execute("listPets", {}, {
+      transport: async () => {
+        attemptCount += 1;
+        return attemptCount === 1 ? new Response("expired", { status: 401 }) : new Response(expected);
+      },
+      onUnauthorized: () => "Bearer refreshed",
+    });
+    assert.equal(result.status, "success");
+    assert.equal(attemptCount, 2);
+    assert.equal(observed.length, 1);
+    assert.deepEqual(observed[0], expected);
   });
 
   it("uses the optional custom transport and keeps the default when omitted", async () => {

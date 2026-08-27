@@ -14,6 +14,10 @@
   `ExtractedOperation` predicates; generated tool names are never selectors.
 - `runtimeContext` is execution-local opaque data for runtime transforms and
   processors only; it never enters schemas, model arguments, or parser state.
+- Fully read, bounded bytes from the final HTTP attempt are execution-local
+  processor context only; incomplete/network-failure bodies stay absent, empty
+  responses use a zero-length array, and raw bytes never enter transforms,
+  parser state, or `ExecuteResult` unless a processor explicitly returns them.
 - Canonical compiled tools retain their combined input/output definition closure;
   Standard JSON Schema projections independently expose only definitions
   reachable from their respective input or output root.

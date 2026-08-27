@@ -6,6 +6,8 @@
  * {variables} substitution, and allowReserved-aware path encoding.
  */
 
+import assert from "node:assert/strict";
+
 import type {
   ExtractedOperation,
   HttpMethod,
@@ -462,19 +464,33 @@ export interface ExecuteResult {
   message?: string;
 }
 
-/** Execute a built request with a timeout; JSON body parsed, text fallback.
- *  The timeout covers the body read too — clearing right after fetch() resolves
- *  would leave a slow download unbounded (G8). */
+export interface ExecuteRequestOutcome {
+  result: ExecuteResult;
+  /** Exact bounded body, kept outside the serializable execution result. */
+  responseBodyBytes?: Uint8Array;
+}
+
+/** Execute a built request while preserving the existing result-only API. */
 export async function executeRequest(
   request: BuiltRequest,
   options: ExecuteOptions = {},
 ): Promise<ExecuteResult> {
+  assert(request !== null && typeof request === "object", "request must be an object");
+  assert(options !== null && typeof options === "object", "execute options must be an object");
+  return (await executeRequestWithBody(request, options)).result;
+}
+
+/** Execute with a timeout and retain fully-read bounded bytes for runtime hooks. */
+export async function executeRequestWithBody(
+  request: BuiltRequest,
+  options: ExecuteOptions = {},
+): Promise<ExecuteRequestOutcome> {
+  assert(request !== null && typeof request === "object", "request must be an object");
+  assert(options !== null && typeof options === "object", "execute options must be an object");
   const retryCount = options.retryCount ?? 0;
-  const timeoutMs = options.timeoutMs ?? 30_000;
-  const signal = combineSignals(options.signal, timeoutMs);
+  const signal = combineSignals(options.signal, options.timeoutMs ?? 30_000);
   try {
-    const responseTransport = options.transport ?? defaultRequestTransport;
-    const response = await responseTransport({
+    const response = await (options.transport ?? defaultRequestTransport)({
       url: request.url,
       method: request.method,
       headers: request.headers,
@@ -483,45 +499,34 @@ export async function executeRequest(
     });
     const metadata = responseMetadata(response, request);
     if (response.status === 204) {
-      return { status: "success", data: null, httpStatus: 204, response: metadata };
-    }
-    const body = await readResponseBody(response, options.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES);
-    if (body.tooLarge) {
       return {
-        status: "truncated",
-        data: null,
-        httpStatus: response.status,
-        response: metadata,
-        size: body.size,
-        message: `Response exceeded the ${body.limit}-byte body limit.`,
-        errorDetails: errorDetails("RESPONSE_TOO_LARGE", `Response exceeded the ${body.limit}-byte body limit.`, request, response, retryCount, metadata.contentType),
+        result: { status: "success", data: null, httpStatus: 204, response: metadata },
+        responseBodyBytes: new Uint8Array(),
       };
     }
+    const body = await readResponseBody(response, options.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES);
+    if (body.tooLarge) return { result: responseTooLarge(request, response, metadata, body, retryCount) };
     const data = decodeResponseBody(body.bytes, metadata.contentType);
     if (!response.ok) {
       const message = extractErrorMessage(data, response.status);
       return {
-        status: "error",
-        data,
-        httpStatus: response.status,
-        error: message,
-        response: metadata,
-        errorDetails: errorDetails("HTTP_ERROR", message, request, response, retryCount, metadata.contentType),
+        result: {
+          status: "error",
+          data,
+          httpStatus: response.status,
+          error: message,
+          response: metadata,
+          errorDetails: errorDetails("HTTP_ERROR", message, request, response, retryCount, metadata.contentType),
+        },
+        responseBodyBytes: body.bytes,
       };
     }
-    return { status: "success", data, httpStatus: response.status, response: metadata };
-  } catch (error: unknown) {
-    const aborted = error instanceof DOMException && error.name === "AbortError";
-    const callerAborted = options.signal?.aborted === true;
-    const code: ExecuteErrorCode = callerAborted ? "ABORTED" : aborted ? "TIMEOUT" : "NETWORK_ERROR";
-    const message = callerAborted ? "Request aborted" : aborted ? "Request timed out" : error instanceof Error ? error.message : String(error);
     return {
-      status: "error",
-      data: null,
-      httpStatus: 0,
-      error: message,
-      errorDetails: { code, message, url: request.url, method: request.method, retryCount, causeMessage: error instanceof Error ? error.message : String(error) },
+      result: { status: "success", data, httpStatus: response.status, response: metadata },
+      responseBodyBytes: body.bytes,
     };
+  } catch (error: unknown) {
+    return { result: requestExecutionFailure(request, options, error, retryCount) };
   }
 }
 
@@ -530,6 +535,55 @@ interface BoundedResponseBody {
   size: number;
   tooLarge: boolean;
   limit: number;
+}
+
+function responseTooLarge(
+  request: BuiltRequest,
+  response: Response,
+  metadata: ExecuteResponseMetadata,
+  body: BoundedResponseBody,
+  retryCount: number,
+): ExecuteResult {
+  assert(body.tooLarge && body.size > body.limit, "response body must exceed its limit");
+  assert(Number.isInteger(retryCount) && retryCount >= 0, "retry count must be non-negative");
+  const message = `Response exceeded the ${body.limit}-byte body limit.`;
+  return {
+    status: "truncated",
+    data: null,
+    httpStatus: response.status,
+    response: metadata,
+    size: body.size,
+    message,
+    errorDetails: errorDetails("RESPONSE_TOO_LARGE", message, request, response, retryCount, metadata.contentType),
+  };
+}
+
+function requestExecutionFailure(
+  request: BuiltRequest,
+  options: ExecuteOptions,
+  error: unknown,
+  retryCount: number,
+): ExecuteResult {
+  assert(request !== null && typeof request === "object", "request must be an object");
+  assert(Number.isInteger(retryCount) && retryCount >= 0, "retry count must be non-negative");
+  const aborted = error instanceof DOMException && error.name === "AbortError";
+  const callerAborted = options.signal?.aborted === true;
+  const code: ExecuteErrorCode = callerAborted ? "ABORTED" : aborted ? "TIMEOUT" : "NETWORK_ERROR";
+  const message = callerAborted ? "Request aborted" : aborted ? "Request timed out" : error instanceof Error ? error.message : String(error);
+  return {
+    status: "error",
+    data: null,
+    httpStatus: 0,
+    error: message,
+    errorDetails: {
+      code,
+      message,
+      url: request.url,
+      method: request.method,
+      retryCount,
+      causeMessage: error instanceof Error ? error.message : String(error),
+    },
+  };
 }
 
 const defaultRequestTransport: RequestTransport = async (request) =>
