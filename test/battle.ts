@@ -107,7 +107,7 @@ const SPECS: SpecCase[] = [
   {
     name: "stripe (OAS 3.0.0, 1440 schemas)",
     file: "stripe.json",
-    expectedOps: 589,
+    expectedOps: 594,
     heapCapMB: 1024,
     timeoutMs: 240_000,
     tier: "worst-case (schema graph)",
@@ -121,7 +121,7 @@ const SPECS: SpecCase[] = [
   {
     name: "github (OAS 3.0.3, 13MB — the OOM case)",
     file: "github.json",
-    expectedOps: 1220,
+    expectedOps: 1221,
     heapCapMB: 1024,
     timeoutMs: 300_000,
     tier: "worst-case (scale)",

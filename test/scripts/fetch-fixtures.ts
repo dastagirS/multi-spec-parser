@@ -28,11 +28,13 @@ const FIXTURES: Array<{ file: string; url: string }> = [
   },
   {
     file: "stripe.json",
-    url: "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json",
+    // Pin the fixture because operation-count gates must not change when upstream master moves.
+    url: "https://raw.githubusercontent.com/stripe/openapi/7258e5084c3b31defae5c5a400a1e39e50a5b796/openapi/spec3.json",
   },
   {
     file: "github.json",
-    url: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
+    // Pin the fixture because operation-count gates must not change when upstream main moves.
+    url: "https://raw.githubusercontent.com/github/rest-api-description/8114b0d0e23240dfe45374e2daf01651a4729210/descriptions/api.github.com/api.github.com.json",
   },
   {
     file: "swagger2.json",
