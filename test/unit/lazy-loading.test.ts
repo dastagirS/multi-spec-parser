@@ -135,6 +135,51 @@ describe("lazy source loading", () => {
     await assert.rejects(lazyParse.parse(), /Multiple YAML documents/);
   });
 
+  it("falls back safely for multiline operation ID scalars", async () => {
+    const operationIds = [
+      'operationId: "list\n        Pets"',
+      "operationId: 'list\n        Pets'",
+    ];
+    assert.equal(operationIds.length, 2);
+    for (const operationId of operationIds) {
+      const source = SIMPLE_YAML.replace("operationId: listPets", operationId);
+      const strict = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+      const fallback = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+      await assert.rejects(strict.load(), /requires an indexable OpenAPI YAML source/);
+      await fallback.parse();
+      assert.equal(fallback.tool("list_Pets")?.name, "list_Pets");
+      assert.equal(fallback.tool("list"), undefined);
+    }
+
+    const malformed = SIMPLE_YAML.replace("operationId: listPets", "operationId: list\n        Pets");
+    const eager = new MultiSpecParser({ spec: { text: malformed } });
+    const fallback = new MultiSpecParser({ spec: { text: malformed }, options: { lazy: true } });
+    await assert.rejects(eager.parse(), /invalid indentation/);
+    await assert.rejects(fallback.parse(), /invalid indentation/);
+  });
+
+  it("rejects operation IDs that YAML resolves to non-string values", async () => {
+    const operationIds = ["", "# absent", "null", "~", "true", "123", "1.5", "0xff"];
+    assert.equal(operationIds.length, 8);
+    for (const operationId of operationIds) {
+      const source = SIMPLE_YAML.replace("listPets", operationId);
+      const strict = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+      const fallback = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+      await assert.rejects(strict.load(), /requires an indexable OpenAPI YAML source/);
+      await assert.rejects(fallback.parse(), /operationId must be a string or undefined/);
+    }
+  });
+
+  it("rejects malformed keyless content at the document root", async () => {
+    const source = `garbage\n${SIMPLE_YAML}`;
+    const eager = new MultiSpecParser({ spec: { text: source } });
+    const strict = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+    const fallback = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });
+    await assert.rejects(eager.parse(), /mapping entry expected/);
+    await assert.rejects(strict.load(), /requires an indexable OpenAPI YAML source/);
+    await assert.rejects(fallback.parse(), /mapping entry expected/);
+  });
+
   it("falls back safely for block-scalar operation IDs", async () => {
     const source = SIMPLE_YAML.replace("operationId: listPets", "operationId: >-\n        listPets");
     const strict = new MultiSpecParser({ spec: { text: source }, options: { lazy: true } });

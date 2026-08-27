@@ -55,6 +55,7 @@ interface ScanState {
   blockScalarIndent?: number;
   ignoredPathExtensionIndent?: number;
   operationCount?: number;
+  operationIdIndent?: number;
   documentMarkerSeen?: boolean;
   contentSeen?: boolean;
   supported: boolean;
@@ -318,7 +319,15 @@ function processIndexedLine(
   }
   state.contentSeen = true;
   closeRangesAtIndent(state, line.indent, position);
-  if (line.key === undefined) return;
+  if (line.key === undefined) {
+    if (line.indent === 0 || (state.operationIdIndent !== undefined && line.indent > state.operationIdIndent)) {
+      state.supported = false;
+    }
+    return;
+  }
+  if (state.operationIdIndent !== undefined && line.indent <= state.operationIdIndent) {
+    state.operationIdIndent = undefined;
+  }
   if (line.indent === 0) startTopLevel(source, state, line, position);
   else if (state.topName === "paths") processPathLine(source, state, line, position);
   else if (state.topName === "components") processComponentLine(source, state, line, position);
@@ -422,6 +431,7 @@ function processPathLine(
   if ((state.operationCount ?? 0) > INDEX_ENTRY_COUNT_MAX) state.supported = false;
   state.operation = operation;
   state.operationChildIndent = undefined;
+  state.operationIdIndent = undefined;
 }
 
 function captureOperationId(state: ScanState, line: ParsedLine): void {
@@ -429,12 +439,13 @@ function captureOperationId(state: ScanState, line: ParsedLine): void {
   assert(state.pathName !== undefined, "operation child must belong to a path");
   if (!state.operation || line.key === undefined) return;
   if (state.operationChildIndent === undefined) state.operationChildIndent = line.indent;
-  if (line.indent === state.operationChildIndent && line.key === "operationId" && line.value) {
-    if (isBlockScalar(line.value)) {
+  if (line.indent === state.operationChildIndent && line.key === "operationId") {
+    if (!line.value || !isIndexableOperationId(line.value)) {
       state.supported = false;
       return;
     }
     state.operation.operationId = decodeScalar(line.value);
+    state.operationIdIndent = line.indent;
   }
 }
 
@@ -598,6 +609,37 @@ function isKeySeparator(text: string, index: number, end: number): boolean {
   return code === 32 || code === 9 || code === 35;
 }
 
+function isIndexableOperationId(value: string): boolean {
+  assert(typeof value === "string" && value.length > 0, "operation ID scalar must be non-empty");
+  assert(value.length <= SOURCE_BYTES_MAX, "operation ID scalar exceeds the safety limit");
+  const trimmed = stripScalarComment(value);
+  if (trimmed.length === 0 || isBlockScalar(trimmed) || /^[&!*\[{]/.test(trimmed)) return false;
+  if (/^(?:~|null|true|false|[-+]?\.(?:inf|nan))$/i.test(trimmed)) return false;
+  if (/^[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?$/i.test(trimmed)) return false;
+  if (/^[-+]?0(?:x[0-9a-f_]+|o[0-7_]+|b[01_]+)$/i.test(trimmed)) return false;
+  if (trimmed.startsWith('"')) {
+    try {
+      return typeof JSON.parse(trimmed) === "string";
+    } catch {
+      return false;
+    }
+  }
+  if (!trimmed.startsWith("'")) return true;
+  let index = 1;
+  while (index < trimmed.length) {
+    if (trimmed[index] !== "'") {
+      index += 1;
+      continue;
+    }
+    if (trimmed[index + 1] === "'") {
+      index += 2;
+      continue;
+    }
+    return index === trimmed.length - 1;
+  }
+  return false;
+}
+
 function decodeScalar(value: string): string {
   assert(typeof value === "string" && value.length > 0, "scalar text must be non-empty");
   assert(value.length <= SOURCE_BYTES_MAX, "scalar text exceeds the safety limit");
@@ -622,7 +664,7 @@ function stripScalarComment(value: string): string {
     const character = value[index]!;
     if (quote !== "" && character === quote) quote = "";
     else if (quote === "" && (character === '"' || character === "'")) quote = character;
-    else if (quote === "" && character === "#" && index > 0 && /\s/.test(value[index - 1]!)) {
+    else if (quote === "" && character === "#" && (index === 0 || /\s/.test(value[index - 1]!))) {
       return value.slice(0, index).trim();
     }
   }
