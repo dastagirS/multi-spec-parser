@@ -88,11 +88,6 @@ export interface MultiSpecParserOptions {
   /** Ordered response processor rules. Every matching rule runs in
    *  declaration order, after response transforms and before truncation. */
   processors?: ProcessorRule[];
-  /** Item 3: called on a 401 before each retry; return the new Authorization
-   *  header value (your closure does the OAuth refresh). */
-  onUnauthorized?: () => string | Promise<string>;
-  /** Item 3: how many retries after the first 401 (default 1). */
-  maxAuthRetries?: number;
   /** Item 4: serialized result size cap; oversized results become
    *  { status: "truncated", … }. Runs after processors. */
   maxResponseBytes?: number;
@@ -125,7 +120,6 @@ export type ExecuteProcessor = (
     response?: ExecuteResult["response"];
     /** Exact final body after maxResponseBodyBytes enforcement. Treat as read-only. */
     responseBodyBytes?: Uint8Array;
-    retryCount: number;
     signal?: AbortSignal;
   },
 ) => ExecuteResult | Promise<ExecuteResult>;
@@ -507,9 +501,7 @@ export class MultiSpecParser<
 
   /** Build + execute. Returns { status, httpStatus, data } — never throws on
    *  HTTP errors (non-2xx → status:"error"); network failures are surfaced the
-   *  same way.
-   *
-   *  Pipeline: fetch → [401 → onUnauthorized() → retry] → processor → truncate.
+   *  same way. Authentication and retries belong to the selected transport.
    */
   async execute(
     tool: string | CompiledTool,
@@ -526,12 +518,7 @@ export class MultiSpecParser<
       return requestFailure(resolved, error);
     }
 
-    // Item 3: 401 → onUnauthorized() → retry (maxAuthRetries times). Resolve
-    // execution-local hooks once so concurrent calls never share client state.
-    const maxAuthRetries = this.options.maxAuthRetries ?? 1;
     const transport = options.transport ?? this.options.transport;
-    const onUnauthorized = options.onUnauthorized ?? this.options.onUnauthorized;
-    let retries = 0;
     let request: BuiltRequest;
     try {
       request = this.buildRequestWithRuntimeContext(
@@ -543,71 +530,19 @@ export class MultiSpecParser<
     } catch (error: unknown) {
       return requestFailure(resolved, error);
     }
-    let outcome = await executeRequestWithBody(request, {
+    const outcome = await executeRequestWithBody(request, {
       timeoutMs,
       signal: options.signal,
       maxResponseBodyBytes,
-      retryCount: 0,
       transport,
     });
     let result = outcome.result;
-    while (
-      result.status === "error" &&
-      result.httpStatus === 401 &&
-      retries < maxAuthRetries &&
-      onUnauthorized
-    ) {
-      retries += 1;
-      let header: string;
-      try {
-        header = await onUnauthorized();
-      } catch (err) {
-        const message = `onUnauthorized failed: ${errorMessage(err)}`;
-        return {
-          status: "error",
-          data: null,
-          httpStatus: 401,
-          error: message,
-          errorDetails: {
-            code: "HTTP_ERROR",
-            message,
-            httpStatus: 401,
-            url: request.url,
-            method: request.method,
-            retryCount: retries,
-            causeMessage: errorMessage(err),
-          },
-        };
-      }
-      try {
-        request = this.buildRequestWithRuntimeContext(
-          resolved,
-          effectiveArgs,
-          {
-            ...options,
-            headers: { ...(options.headers ?? {}), Authorization: header },
-          },
-          options.runtimeContext,
-        );
-      } catch (error: unknown) {
-        return requestFailure(resolved, error);
-      }
-      outcome = await executeRequestWithBody(request, {
-        timeoutMs,
-        signal: options.signal,
-        maxResponseBodyBytes,
-        retryCount: retries,
-        transport,
-      });
-      result = outcome.result;
-    }
 
     result = await this.applyResponseTransform(
       resolved,
       effectiveArgs,
       request,
       result,
-      retries,
       options.signal,
       options.runtimeContext,
     );
@@ -617,7 +552,6 @@ export class MultiSpecParser<
       effectiveArgs,
       result,
       request,
-      retries,
       options.signal,
       options.runtimeContext,
       outcome.responseBodyBytes,
@@ -633,7 +567,6 @@ export class MultiSpecParser<
     args: Record<string, unknown>,
     request: BuiltRequest,
     result: ExecuteResult,
-    retryCount: number,
     signal: AbortSignal | undefined,
     runtimeContext: unknown,
   ): Promise<ExecuteResult> {
@@ -644,7 +577,6 @@ export class MultiSpecParser<
         tool,
         args,
         request,
-        retryCount,
         signal,
         runtimeContext,
       });
@@ -659,7 +591,6 @@ export class MultiSpecParser<
     args: Record<string, unknown>,
     result: ExecuteResult,
     request: BuiltRequest,
-    retryCount: number,
     signal: AbortSignal | undefined,
     runtimeContext: unknown,
     responseBodyBytes: Uint8Array | undefined,
@@ -684,7 +615,6 @@ export class MultiSpecParser<
           request,
           response: result.response,
           responseBodyBytes,
-          retryCount,
           signal,
         });
         if (!isExecuteResult(processed)) {
@@ -721,7 +651,6 @@ export class MultiSpecParser<
           message: "Response could not be serialized",
           url: result.response?.url ?? "",
           method: tool.method,
-          retryCount: result.errorDetails?.retryCount ?? 0,
           causeMessage: errorMessage(error),
         },
       };
@@ -925,6 +854,17 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new TypeError("MultiSpecParser: options must be an object.");
   }
+  const knownOptionKeys = [
+    "maxDefsBytes", "baseUrl", "headers", "executeTimeoutMs", "transport",
+    "filterOps", "extraParameterRules", "processors", "maxResponseBytes",
+    "onTruncate", "maxResponseBodyBytes", "transforms", "cache",
+    "describeMaxBytes", "defaultPolicy", "lazy",
+  ];
+  for (const key of Object.keys(options)) {
+    if (!knownOptionKeys.includes(key)) {
+      throw new TypeError(`MultiSpecParser: unknown option "${key}".`);
+    }
+  }
   const { maxDefsBytes, baseUrl, headers, executeTimeoutMs, defaultPolicy, lazy } = options;
   if (lazy !== undefined && typeof lazy !== "boolean") {
     throw new TypeError("MultiSpecParser: options.lazy must be a boolean.");
@@ -1010,17 +950,6 @@ function validateOptions(options: MultiSpecParserOptions | undefined): void {
   if (options.transport !== undefined && typeof options.transport !== "function") {
     throw new TypeError("MultiSpecParser: options.transport must be a function.");
   }
-  if (options.onUnauthorized !== undefined && typeof options.onUnauthorized !== "function") {
-    throw new TypeError("MultiSpecParser: options.onUnauthorized must be a function.");
-  }
-  if (
-    options.maxAuthRetries !== undefined &&
-    (!Number.isInteger(options.maxAuthRetries) || options.maxAuthRetries < 0)
-  ) {
-    throw new TypeError(
-      "MultiSpecParser: options.maxAuthRetries must be a non-negative integer.",
-    );
-  }
   positiveNumber(options.maxResponseBytes, "maxResponseBytes");
   positiveNumber(options.maxResponseBodyBytes, "maxResponseBodyBytes");
   positiveNumber(options.describeMaxBytes, "describeMaxBytes");
@@ -1092,7 +1021,6 @@ function requestFailure(tool: CompiledTool, error: unknown): ExecuteResult {
       message,
       url: "",
       method: tool.method,
-      retryCount: 0,
       causeMessage: message,
     },
   };

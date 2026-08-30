@@ -108,7 +108,6 @@ export interface ResponseTransformContext {
   /** Opaque execution-local dependencies for this execution. */
   runtimeContext?: unknown;
   request: BuiltRequest;
-  retryCount: number;
   signal?: AbortSignal;
 }
 

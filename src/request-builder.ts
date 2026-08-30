@@ -418,7 +418,6 @@ export interface ExecuteErrorDetails {
   url: string;
   method: HttpMethod;
   contentType?: string;
-  retryCount: number;
   causeMessage?: string;
 }
 
@@ -433,7 +432,6 @@ export interface ExecuteOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   maxResponseBodyBytes?: number;
-  retryCount?: number;
   transport?: RequestTransport;
 }
 
@@ -445,8 +443,6 @@ export interface ExecuteRequestOptions extends RequestBuildOptions {
   runtimeContext?: unknown;
   /** Execution-local transport; overrides the parser default. */
   transport?: RequestTransport;
-  /** Execution-local 401 refresh callback; returns an Authorization value. */
-  onUnauthorized?: () => string | Promise<string>;
 }
 
 export interface ExecuteResult {
@@ -487,7 +483,6 @@ export async function executeRequestWithBody(
 ): Promise<ExecuteRequestOutcome> {
   assert(request !== null && typeof request === "object", "request must be an object");
   assert(options !== null && typeof options === "object", "execute options must be an object");
-  const retryCount = options.retryCount ?? 0;
   const signal = combineSignals(options.signal, options.timeoutMs ?? 30_000);
   try {
     const response = await (options.transport ?? defaultRequestTransport)({
@@ -505,7 +500,7 @@ export async function executeRequestWithBody(
       };
     }
     const body = await readResponseBody(response, options.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES);
-    if (body.tooLarge) return { result: responseTooLarge(request, response, metadata, body, retryCount) };
+    if (body.tooLarge) return { result: responseTooLarge(request, response, metadata, body) };
     const data = decodeResponseBody(body.bytes, metadata.contentType);
     if (!response.ok) {
       const message = extractErrorMessage(data, response.status);
@@ -516,7 +511,7 @@ export async function executeRequestWithBody(
           httpStatus: response.status,
           error: message,
           response: metadata,
-          errorDetails: errorDetails("HTTP_ERROR", message, request, response, retryCount, metadata.contentType),
+          errorDetails: errorDetails("HTTP_ERROR", message, request, response, metadata.contentType),
         },
         responseBodyBytes: body.bytes,
       };
@@ -526,7 +521,7 @@ export async function executeRequestWithBody(
       responseBodyBytes: body.bytes,
     };
   } catch (error: unknown) {
-    return { result: requestExecutionFailure(request, options, error, retryCount) };
+    return { result: requestExecutionFailure(request, options, error) };
   }
 }
 
@@ -542,10 +537,9 @@ function responseTooLarge(
   response: Response,
   metadata: ExecuteResponseMetadata,
   body: BoundedResponseBody,
-  retryCount: number,
 ): ExecuteResult {
   assert(body.tooLarge && body.size > body.limit, "response body must exceed its limit");
-  assert(Number.isInteger(retryCount) && retryCount >= 0, "retry count must be non-negative");
+  assert(metadata.status === response.status, "response metadata status must match");
   const message = `Response exceeded the ${body.limit}-byte body limit.`;
   return {
     status: "truncated",
@@ -554,7 +548,7 @@ function responseTooLarge(
     response: metadata,
     size: body.size,
     message,
-    errorDetails: errorDetails("RESPONSE_TOO_LARGE", message, request, response, retryCount, metadata.contentType),
+    errorDetails: errorDetails("RESPONSE_TOO_LARGE", message, request, response, metadata.contentType),
   };
 }
 
@@ -562,10 +556,9 @@ function requestExecutionFailure(
   request: BuiltRequest,
   options: ExecuteOptions,
   error: unknown,
-  retryCount: number,
 ): ExecuteResult {
   assert(request !== null && typeof request === "object", "request must be an object");
-  assert(Number.isInteger(retryCount) && retryCount >= 0, "retry count must be non-negative");
+  assert(options !== null && typeof options === "object", "execute options must be an object");
   const aborted = error instanceof DOMException && error.name === "AbortError";
   const callerAborted = options.signal?.aborted === true;
   const code: ExecuteErrorCode = callerAborted ? "ABORTED" : aborted ? "TIMEOUT" : "NETWORK_ERROR";
@@ -580,7 +573,6 @@ function requestExecutionFailure(
       message,
       url: request.url,
       method: request.method,
-      retryCount,
       causeMessage: error instanceof Error ? error.message : String(error),
     },
   };
@@ -654,7 +646,6 @@ function errorDetails(
   message: string,
   request: BuiltRequest,
   response: Response,
-  retryCount: number,
   contentType: string | undefined,
 ): ExecuteErrorDetails {
   return {
@@ -664,7 +655,6 @@ function errorDetails(
     url: request.url,
     method: request.method,
     ...(contentType ? { contentType } : {}),
-    retryCount,
   };
 }
 

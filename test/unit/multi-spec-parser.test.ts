@@ -380,19 +380,17 @@ components:
         runtimeContext: contexts[user],
         transport: async (_request: TransportRequest) => {
           attempts[user] += 1;
-          if (attempts[user] === 1) return new Response("expired", { status: 401 });
           return new Response(JSON.stringify({ user }), {
             status: 200,
             headers: { "content-type": "application/json" },
           });
         },
-        onUnauthorized: () => `Bearer ${user}-fresh`,
       });
     const [resultA, resultB] = await Promise.all([executeForUser("A"), executeForUser("B")]);
     assert.equal(resultA.status, "success");
     assert.equal(resultB.status, "success");
-    assert.equal(requestContexts.filter((context) => context === contexts.A).length, 2);
-    assert.equal(requestContexts.filter((context) => context === contexts.B).length, 2);
+    assert.equal(requestContexts.filter((context) => context === contexts.A).length, 1);
+    assert.equal(requestContexts.filter((context) => context === contexts.B).length, 1);
     for (const observed of [responseContexts, matchContexts, processContexts]) {
       assert.equal(observed.filter((context) => context === contexts.A).length, 1);
       assert.equal(observed.filter((context) => context === contexts.B).length, 1);
@@ -444,7 +442,7 @@ components:
     assert.deepEqual(observed[1], new Uint8Array());
   });
 
-  it("exposes only the final authentication attempt body", async () => {
+  it("exposes only the final transport response body", async () => {
     const observed: Array<Uint8Array | undefined> = [];
     const parser = await createProcessorParser((result, context) => {
       observed.push(context.responseBodyBytes);
@@ -455,9 +453,13 @@ components:
     const result = await parser.execute("listPets", {}, {
       transport: async () => {
         attemptCount += 1;
-        return attemptCount === 1 ? new Response("expired", { status: 401 }) : new Response(expected);
+        const first = new Response("expired", { status: 401 });
+        if (first.status === 401) {
+          await first.body?.cancel();
+          attemptCount += 1;
+        }
+        return new Response(expected);
       },
-      onUnauthorized: () => "Bearer refreshed",
     });
     assert.equal(result.status, "success");
     assert.equal(attemptCount, 2);

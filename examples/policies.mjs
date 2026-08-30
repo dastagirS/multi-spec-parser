@@ -1,11 +1,11 @@
 /**
- * The policy surface, end to end: filterOps, extraParameterRules, the
- * execute() pipeline (401 retry → processors → truncation), describeTools(),
- * validate(), and the Standard Schema adapter.
+ * The policy surface, end to end: filterOps, extraParameterRules, authenticated
+ * transport, processors, truncation, describeTools(), validation, and the
+ * Standard Schema adapter.
  *
  * Network-free: a tiny local HTTP server stands in for the API — it 401s once
- * (to trigger the auth retry), then returns a deliberately oversized body (to
- * trigger truncation).
+ * so the transport refreshes authentication, then returns a deliberately
+ * oversized body to trigger truncation.
  *
  * Run: node examples/policies.mjs
  */
@@ -96,8 +96,25 @@ const server = createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const { port } = server.address();
 
-// 2. Configure the whole policy surface. Everything stack-specific (token
-//    refresh, logging) lives in these closures — the package never sees it.
+let authorization = "Bearer stale-token";
+const authenticatedTransport = async (request) => {
+  const send = () => fetch(request.url, {
+    method: request.method,
+    headers: { ...request.headers, Authorization: authorization },
+    body: request.body,
+    signal: request.signal,
+  });
+  let response = await send();
+  if (response.status === 401) {
+    await response.body?.cancel();
+    authorization = "Bearer fresh-token";
+    response = await send();
+  }
+  return response;
+};
+
+// 2. Configure the whole policy surface. Everything stack-specific (auth,
+//    retries, logging) lives in these closures — the package never sees it.
 const parser = new MultiSpecParser({
   spec: { spec: SPEC },
   options: {
@@ -118,9 +135,8 @@ const parser = new MultiSpecParser({
       },
     ],
 
-    // 401 → onUnauthorized() → retry once (maxAuthRetries).
-    onUnauthorized: async () => "Bearer fresh-token",
-    maxAuthRetries: 1,
+    // Authentication and retries belong to the scoped transport.
+    transport: authenticatedTransport,
 
     // Uniform result-size guarantee, applied AFTER processors.
     maxResponseBytes: 2_000,
@@ -163,8 +179,8 @@ console.log("buildRequest ignores extras:", parser.buildRequest("getPet", { petI
 console.log("validate() bad args:", JSON.stringify(await parser.validate("getPet", {})));
 console.log("validate() good args:", JSON.stringify(await parser.validate("getPet", { petId: "1" })));
 
-// 6. execute() pipeline: getPet hits the 401 → refresh → retry → oversized
-//    body → truncated. listPets runs its processor (shrinks → no truncation).
+// 6. execute() pipeline: the transport handles 401 → refresh → retry, then
+//    getPet is truncated. listPets runs its processor (shrinks → no truncation).
 const truncated = await parser.execute("getPet", { petId: "1" });
 console.log("execute(getPet):", truncated.status, truncated.size !== undefined ? `size=${truncated.size}` : "");
 const processed = await parser.execute("listPets", {});

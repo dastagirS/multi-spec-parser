@@ -131,7 +131,7 @@ node examples/basic.mjs                  # text → model → schemas
 node examples/multi-format.mjs           # OpenAPI, Swagger, and Discovery
 node examples/requests.mjs               # build + execute live requests
 node examples/llm-tools.mjs              # OpenAI-style tool definitions
-node examples/policies.mjs               # filters, processors, retry, validation
+node examples/policies.mjs               # filters, authenticated transport, processors
 node examples/consumer-media-upload.mjs  # Google media upload
 node examples/google-attachment-to-s3.mjs # Gmail attachment → S3
 ```
@@ -188,9 +188,9 @@ other graph features that cannot be represented safely as JSON.
 ## Policies and hooks
 
 `options.transforms` supports operation, schema, request, and response changes.
-Other hooks provide filtering, authentication refresh, response processing,
-truncation, extra LLM-visible parameters, and custom transport. They are
-consumer-owned; provider protocols and storage policies stay outside the
+Other hooks provide filtering, response processing, truncation, extra
+LLM-visible parameters, and custom transport. They are consumer-owned;
+provider protocols, authentication, and storage policies stay outside the
 package.
 
 ```ts
@@ -200,8 +200,7 @@ const parser = new MultiSpecParser({
     filterOps: (op) =>
       !["POST", "PUT", "PATCH", "DELETE"].includes(op.method) &&
       !DESTRUCTIVE.has(op.toolName),
-    onUnauthorized: async () => `Bearer ${await refreshToken()}`,
-    maxAuthRetries: 1,
+    transport: (request) => authenticatedClient.transport(request),
     maxResponseBytes: 250_000,
     onTruncate: (size, toolName) => logger.warn(`${toolName}: ${size} bytes`),
     describeMaxBytes: 20_000,
@@ -242,8 +241,9 @@ Hook semantics:
   failures become explicit error results and `execute()` does not throw. Their
   context exposes the final fully-read body as read-only `responseBodyBytes`;
   these bounded bytes never enter `ExecuteResult` unless a processor returns them.
-- `onUnauthorized` replaces `Authorization` and retries up to
-  `maxAuthRetries`; refresh failures do not loop.
+- `transport` owns authentication, credential refresh, and retry policy; use
+  the execution-local override for user-scoped clients and parser-instance
+  transport only for credentials intentionally shared by that parser.
 - `describeTools()` projects schemas for LLM budgets, replacing over-budget
   `$defs` with reference names in `$refs`.
 - `validate()` returns `{ valid: true }` or `{ valid: false, issues }` and loads
@@ -269,18 +269,16 @@ users or clients:
 
 ```ts
 const result = await parser.execute("listPets", {}, {
-  headers: await userClient.getHeaders(),
   transport: (request) => userClient.transport(request),
-  onUnauthorized: () => userClient.refreshAuthorization(),
-  runtimeContext: { userId, storageClient },
+  runtimeContext: { userId, storageClient, requestFollowUp: userClient.requestBounded },
 });
 ```
 
 Execution-local values take precedence over parser defaults and remain isolated
 from concurrent executions. `runtimeContext` is opaque and is passed only to
 request/response transforms and processor hooks; it never enters tool schemas,
-model arguments, logs, or serialized results. The parser still owns retries,
-processors, truncation, and response handling.
+model arguments, logs, or serialized results. The selected transport owns
+retries; the parser owns processors, truncation, and response handling.
 
 ## Options reference
 
@@ -293,7 +291,7 @@ processors, truncation, and response handling.
 | `runtimeContext` | runtime hooks during `execute()` | absent |
 | `executeTimeoutMs` | `execute()` | 30s |
 | `maxResponseBodyBytes` | `execute()` | 50MiB |
-| `processors`, `onUnauthorized`, `maxAuthRetries` | `execute()` | none / disabled / 1 |
+| `processors` | `execute()` | none |
 | `maxResponseBytes`, `onTruncate` | `execute()` | no cap / none |
 | `transforms` | parse/build/execute | none |
 | `cache` | `parse()` | enabled, bounded |

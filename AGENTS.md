@@ -14,6 +14,9 @@
   `ExtractedOperation` predicates; generated tool names are never selectors.
 - `runtimeContext` is execution-local opaque data for runtime transforms and
   processors only; it never enters schemas, model arguments, or parser state.
+- `RequestTransport` is the sole authentication and retry boundary: the parser
+  selects parser-instance or execution-local transport, but does not refresh
+  credentials, interpret 401 responses, or expose auth-specific retry hooks.
 - Fully read, bounded bytes from the final HTTP attempt are execution-local
   processor context only; incomplete/network-failure bodies stay absent, empty
   responses use a zero-length array, and raw bytes never enter transforms,

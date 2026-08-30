@@ -466,193 +466,127 @@ describe("401 retry (item 3)", () => {
     assert.deepEqual(result.data, { source: "parser" });
   });
 
-  it("uses the execution transport and refresh callback for both retry attempts", async () => {
-    const seenAuthorization: string[] = [];
-    let attempts = 0;
-    let parserTransportCalls = 0;
-    let parserRefreshCalls = 0;
+  it("returns a transport 401 without parser-owned authentication retries", async () => {
+    let calls = 0;
     const parser = new MultiSpecParser({
       spec: { spec: SPEC },
       options: {
-        headers: { Authorization: "Bearer parser-stale" },
         transport: async () => {
-          parserTransportCalls += 1;
-          throw new Error("parser transport must not be used");
-        },
-        onUnauthorized: () => {
-          parserRefreshCalls += 1;
-          return "Bearer parser-fresh";
+          calls += 1;
+          return new Response("expired", { status: 401 });
         },
       },
     });
     await parser.parse();
+    const result = await parser.execute("listPets", {});
+    assert.equal(result.status, "error");
+    assert.equal(result.httpStatus, 401);
+    assert.equal(calls, 1);
+  });
+
+  it("lets the execution transport own authentication retries", async () => {
+    const seenAuthorization: string[] = [];
+    let parserTransportCalls = 0;
+    const parser = new MultiSpecParser({
+      spec: { spec: SPEC },
+      options: {
+        headers: { Authorization: "Bearer stale" },
+        transport: async () => {
+          parserTransportCalls += 1;
+          throw new Error("parser transport must not be used");
+        },
+      },
+    });
+    await parser.parse();
+    let authorization = "Bearer stale";
     const result = await parser.execute("listPets", {}, {
       transport: async (request: TransportRequest) => {
-        attempts += 1;
-        seenAuthorization.push(request.headers.Authorization ?? "(none)");
-        if (attempts === 1) return new Response("expired", { status: 401 });
+        seenAuthorization.push(authorization);
+        const first = new Response("expired", { status: 401 });
+        if (first.status === 401) {
+          await first.body?.cancel();
+          authorization = "Bearer fresh";
+          seenAuthorization.push(authorization);
+        }
+        assert.equal(request.headers.Authorization, "Bearer stale");
         return new Response("{}", {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       },
-      onUnauthorized: () => "Bearer execution-fresh",
     });
     assert.equal(result.status, "success");
     assert.equal(parserTransportCalls, 0);
-    assert.equal(parserRefreshCalls, 0);
-    assert.deepEqual(seenAuthorization, ["Bearer parser-stale", "Bearer execution-fresh"]);
+    assert.deepEqual(seenAuthorization, ["Bearer stale", "Bearer fresh"]);
   });
 
-  it("isolates transports and refresh callbacks across concurrent executions", async () => {
+  it("isolates authenticated transports across concurrent executions", async () => {
     const seenAuthorization: Record<"A" | "B", string[]> = { A: [], B: [] };
-    const attempts: Record<"A" | "B", number> = { A: 0, B: 0 };
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const executeForUser = async (user: "A" | "B") =>
-      parser.execute("listPets", {}, {
-        headers: { Authorization: `Bearer ${user}-stale` },
-        transport: async (request: TransportRequest) => {
+    const executeForUser = async (user: "A" | "B") => {
+      let authorization = `Bearer ${user}-stale`;
+      return parser.execute("listPets", {}, {
+        transport: async () => {
           await new Promise<void>((resolve) => setImmediate(resolve));
-          attempts[user] += 1;
-          seenAuthorization[user]!.push(request.headers.Authorization ?? "(none)");
-          if (attempts[user] === 1) return new Response("expired", { status: 401 });
+          seenAuthorization[user].push(authorization);
+          authorization = `Bearer ${user}-fresh`;
+          seenAuthorization[user].push(authorization);
           return new Response(JSON.stringify({ user }), {
             status: 200,
             headers: { "content-type": "application/json" },
           });
         },
-        onUnauthorized: () => `Bearer ${user}-fresh`,
       });
+    };
     const [resultA, resultB] = await Promise.all([executeForUser("A"), executeForUser("B")]);
-    assert.equal(resultA.status, "success");
-    assert.equal(resultB.status, "success");
     assert.deepEqual(resultA.data, { user: "A" });
     assert.deepEqual(resultB.data, { user: "B" });
     assert.deepEqual(seenAuthorization.A, ["Bearer A-stale", "Bearer A-fresh"]);
     assert.deepEqual(seenAuthorization.B, ["Bearer B-stale", "Bearer B-fresh"]);
   });
 
-  it("retries once with the refreshed Authorization header", async () => {
+  it("keeps transport-owned refresh inside the parser request signal", async () => {
     let requests = 0;
-    const seenAuth: string[] = [];
+    const seenAuthorization: string[] = [];
     await withServer(
-      (req, res) => {
+      (request, response) => {
         requests += 1;
-        seenAuth.push(req.headers.authorization ?? "(none)");
+        seenAuthorization.push(request.headers.authorization ?? "(none)");
         if (requests === 1) {
-          res.statusCode = 401;
-          res.end("expired");
+          response.statusCode = 401;
+          response.end("expired");
           return;
         }
-        res.setHeader("content-type", "application/json");
-        res.end("{}");
+        response.setHeader("content-type", "application/json");
+        response.end("{}");
       },
       async (port) => {
-        let refreshes = 0;
+        let authorization = "Bearer stale";
+        const transport = async (request: TransportRequest): Promise<Response> => {
+          const send = () => fetch(request.url, {
+            method: request.method,
+            headers: { ...request.headers, Authorization: authorization },
+            body: request.body,
+            signal: request.signal,
+          });
+          let response = await send();
+          if (response.status === 401) {
+            await response.body?.cancel();
+            authorization = "Bearer fresh";
+            response = await send();
+          }
+          return response;
+        };
         const parser = new MultiSpecParser({
           spec: { spec: SPEC },
-          options: {
-            baseUrl: `http://127.0.0.1:${port}`,
-            headers: { Authorization: "Bearer stale" },
-            onUnauthorized: async () => {
-              refreshes += 1;
-              return "Bearer fresh";
-            },
-          },
+          options: { baseUrl: `http://127.0.0.1:${port}`, transport },
         });
         await parser.parse();
-        const res = await parser.execute("listPets", {});
-        assert.equal(res.status, "success");
-        assert.equal(refreshes, 1);
+        const result = await parser.execute("listPets", {});
+        assert.equal(result.status, "success");
         assert.equal(requests, 2);
-        assert.deepEqual(seenAuth, ["Bearer stale", "Bearer fresh"]);
-      },
-    );
-  });
-
-  it("a failed execution-local refresher returns an error without looping", async () => {
-    let attempts = 0;
-    let parserRefreshCalls = 0;
-    const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        onUnauthorized: () => {
-          parserRefreshCalls += 1;
-          return "Bearer parser-fresh";
-        },
-      },
-    });
-    await parser.parse();
-    const result = await parser.execute("listPets", {}, {
-      transport: async () => {
-        attempts += 1;
-        return new Response("expired", { status: 401 });
-      },
-      onUnauthorized: () => {
-        throw new Error("execution refresh failed");
-      },
-    });
-    assert.equal(result.status, "error");
-    assert.match(result.error ?? "", /execution refresh failed/);
-    assert.equal(attempts, 1);
-    assert.equal(parserRefreshCalls, 0);
-  });
-
-  it("maxAuthRetries: 0 disables the retry", async () => {
-    let requests = 0;
-    await withServer(
-      (req, res) => {
-        requests += 1;
-        res.statusCode = 401;
-        res.end("expired");
-      },
-      async (port) => {
-        let refreshes = 0;
-        const parser = new MultiSpecParser({
-          spec: { spec: SPEC },
-          options: {
-            baseUrl: `http://127.0.0.1:${port}`,
-            maxAuthRetries: 0,
-            onUnauthorized: async () => {
-              refreshes += 1;
-              return "Bearer x";
-            },
-          },
-        });
-        await parser.parse();
-        const res = await parser.execute("listPets", {});
-        assert.equal(res.status, "error");
-        assert.equal(res.httpStatus, 401);
-        assert.equal(refreshes, 0);
-        assert.equal(requests, 1);
-      },
-    );
-  });
-
-  it("a failing refresher degrades to an error result without looping", async () => {
-    let requests = 0;
-    await withServer(
-      (req, res) => {
-        requests += 1;
-        res.statusCode = 401;
-        res.end("expired");
-      },
-      async (port) => {
-        const parser = new MultiSpecParser({
-          spec: { spec: SPEC },
-          options: {
-            baseUrl: `http://127.0.0.1:${port}`,
-            onUnauthorized: async () => {
-              throw new Error("refresh failed");
-            },
-          },
-        });
-        await parser.parse();
-        const res = await parser.execute("listPets", {});
-        assert.equal(res.status, "error");
-        assert.match(res.error ?? "", /refresh failed/);
-        assert.equal(requests, 1, "no retry after a failed refresh");
+        assert.deepEqual(seenAuthorization, ["Bearer stale", "Bearer fresh"]);
       },
     );
   });
@@ -839,8 +773,8 @@ describe("option validation guards", () => {
       { processors: { x: "not a fn" } },
       { processors: [{ matches: "not a fn", process: async () => ({ status: "success", data: null, httpStatus: 200 }) }] },
       { extraParameterRules: {} },
-      { onUnauthorized: "not a fn" },
-      { maxAuthRetries: -1 },
+      { onUnauthorized: () => "Bearer removed" },
+      { maxAuthRetries: 1 },
       { maxResponseBytes: 0 },
       { describeMaxBytes: -5 },
       { defaultPolicy: "other" },
