@@ -57,7 +57,7 @@ function validateOperation(
   assert(operation !== null && typeof operation === "object", "operation must be an object");
   assert(typeof location === "string" && location.length > 0, "operation location must be non-empty");
   if (typeof operation.operationKey !== "string" || operation.operationKey.length === 0) add("missingOperationKey", location, "operationKey must be non-empty");
-  if (typeof operation.toolName !== "string" || operation.toolName.length === 0) add("missingToolName", location, "toolName must be non-empty");
+  if (typeof operation.operationName !== "string" || operation.operationName.length === 0) add("missingToolName", location, "operationName must be non-empty");
   if (!VALID_METHODS.has(operation.method)) add("invalidMethod", location, `unsupported method ${String(operation.method)}`);
   if (typeof operation.path !== "string" || !operation.path.startsWith("/")) add("invalidPath", location, "path must start with /");
   if (VALID_METHODS.has(operation.method) && typeof operation.path === "string" && operation.path.startsWith("/") && operation.operationKey !== `${operation.method} ${operation.path}`) {

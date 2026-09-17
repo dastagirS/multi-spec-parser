@@ -1,22 +1,22 @@
 /**
- * Standard Schema + Standard JSON Schema adapter for compiled tool inputs.
+ * Standard Schema + Standard JSON Schema adapter for compiled operation inputs.
  *
- * The adapter keeps the tool's plain JSON Schema as the canonical source. It
+ * The adapter keeps the operation's plain JSON Schema as the canonical source. It
  * adds an in-process validator and dialect-aware schema projections without
- * changing the MCP/Executor-facing inputSchema object.
+ * changing the canonical operation inputSchema object.
  */
 import assert from "node:assert/strict";
 import addFormatsModule from "ajv-formats";
 import { Ajv } from "ajv";
 import type { ErrorObject, ValidateFunction } from "ajv";
-import type { CompiledTool } from "./factory.js";
+import type { CompiledOperation } from "./operation-compiler.js";
 import {
   cloneForDefaultApplication,
   createStandardSchemaAdapter,
   type DefaultPolicy,
   type StandardSchemaAdapterOptions,
+  type StandardSchema,
   type StandardSchemaIssue,
-  type StandardSchemaLike,
 } from "./standard-schema-adapter.js";
 import { registerOpenApiFormats, resolveAjvFormatsPlugin } from "./openapi-formats.js";
 
@@ -26,6 +26,7 @@ export type {
   StandardJsonSchemaOptions,
   StandardJsonSchemaTarget,
   StandardSchemaAdapterOptions,
+  StandardSchema,
   StandardSchemaIssue,
   StandardSchemaLike,
   StandardSchemaOptions,
@@ -37,29 +38,29 @@ const MAX_AJV_ERRORS = 1_000_000;
 const MAX_INSTANCE_PATH_LENGTH = 16 * 1024;
 const ajv = createAjv(false);
 const defaultingAjv = createAjv(true);
-const wrappers = new WeakMap<CompiledTool, Map<DefaultPolicy, StandardSchemaLike>>();
-const validators = new WeakMap<CompiledTool, Map<DefaultPolicy, ValidateFunction>>();
+const wrappers = new WeakMap<CompiledOperation, Map<DefaultPolicy, StandardSchema>>();
+const validators = new WeakMap<CompiledOperation, Map<DefaultPolicy, ValidateFunction>>();
 
-/** Wrap a compiled tool's input schema with synchronous validation and JSON
- *  Schema projections. Memoization avoids recompiling Ajv for the same tool. */
+/** Wrap a compiled operation's input schema with synchronous validation and JSON
+ *  Schema projections. Memoization avoids recompiling Ajv for the same operation. */
 export function toStandardSchema(
-  tool: CompiledTool,
+  operation: CompiledOperation,
   options: StandardSchemaAdapterOptions = {},
-): StandardSchemaLike {
-  assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
-  assert(typeof tool.name === "string" && tool.name.length > 0, "compiled tool name must be non-empty");
+): StandardSchema {
+  assert(operation !== null && typeof operation === "object", "compiled operation must be an object");
+  assert(typeof operation.name === "string" && operation.name.length > 0, "compiled operation name must be non-empty");
   assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
   const defaultPolicy = options.defaultPolicy ?? "preserve";
   assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
-  let cachedWrappers = wrappers.get(tool);
+  let cachedWrappers = wrappers.get(operation);
   if (!cachedWrappers) {
     cachedWrappers = new Map();
-    wrappers.set(tool, cachedWrappers);
+    wrappers.set(operation, cachedWrappers);
   }
   const cached = cachedWrappers.get(defaultPolicy);
   if (cached) return cached;
-  const validate = getValidator(tool, defaultPolicy);
-  const wrapper = createStandardSchemaAdapter(tool, (value) => {
+  const validate = getValidator(operation, defaultPolicy);
+  const wrapper = createStandardSchemaAdapter(operation, (value) => {
     try {
       const candidate = defaultPolicy === "apply" ? cloneForDefaultApplication(value) : value;
       if (validate(candidate)) return { value: candidate };
@@ -81,17 +82,17 @@ function createAjv(useDefaults: boolean): Ajv {
   return instance;
 }
 
-function getValidator(tool: CompiledTool, defaultPolicy: DefaultPolicy): ValidateFunction {
-  assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
+function getValidator(operation: CompiledOperation, defaultPolicy: DefaultPolicy): ValidateFunction {
+  assert(operation !== null && typeof operation === "object", "compiled operation must be an object");
   assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
-  let cachedValidators = validators.get(tool);
+  let cachedValidators = validators.get(operation);
   if (!cachedValidators) {
     cachedValidators = new Map();
-    validators.set(tool, cachedValidators);
+    validators.set(operation, cachedValidators);
   }
   const cached = cachedValidators.get(defaultPolicy);
   if (cached) return cached;
-  const compiled = (defaultPolicy === "apply" ? defaultingAjv : ajv).compile(tool.inputSchema as object);
+  const compiled = (defaultPolicy === "apply" ? defaultingAjv : ajv).compile(operation.inputSchema as object);
   cachedValidators.set(defaultPolicy, compiled);
   return compiled;
 }

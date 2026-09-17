@@ -1,5 +1,5 @@
 /**
- * Quick start: one class owns the whole lifecycle — config → parse → tools.
+ * Quick start: parse one API description into operation-level JSON Schemas.
  *
  * Run: node examples/basic.mjs
  * (In-repo this self-references the package; after `npm install
@@ -57,29 +57,22 @@ components:
         tag: { type: string }
 `;
 
-// Construct with the spec source — url, text, or a pre-parsed object.
-// (text is JSON or YAML; content is sniffed, never the file extension.)
+// Construct with JSON/YAML text or a pre-parsed object.
 const parser = new MultiSpecParser({ spec: { text: yaml } });
 
-// Load + parse (idempotent — repeated calls return the cached model).
-// parse() returns the RAW document, typed to the input spec; the compiled
-// tools + model live on the parser.
-await parser.parse();
+const operations = await parser.parse();
 console.log("format:", parser.format);
-console.log("operations:", parser.tools().length, "| baseUrl:", parser.baseUrl);
+console.log("operations:", operations.length, "| baseUrl:", parser.baseUrl);
 
-// Memory-safe tool definitions: each tool's schema carries only its own
-// reachable $ref closure as $defs, not the whole spec.
-const tools = parser.tools();
-for (const tool of tools) {
-  const inputBytes = JSON.stringify(tool.inputSchema).length;
-  const defsBytes = JSON.stringify(tool.inputSchema.$defs ?? {}).length;
+// Each operation carries only the definitions reachable from its input and
+// output schemas. Compact projections replace over-budget closures with names.
+for (const operation of await parser.parse({ compact: true, maxBytes: 4_000 })) {
+  const inputBytes = new TextEncoder().encode(JSON.stringify(operation.inputSchema)).byteLength;
   console.log(
-    `  ${tool.name.padEnd(10)} input=${String(inputBytes).padStart(4)}B ` +
-      `defs=${String(defsBytes).padStart(4)}B  (shared map: ${Object.keys(parser.defs).length} schemas)`,
+    `  ${operation.name.padEnd(10)} ${operation.method.padEnd(5)} ${operation.path} ` +
+      `input=${inputBytes}B`,
   );
 }
 
-// Look up a tool by name; build a request; execute.
-const req = parser.buildRequest("getPet", { petId: "42" });
-console.log("request:", req.method, req.url);
+const getPet = await parser.operation("getPet");
+console.log("getPet schema:", JSON.stringify(getPet?.inputSchema));

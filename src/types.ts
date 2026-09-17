@@ -76,7 +76,7 @@ export interface SchemaObject {
 export interface NormalizedParameter {
   /** Original parameter name used on the wire. */
   name: string;
-  /** Model-facing input name; assigned during tool compilation when needed. */
+  /** Collision-safe input name assigned during operation projection. */
   inputName?: string;
   in: ParamLocation;
   required: boolean;
@@ -118,8 +118,8 @@ export interface ServerInfo {
 export interface ExtractedOperation {
   /** Stable operation identity derived from method + path, independent of display naming. */
   operationKey: string;
-  /** LLM-facing tool name derived from operationId or method+path. */
-  toolName: string;
+  /** Operation name derived from operationId or method and path. */
+  operationName: string;
   method: HttpMethod;
   /** Path template, e.g. /users/{userId}/messages. */
   path: string;
@@ -128,7 +128,7 @@ export interface ExtractedOperation {
   tags: string[];
   parameters: NormalizedParameter[];
   requestBody?: NormalizedRequestBody;
-  /** Schema of the success response body (output contract for the LLM). */
+  /** Schema of the successful response body. */
   outputSchema?: SchemaObject;
   deprecated: boolean;
   /** Servers for this operation (op-level, else path-level, else document). */

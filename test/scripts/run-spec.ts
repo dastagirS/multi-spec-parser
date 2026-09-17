@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Ajv } from "ajv";
 
-import { compileSpecToTools } from "../../src/factory.js";
+import { compileSpecToOperations } from "../../src/operation-compiler.js";
 import { parseSpec, parseSpecText } from "../../src/parse-spec.js";
 
 const fixturePath = (name: string): string =>
@@ -62,14 +62,14 @@ if (expectedOps !== undefined && parsed.operations.length !== expectedOps) {
 const t1 = performance.now();
 let compiled;
 try {
-  compiled = compileSpecToTools(parsed, maxDefsBytes !== undefined ? { maxDefsBytes } : {});
+  compiled = compileSpecToOperations(parsed, maxDefsBytes !== undefined ? { maxDefsBytes } : {});
 } catch (err) {
   console.log(`RESULT_JSON: ${JSON.stringify({ fatal: "compile", error: String(err) })}`);
   process.exit(1);
 }
 stats.compileMs = Math.round(performance.now() - t1);
 
-// Phase 3: per-tool schema stats + ref integrity
+// Phase 3: per-operation schema stats + ref integrity
 const ajv = new Ajv({ strict: false, validateFormats: false, validateSchema: false });
 let ajvCompileFailures = 0;
 let refResolutionFailures = 0;
@@ -83,37 +83,37 @@ let defsCountTotal = 0;
 let unresolvedRefsTotal = 0;
 const failures: string[] = [];
 
-for (const tool of compiled.tools) {
-  const inputBytes = JSON.stringify(tool.inputSchema).length;
+for (const operation of compiled.operations) {
+  const inputBytes = JSON.stringify(operation.inputSchema).length;
   inputSchemaBytesTotal += inputBytes;
   inputSchemaBytesMax = Math.max(inputSchemaBytesMax, inputBytes);
 
-  const defs = (tool.inputSchema.$defs ?? {}) as Record<string, unknown>;
+  const defs = (operation.inputSchema.$defs ?? {}) as Record<string, unknown>;
   const defsBytes = JSON.stringify(defs).length;
   defsBytesTotal += defsBytes;
   defsBytesMax = Math.max(defsBytesMax, defsBytes);
   defsCountTotal += Object.keys(defs).length;
 
-  if (tool.outputSchema) outputSchemaCount += 1;
-  unresolvedRefsTotal += tool.unresolvedRefs?.length ?? 0;
+  if (operation.outputSchema) outputSchemaCount += 1;
+  unresolvedRefsTotal += operation.unresolvedRefs?.length ?? 0;
 
   // Every #/ ref in input + output + defs must be a #/$defs/X that exists locally.
-  const schema = { ...tool.inputSchema, ...(tool.outputSchema ? { out: tool.outputSchema } : {}) };
-  refResolutionFailures += checkRefs(schema, defs, tool.name, failures, "resolution");
-  refRewriteFailures += checkRefRewrite(tool.inputSchema, tool.name, failures);
+  const schema = { ...operation.inputSchema, ...(operation.outputSchema ? { out: operation.outputSchema } : {}) };
+  refResolutionFailures += checkRefs(schema, defs, operation.name, failures, "resolution");
+  refRewriteFailures += checkRefRewrite(operation.inputSchema, operation.name, failures);
 
   try {
     // Belt-and-braces: the library converts OAS `nullable` to type-arrays /
     // anyOf at compile time (PR4), so nothing should remain — but if a schema
     // slips one through, strip it so the Ajv gate measures real failures.
-    ajv.compile(stripNullable(tool.inputSchema) as object);
+    ajv.compile(stripNullable(operation.inputSchema) as object);
   } catch (err) {
     ajvCompileFailures += 1;
-    if (failures.length < 10) failures.push(`${tool.name}: ajv ${String(err)}`);
+    if (failures.length < 10) failures.push(`${operation.name}: ajv ${String(err)}`);
   }
 }
 
-stats.tools = compiled.tools.length;
+stats.operations = compiled.operations.length;
 stats.inputSchemaBytesTotal = inputSchemaBytesTotal;
 stats.inputSchemaBytesMax = inputSchemaBytesMax;
 stats.defsBytesTotal = defsBytesTotal;
@@ -133,7 +133,7 @@ process.exit(0);
 
 /** Remove OAS-only `nullable` keys (Ajv treats it as a JSON-Schema keyword).
  *  Mutates in place — the probe's schemas are throwaway, and a deep copy per
- *  tool would spike heap (Stripe: 60MB → 520MB on 589 tools). */
+ *  operation would spike heap (Stripe: 60MB → 520MB on 589 operations). */
 function stripNullable(node: unknown): unknown {
   if (Array.isArray(node)) {
     for (const item of node) stripNullable(item);
@@ -151,11 +151,11 @@ function stripNullable(node: unknown): unknown {
   return node;
 }
 
-/** Verify every $ref resolves within the tool's own $defs (transitively). */
+/** Verify every $ref resolves within the operation's own $defs (transitively). */
 function checkRefs(
   node: unknown,
   defs: Record<string, unknown>,
-  toolName: string,
+  operationName: string,
   failures: string[],
   phase: string,
 ): number {
@@ -166,7 +166,7 @@ function checkRefs(
         const name = value.slice("#/$defs/".length);
         if (!(name in defs)) {
           count += 1;
-          if (failures.length < 10) failures.push(`${toolName}: dangling ${phase} $ref ${value}`);
+          if (failures.length < 10) failures.push(`${operationName}: dangling ${phase} $ref ${value}`);
         }
       }
       return;
@@ -183,8 +183,8 @@ function checkRefs(
   return count;
 }
 
-/** No leftover native refs (#/components/schemas, #/definitions) in tool schemas. */
-function checkRefRewrite(node: unknown, toolName: string, failures: string[]): number {
+/** No leftover native refs (#/components/schemas, #/definitions) in operation schemas. */
+function checkRefRewrite(node: unknown, operationName: string, failures: string[]): number {
   let count = 0;
   const walk = (value: unknown): void => {
     if (typeof value === "string") {
@@ -193,7 +193,7 @@ function checkRefRewrite(node: unknown, toolName: string, failures: string[]): n
         value.startsWith("#/definitions/")
       ) {
         count += 1;
-        if (failures.length < 10) failures.push(`${toolName}: unrewritten ref ${value}`);
+        if (failures.length < 10) failures.push(`${operationName}: unrewritten ref ${value}`);
       }
       return;
     }

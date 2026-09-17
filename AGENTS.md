@@ -10,28 +10,50 @@
 
 ## API Decisions
 
-- Consumer-added model inputs use ordered `extraParameterRules`, matching
-  `ExtractedOperation` predicates; generated tool names are never selectors.
-- `runtimeContext` is execution-local opaque data for runtime transforms and
-  processors only; it never enters schemas, model arguments, or parser state.
-- `RequestTransport` is the sole authentication and retry boundary: the parser
-  selects parser-instance or execution-local transport, but does not refresh
-  credentials, interpret 401 responses, or expose auth-specific retry hooks.
-- Fully read, bounded bytes from the final HTTP attempt are execution-local
-  processor context only; incomplete/network-failure bodies stay absent, empty
-  responses use a zero-length array, and raw bytes never enter transforms,
-  parser state, or `ExecuteResult` unless a processor explicitly returns them.
-- Canonical compiled tools retain their combined input/output definition closure;
-  Standard JSON Schema projections independently expose only definitions
-  reachable from their respective input or output root.
-- `options.lazy` is an opt-in experiment for URL/text source indexing and
-  on-demand tool compilation; OpenAPI YAML sources use operation/component
-  fragments while unsupported layouts fall back to full source materialization,
-  object sources remain caller-owned, and full materialization
-  is still required by `tools()`/`describeTools()`; compile-time
-  filters/transforms must be deterministic because lazy materialization may
-  reapply them; `load()` is the no-raw-document low-memory entry path and
-  rejects unsupported text layouts rather than violating that guarantee.
+- Do not prepare another release until parser robustness gates are explicitly
+  agreed and passing; API cleanup alone is not release readiness.
+- The package parses and projects API descriptions only. Apart from bounded URL
+  source loading, it does not build requests, execute operations, manage
+  authentication, process responses, or inject consumer-owned fields into
+  source models.
+- Canonical public units are compiled operations, not LLM tools. LLM/provider
+  formats may be separate adapters but never define the parser's domain model.
+- Sources are caller-provided URLs, JSON/YAML text, or parsed objects. URL
+  loading is a bounded parser convenience with cancellation; authentication,
+  retries, custom transports, and source caches remain caller-owned.
+- Low-memory loading means indexing a large source document without
+  materializing its complete parsed or normalized model, then materializing
+  requested operations and transitive schema references on demand. Object
+  sources cannot satisfy this contract because callers already own them;
+  unsupported formats/layouts must reject rather than fall back to eager parsing.
+  URL sources may use bounded temporary files as seekable backing storage;
+  idempotent `close()` owns deterministic cleanup, loading failures clean up
+  automatically, and lazy access after closing must reject. Lazy URL loading is
+  required for JSON sources in all three supported formats—OpenAPI 3.x, Swagger
+  2.0, and Google Discovery—through dedicated format indexers. OpenAPI 3.x block
+  YAML also remains supported. Support may ship incrementally, and any encoding
+  or layout not yet indexed must reject. `options.lazy: true` selects this mode;
+  omitted or false remains eager.
+- Canonical operation schemas retain their combined input/output definition
+  closure; Standard JSON Schema projections independently expose only
+  definitions reachable from their respective input or output root.
+- `parse({ compact: true, maxBytes })` creates bounded copies without mutating
+  canonical operations. Budgets use serialized UTF-8 bytes.
+- Standard Schema adapters expose ergonomic `validate()`, `input()`, and
+  `output()` methods; `~standard` remains only for ecosystem interoperability.
+- Canonical schemas remain private normalized JSON Schema. Public operation
+  schemas expose bounded compact TypeScript preview strings, separate referenced
+  type definitions, and lazy memoized validation against the canonical schema.
+  Preview rendering degrades to `unknown` beyond safety limits. Do not introduce
+  a second validation model or custom type AST.
+- Runtime validation must remain Ajv-free and dependency-free. Build a bounded
+  targeted validator available only through parser-produced operation input and
+  output handles; never expose arbitrary-schema validation, claim support for
+  arbitrary JSON Schema, or silently ignore unsupported assertion keywords.
+- Zod is out of scope and must not be shipped or exposed. Prioritize bounded
+  low-memory source loading before adding further schema adapters.
+- Object sources remain caller-owned and are never mutated. Arbitrary compile
+  transforms and consumer-added parameters are intentionally unsupported.
 
 ## Naming
 

@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
+import { open, type FileHandle } from "node:fs/promises";
 
-import type { ToolLocator, ToolNameIndex } from "./factory.js";
+import { createJsonLazySourceIndex } from "./lazy-json-source-index.js";
 import { parseSpecText } from "./parse-spec.js";
 import {
-  assignUniqueToolName,
-  createUniqueToolNameState,
+  assignUniqueOperationName,
+  createUniqueOperationNameState,
   deriveOperationKey,
-  deriveToolName,
-  TOOL_NAME_LOOKUP_LENGTH_MAX,
-} from "./tool-names.js";
+  deriveOperationName,
+} from "./operation-names.js";
 import type { SpecFormat } from "./types.js";
 
 const HTTP_METHOD_ORDER = ["get", "put", "post", "patch", "delete", "head", "options", "trace"] as const;
@@ -18,6 +18,22 @@ const PATH_ITEM_KEYS = ["$ref", "summary", "description", "servers", "parameters
 const COMPONENT_REFERENCE_COUNT_MAX = 100_000;
 const INDEX_ENTRY_COUNT_MAX = 1_000_000;
 const SOURCE_BYTES_MAX = 200 * 1024 * 1024;
+const SOURCE_LINE_BYTES_MAX = 16 * 1024 * 1024;
+const SOURCE_FRAGMENT_BYTES_MAX = 32 * 1024 * 1024;
+const OPERATION_NAME_LOOKUP_LENGTH_MAX = 16 * 1024 * 1024;
+
+export interface LazyOperationLocator {
+  readonly name: string;
+  readonly path: string;
+  readonly method: string;
+  readonly operationKey: string;
+}
+
+export interface LazyOperationIndex {
+  readonly size: number;
+  names(): string[];
+  get(name: string): LazyOperationLocator | undefined;
+}
 
 type SourceRange = { start: number; end: number; indent: number };
 
@@ -33,7 +49,8 @@ interface IndexedPath {
 }
 
 interface IndexedSource {
-  text: string;
+  filePath: string;
+  size: number;
   topLevel: Map<string, SourceRange>;
   paths: Map<string, IndexedPath>;
   components: Map<string, SourceRange>;
@@ -73,80 +90,139 @@ interface ParsedLine {
 export interface LazySourceIndex {
   readonly specFormat: SpecFormat;
   readonly baseUrl: string;
-  createToolNameIndex(): ToolNameIndex;
-  materialize(locator: ToolLocator): Record<string, unknown>;
+  createOperationIndex(): LazyOperationIndex;
+  materialize(locator: LazyOperationLocator): Promise<Record<string, unknown>>;
+  close(): Promise<void>;
 }
 
-export function createLazySourceIndex(
-  sourceText: string,
-  specFormat?: SpecFormat,
-): LazySourceIndex | undefined {
-  assert(typeof sourceText === "string", "source text must be a string");
-  assert(specFormat === undefined || typeof specFormat === "string", "spec format must be a string or undefined");
-  if (Buffer.byteLength(sourceText, "utf8") > SOURCE_BYTES_MAX || looksLikeJson(sourceText)) return undefined;
-  const source = indexYamlSource(sourceText);
-  if (!source || (specFormat !== undefined && specFormat !== "openapi3")) return undefined;
-  if (!isOpenApi3(source) || source.paths.size === 0) return undefined;
-  return new OpenApiSourceIndex(source);
+export async function createLazySourceIndex(
+  filePath: string,
+  sourceSize: number,
+): Promise<LazySourceIndex> {
+  assert(typeof filePath === "string" && filePath.length > 0, "source path must be non-empty");
+  assert(Number.isInteger(sourceSize) && sourceSize > 0, "source size must be positive");
+  if (sourceSize > SOURCE_BYTES_MAX) throw new Error(`Lazy source index: source exceeds ${SOURCE_BYTES_MAX} bytes.`);
+  if (await startsWithJsonObject(filePath, sourceSize)) {
+    return createJsonLazySourceIndex(filePath, sourceSize);
+  }
+  const source = await indexYamlSource(filePath, sourceSize);
+  if (!source || !(await isOpenApi3(source)) || source.paths.size === 0) {
+    throw new Error("MultiSpecParser: lazy mode supports only indexable OpenAPI 3.x YAML URL sources.");
+  }
+  return OpenApiSourceIndex.create(source);
+}
+
+async function startsWithJsonObject(filePath: string, sourceSize: number): Promise<boolean> {
+  assert(typeof filePath === "string" && filePath.length > 0, "source path must be non-empty");
+  assert(Number.isInteger(sourceSize) && sourceSize > 0, "source size must be positive");
+  const file = await open(filePath, "r");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  try {
+    if (sourceSize >= 3) {
+      const marker = Buffer.allocUnsafe(3);
+      const { bytesRead } = await file.read(marker, 0, marker.byteLength, 0);
+      if (bytesRead === 3 && marker[0] === 0xef && marker[1] === 0xbb && marker[2] === 0xbf) position = 3;
+    }
+    while (position < sourceSize) {
+      const requested = Math.min(chunk.byteLength, sourceSize - position);
+      const { bytesRead } = await file.read(chunk, 0, requested, position);
+      if (bytesRead === 0) return false;
+      let index = 0;
+      while (index < bytesRead) {
+        const byte = chunk[index]!;
+        if (byte !== 9 && byte !== 10 && byte !== 13 && byte !== 32) return byte === 123;
+        index += 1;
+      }
+      position += bytesRead;
+    }
+    return false;
+  } finally {
+    await file.close();
+  }
 }
 
 class OpenApiSourceIndex implements LazySourceIndex {
   readonly specFormat = "openapi3" as const;
   readonly baseUrl: string;
   private readonly source: IndexedSource;
+  private readonly file: FileHandle;
+  private closed = false;
 
-  constructor(source: IndexedSource) {
+  private constructor(source: IndexedSource, file: FileHandle, baseUrl: string) {
     assert(source.paths.size > 0, "indexed source must contain paths");
-    assert(source.topLevel.has("openapi"), "indexed source must contain an OpenAPI version");
+    assert(file.fd >= 0, "indexed source file must be open");
     this.source = source;
-    this.baseUrl = readBaseUrl(source);
+    this.file = file;
+    this.baseUrl = baseUrl;
   }
 
-  createToolNameIndex(): ToolNameIndex {
-    assert(this.source.paths.size > 0, "indexed source must contain paths");
+  static async create(source: IndexedSource): Promise<OpenApiSourceIndex> {
+    assert(source.paths.size > 0, "indexed source must contain paths");
+    assert(source.topLevel.has("openapi"), "indexed source must contain an OpenAPI version");
+    const file = await open(source.filePath, "r");
+    try {
+      const baseUrl = await readBaseUrl(file, source);
+      return new OpenApiSourceIndex(source, file, baseUrl);
+    } catch (error: unknown) {
+      await file.close();
+      throw error;
+    }
+  }
+
+  createOperationIndex(): LazyOperationIndex {
+    assert(!this.closed, "lazy source must be open");
     assert(this.source.paths.size <= COMPONENT_REFERENCE_COUNT_MAX, "indexed source contains too many paths");
-    const locators = new Map<string, ToolLocator>();
-    const uniqueNames = createUniqueToolNameState();
+    const locators = new Map<string, LazyOperationLocator>();
+    const uniqueNames = createUniqueOperationNameState();
     for (const [path, indexedPath] of this.source.paths) {
       for (const method of HTTP_METHOD_ORDER) {
         const operation = indexedPath.operations.find((candidate) => candidate.method === method);
         if (!operation) continue;
         const operationKey = deriveOperationKey(operation.method, path);
-        const candidate = deriveToolName(operation.operationId, operation.method, path);
-        const name = assignUniqueToolName(candidate, uniqueNames);
+        const candidate = deriveOperationName(operation.operationId, operation.method, path);
+        const name = assignUniqueOperationName(candidate, uniqueNames);
         locators.set(name, { name, path, method: operation.method.toUpperCase(), operationKey });
       }
     }
     assert(locators.size > 0, "indexed source must contain operations");
-    return createMapToolNameIndex(locators);
+    return createMapOperationIndex(locators);
   }
 
-  materialize(locator: ToolLocator): Record<string, unknown> {
-    assert(locator !== null && typeof locator === "object", "source locator must be an object");
+  async materialize(locator: LazyOperationLocator): Promise<Record<string, unknown>> {
+    assert(!this.closed, "lazy source must be open");
     assert(typeof locator.path === "string" && locator.path.startsWith("/"), "source locator path must start with /");
     const indexedPath = this.source.paths.get(locator.path);
     if (!indexedPath) throw new Error(`Lazy source index: unknown path "${locator.path}".`);
-    const parsedPath = parseFragment(this.source.text, indexedPath.range);
+    const parsedPath = await parseFragment(this.file, indexedPath.range);
     const pathItem = parsedPath[locator.path];
     if (!isRecord(pathItem)) throw new Error(`Lazy source index: path "${locator.path}" is not an object.`);
     const method = locator.method.toLowerCase();
     if (!isRecord(pathItem[method])) throw new Error(`Lazy source index: operation "${locator.operationKey}" is missing.`);
     const selectedPath = selectPathItem(pathItem, method);
-    const document = this.readMetadata();
+    const document = await this.readMetadata();
     document.paths = { [locator.path]: selectedPath };
-    this.addReferencedComponents(document, selectedPath);
+    await this.addReferencedComponents(document, selectedPath);
     assert(isRecord(document.paths), "fragment document must contain paths");
     return document;
   }
 
-  private readMetadata(): Record<string, unknown> {
-    assert(this.source.topLevel.size > 0, "indexed source must contain metadata");
+  async close(): Promise<void> {
+    assert(typeof this.closed === "boolean", "closed state must be boolean");
+    assert(this.file.fd >= -1, "file descriptor state must be valid");
+    if (this.closed) return;
+    this.closed = true;
+    await this.file.close();
+  }
+
+  private async readMetadata(): Promise<Record<string, unknown>> {
+    assert(!this.closed, "lazy source must be open");
     assert(this.source.topLevel.has("info"), "indexed source must contain info");
     const document: Record<string, unknown> = {};
     for (const name of METADATA_KEYS) {
       const range = this.source.topLevel.get(name);
       if (!range) continue;
-      const fragment = parseFragment(this.source.text, range);
+      const fragment = await parseFragment(this.file, range);
       if (Object.prototype.hasOwnProperty.call(fragment, name)) document[name] = fragment[name];
     }
     if (typeof document.openapi !== "string" || !isRecord(document.info)) {
@@ -155,7 +231,10 @@ class OpenApiSourceIndex implements LazySourceIndex {
     return document;
   }
 
-  private addReferencedComponents(document: Record<string, unknown>, root: Record<string, unknown>): void {
+  private async addReferencedComponents(
+    document: Record<string, unknown>,
+    root: Record<string, unknown>,
+  ): Promise<void> {
     assert(isRecord(document), "fragment document must be an object");
     assert(isRecord(root), "reference root must be an object");
     const components = Object.create(null) as Record<string, Record<string, unknown>>;
@@ -170,7 +249,7 @@ class OpenApiSourceIndex implements LazySourceIndex {
       const category = components[reference.kind] ??
         (components[reference.kind] = Object.create(null) as Record<string, unknown>);
       if (Object.prototype.hasOwnProperty.call(category, reference.name)) continue;
-      const value = parseFragment(this.source.text, range)[reference.name];
+      const value = (await parseFragment(this.file, range))[reference.name];
       if (value === undefined) continue;
       category[reference.name] = value;
       if (value !== null && typeof value === "object") pending.push(...collectComponentRefs(value));
@@ -179,18 +258,15 @@ class OpenApiSourceIndex implements LazySourceIndex {
   }
 }
 
-function createMapToolNameIndex(locators: Map<string, ToolLocator>): ToolNameIndex {
-  assert(locators instanceof Map, "tool locators must be a map");
-  assert(locators.size > 0, "tool locators must be non-empty");
+function createMapOperationIndex(locators: Map<string, LazyOperationLocator>): LazyOperationIndex {
+  assert(locators instanceof Map, "operation locators must be a map");
+  assert(locators.size > 0, "operation locators must be non-empty");
   return {
-    has(name: string): boolean {
-      assert(typeof name === "string", "tool name must be a string");
-      assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
-      return locators.has(name);
-    },
-    get(name: string): ToolLocator | undefined {
-      assert(typeof name === "string", "tool name must be a string");
-      assert(name.length <= TOOL_NAME_LOOKUP_LENGTH_MAX, "tool name exceeds the lookup length limit");
+    size: locators.size,
+    names: () => [...locators.keys()],
+    get(name: string): LazyOperationLocator | undefined {
+      assert(typeof name === "string", "operation name must be a string");
+      assert(name.length <= OPERATION_NAME_LOOKUP_LENGTH_MAX, "operation name exceeds the lookup length limit");
       return locators.get(name);
     },
   };
@@ -273,31 +349,77 @@ function componentKey(kind: string, name: string): string {
   return `${kind}\u0000${name}`;
 }
 
-function indexYamlSource(sourceText: string): IndexedSource | undefined {
-  assert(typeof sourceText === "string", "source text must be a string");
-  assert(sourceText.length > 0, "source text must be non-empty");
+async function indexYamlSource(
+  filePath: string,
+  sourceSize: number,
+): Promise<IndexedSource | undefined> {
+  assert(typeof filePath === "string" && filePath.length > 0, "source path must be non-empty");
+  assert(Number.isInteger(sourceSize) && sourceSize > 0, "source size must be positive");
   const source: IndexedSource = {
-    text: sourceText,
+    filePath,
+    size: sourceSize,
     topLevel: new Map(),
     paths: new Map(),
     components: new Map(),
   };
   const state: ScanState = { supported: true };
-  let position = sourceText.charCodeAt(0) === 0xfeff ? 1 : 0;
-  while (position < sourceText.length && state.supported) {
-    const lineEnd = findLineEnd(sourceText, position);
-    const contentEnd = trimCarriageReturn(sourceText, position, lineEnd);
-    const line = readLine(sourceText, position, contentEnd);
-    if (!line.valid) return undefined;
-    processIndexedLine(source, state, line, position);
-    position = lineEnd < sourceText.length ? lineEnd + 1 : sourceText.length;
+  const file = await open(filePath, "r");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  try {
+    let filePosition = 0;
+    while (filePosition < sourceSize && state.supported) {
+      const requested = Math.min(chunk.byteLength, sourceSize - filePosition);
+      const { bytesRead } = await file.read(chunk, 0, requested, filePosition);
+      if (bytesRead === 0) break;
+      filePosition += bytesRead;
+      const combined = pending.byteLength === 0
+        ? Buffer.from(chunk.subarray(0, bytesRead))
+        : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      let lineOffset = 0;
+      for (let newline = combined.indexOf(10, lineOffset); newline >= 0; newline = combined.indexOf(10, lineOffset)) {
+        processLineBytes(source, state, combined.subarray(lineOffset, newline), pendingStart + lineOffset);
+        lineOffset = newline + 1;
+        if (!state.supported) break;
+      }
+      pending = Buffer.from(combined.subarray(lineOffset));
+      pendingStart += lineOffset;
+      if (pending.byteLength > SOURCE_LINE_BYTES_MAX) {
+        throw new Error(`Lazy source index: line exceeds ${SOURCE_LINE_BYTES_MAX} bytes.`);
+      }
+    }
+    if (state.supported && pending.byteLength > 0) processLineBytes(source, state, pending, pendingStart);
+  } finally {
+    await file.close();
   }
-  closeAllRanges(state, sourceText.length);
+  closeAllRanges(state, sourceSize);
   if (!state.supported || source.paths.size === 0) return undefined;
   for (const indexedPath of source.paths.values()) {
     if (indexedPath.operations.length === 0) return undefined;
   }
   return source;
+}
+
+function processLineBytes(
+  source: IndexedSource,
+  state: ScanState,
+  lineBytes: Buffer,
+  position: number,
+): void {
+  assert(lineBytes.byteLength <= SOURCE_LINE_BYTES_MAX, "source line must be bounded");
+  assert(position >= 0 && position <= source.size, "line position must be within source");
+  const contentEnd = lineBytes.byteLength > 0 && lineBytes[lineBytes.byteLength - 1] === 13
+    ? lineBytes.byteLength - 1
+    : lineBytes.byteLength;
+  let lineText = lineBytes.toString("utf8", 0, contentEnd);
+  if (position === 0 && lineText.charCodeAt(0) === 0xfeff) lineText = lineText.slice(1);
+  const line = readLine(lineText, 0, lineText.length);
+  if (!line.valid) {
+    state.supported = false;
+    return;
+  }
+  processIndexedLine(source, state, line, position);
 }
 
 function processIndexedLine(
@@ -306,7 +428,7 @@ function processIndexedLine(
   line: ParsedLine,
   position: number,
 ): void {
-  assert(source.text.length >= position, "line position must be within source");
+  assert(source.size >= position, "line position must be within source");
   assert(line.indent >= 0, "line indentation must be non-negative");
   if (line.blank) return;
   if (state.blockScalarIndent !== undefined) {
@@ -355,7 +477,7 @@ function startTopLevel(
 ): void {
   assert(line.key !== undefined && line.key.length > 0, "top-level key must be non-empty");
   assert(position >= 0, "top-level position must be non-negative");
-  const range = { start: position, end: source.text.length, indent: 0 };
+  const range = { start: position, end: source.size, indent: 0 };
   if (line.key === "paths" && source.topLevel.has(line.key)) {
     source.paths.clear();
     state.operationCount = 0;
@@ -396,7 +518,7 @@ function processPathLine(
       state.supported = false;
       return;
     }
-    const range = { start: position, end: source.text.length, indent: line.indent };
+    const range = { start: position, end: source.size, indent: line.indent };
     state.operationCount = (state.operationCount ?? 0) - (source.paths.get(line.key)?.operations.length ?? 0);
     source.paths.set(line.key, { range, operations: [] });
     if (source.paths.size > INDEX_ENTRY_COUNT_MAX) state.supported = false;
@@ -420,7 +542,7 @@ function processPathLine(
     state.supported = false;
     return;
   }
-  const operation = { method: line.key, range: { start: position, end: source.text.length, indent: line.indent } };
+  const operation = { method: line.key, range: { start: position, end: source.size, indent: line.indent } };
   const operations = source.paths.get(state.pathName)!.operations;
   const duplicateIndex = operations.findIndex((candidate) => candidate.method === line.key);
   if (duplicateIndex >= 0) operations[duplicateIndex] = operation;
@@ -469,7 +591,7 @@ function processComponentLine(
   }
   if (state.componentIndent === undefined) state.componentIndent = line.indent;
   if (line.indent !== state.componentIndent) return;
-  const range = { start: position, end: source.text.length, indent: line.indent };
+  const range = { start: position, end: source.size, indent: line.indent };
   source.components.set(componentKey(state.componentKind, line.key), range);
   if (source.components.size > INDEX_ENTRY_COUNT_MAX) state.supported = false;
   state.componentRange = range;
@@ -521,22 +643,27 @@ function closeAllRanges(state: ScanState, end: number): void {
   if (state.topRange) state.topRange.end = end;
 }
 
-function isOpenApi3(source: IndexedSource): boolean {
+async function isOpenApi3(source: IndexedSource): Promise<boolean> {
   assert(source.topLevel instanceof Map, "top-level index must be a map");
-  assert(source.text.length > 0, "indexed source text must be non-empty");
+  assert(source.size > 0, "indexed source must be non-empty");
   const openapi = source.topLevel.get("openapi");
   const info = source.topLevel.get("info");
   if (!openapi || !info) return false;
-  const value = parseFragment(source.text, openapi).openapi;
-  return typeof value === "string" && value.startsWith("3.");
+  const file = await open(source.filePath, "r");
+  try {
+    const value = (await parseFragment(file, openapi)).openapi;
+    return typeof value === "string" && value.startsWith("3.");
+  } finally {
+    await file.close();
+  }
 }
 
-function readBaseUrl(source: IndexedSource): string {
-  assert(source.topLevel instanceof Map, "top-level index must be a map");
-  assert(source.text.length > 0, "indexed source text must be non-empty");
+async function readBaseUrl(file: FileHandle, source: IndexedSource): Promise<string> {
+  assert(file.fd >= 0, "source file must be open");
+  assert(source.size > 0, "indexed source must be non-empty");
   const range = source.topLevel.get("servers");
   if (!range) return "";
-  const servers = parseFragment(source.text, range).servers;
+  const servers = (await parseFragment(file, range)).servers;
   if (!Array.isArray(servers) || servers.length === 0) return "";
   return isRecord(servers[0]) && typeof servers[0].url === "string" ? servers[0].url : "";
 }
@@ -688,13 +815,28 @@ function decodeKey(value: string): string {
   return value;
 }
 
-function parseFragment(sourceText: string, range: SourceRange): Record<string, unknown> {
+async function parseFragment(
+  file: FileHandle,
+  range: SourceRange,
+): Promise<Record<string, unknown>> {
+  assert(file.fd >= 0, "source file must be open");
   assert(range.start >= 0 && range.end > range.start, "source fragment range must be non-empty");
-  assert(range.end <= sourceText.length, "source fragment must be within source text");
-  const fragment = sourceText.slice(range.start, range.end);
+  const size = range.end - range.start;
+  if (size > SOURCE_FRAGMENT_BYTES_MAX) {
+    throw new Error(`Lazy source index: fragment exceeds ${SOURCE_FRAGMENT_BYTES_MAX} bytes.`);
+  }
+  const bytes = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const result = await file.read(bytes, offset, size - offset, range.start + offset);
+    if (result.bytesRead === 0) throw new Error("Lazy source index: source fragment ended unexpectedly.");
+    offset += result.bytesRead;
+  }
+  const fragment = bytes.toString("utf8");
   const normalized = fragment.split("\n").map((line) => removeIndent(line, range.indent)).join("\n");
   const parsed = parseSpecText(normalized);
   assert(isRecord(parsed), "source fragment must parse to an object");
+  assert(offset === size, "source fragment must be read completely");
   return parsed;
 }
 
@@ -704,19 +846,6 @@ function removeIndent(line: string, indent: number): string {
   let removed = 0;
   while (removed < line.length && removed < indent && line.charCodeAt(removed) === 32) removed += 1;
   return line.slice(removed);
-}
-
-function findLineEnd(text: string, start: number): number {
-  assert(start >= 0 && start <= text.length, "line start must be within source");
-  assert(typeof text === "string", "line source must be a string");
-  const end = text.indexOf("\n", start);
-  return end < 0 ? text.length : end;
-}
-
-function trimCarriageReturn(text: string, start: number, end: number): number {
-  assert(start >= 0 && start <= end, "line start must precede line end");
-  assert(end <= text.length, "line end must be within source");
-  return end > start && text.charCodeAt(end - 1) === 13 ? end - 1 : end;
 }
 
 function isEmptyMappingValue(value: string | undefined): boolean {
@@ -729,14 +858,6 @@ function isBlockScalar(value: string | undefined): boolean {
   assert(value === undefined || typeof value === "string", "mapping value must be a string or undefined");
   assert(value === undefined || value.length <= SOURCE_BYTES_MAX, "mapping value exceeds the safety limit");
   return value !== undefined && /^[>|](?:[1-9][+-]?|[+-][1-9]?|)(?:\s+#.*)?$/.test(value);
-}
-
-function looksLikeJson(sourceText: string): boolean {
-  assert(typeof sourceText === "string", "source text must be a string");
-  assert(sourceText.length <= SOURCE_BYTES_MAX, "source text exceeds the safety limit");
-  let index = 0;
-  while (index < sourceText.length && /\s/.test(sourceText[index]!)) index += 1;
-  return sourceText[index] === "{" || sourceText[index] === "[";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

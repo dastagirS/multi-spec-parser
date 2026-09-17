@@ -1,11 +1,128 @@
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
-import type { ExecuteProcessor } from "../../src/multi-spec-parser.js";
-import type { TransportRequest } from "../../src/request-builder.js";
+
+const LAZY_SPEC_TEXT = `openapi: 3.0.3
+info:
+  title: Lazy test
+  version: "1"
+servers:
+  - url: https://api.example.com/v2
+paths:
+  /pets/{petId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getPet
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+  /owners/{ownerId}:
+    get:
+      operationId: getPet
+      parameters:
+        - name: ownerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+components:
+  schemas:
+    Pet:
+      allOf:
+        - $ref: "#/components/schemas/Named"
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+    Named:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+`;
+
+const SWAGGER_SPEC = {
+  swagger: "2.0",
+  info: { title: "Swagger lazy test", version: "1" },
+  host: "api.example.com",
+  basePath: "/v1",
+  schemes: ["https"],
+  parameters: {
+    PetId: { name: "petId", in: "path", required: true, type: "string" },
+  },
+  responses: {
+    PetResponse: { description: "ok", schema: { $ref: "#/definitions/Pet" } },
+  },
+  paths: {
+    "/pets/{petId}": {
+      get: {
+        operationId: "getPet",
+        parameters: [{ $ref: "#/parameters/PetId" }],
+        responses: { "200": { $ref: "#/responses/PetResponse" } },
+      },
+    },
+  },
+  definitions: {
+    Pet: {
+      type: "object",
+      properties: { owner: { $ref: "#/definitions/Owner" } },
+    },
+    Owner: { type: "object", properties: { name: { type: "string" } } },
+  },
+};
+
+const GOOGLE_SPEC = {
+  kind: "discovery#restDescription",
+  name: "pets",
+  version: "v1",
+  title: "Google lazy test",
+  rootUrl: "https://pets.googleapis.com/",
+  servicePath: "v1/",
+  parameters: {
+    prettyPrint: { type: "boolean", location: "query", default: "true" },
+  },
+  resources: {
+    owners: {
+      resources: {
+        pets: {
+          methods: {
+            get: {
+              id: "pets.owners.pets.get",
+              path: "owners/{ownerId}/pets/{petId}",
+              httpMethod: "GET",
+              parameters: {
+                ownerId: { type: "string", location: "path", required: true },
+                petId: { type: "string", location: "path", required: true },
+              },
+              response: { $ref: "Pet" },
+            },
+          },
+        },
+      },
+    },
+  },
+  schemas: {
+    Pet: { type: "object", properties: { owner: { $ref: "Owner" } } },
+    Owner: { type: "object", properties: { name: { type: "string" } } },
+  },
+};
 
 const SPEC = {
   openapi: "3.0.3",
@@ -61,566 +178,276 @@ const SPEC = {
   },
 };
 
-interface TestServer {
-  url: string;
-  hits: () => number;
-  close: () => Promise<void>;
-}
-
-async function createProcessorParser(process: ExecuteProcessor): Promise<MultiSpecParser> {
-  assert(typeof process === "function", "processor must be a function");
-  assert(SPEC !== null && typeof SPEC === "object", "test specification must be an object");
-  const parser = new MultiSpecParser({
-    spec: { spec: SPEC },
-    options: { processors: [{ matches: () => true, process }] },
-  });
-  await parser.parse();
-  return parser;
-}
-
-function startServer(): Promise<TestServer> {
-  let hits = 0;
-  const server = createServer((req, res) => {
-    hits += 1;
-    if (req.url === "/spec.json") {
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify(SPEC));
-    } else if (req.url === "/spec.yaml") {
-      res.setHeader("content-type", "application/yaml");
-      res.end("openapi: 3.0.3\ninfo: { title: T, version: '1' }\npaths:\n  /pets:\n    get:\n      operationId: listPets\n      responses:\n        '200': { description: ok }\n");
-    } else if (req.url === "/v1/pets") {
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify([{ id: 1, name: "Rex" }]));
-    } else if (req.url === "/v1/pets/missing") {
-      res.statusCode = 404;
-      res.end("nope");
-    } else {
-      res.statusCode = 404;
-      res.end("not found");
-    }
-  });
-  return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as AddressInfo;
-      resolve({
-        url: `http://127.0.0.1:${port}`,
-        hits: () => hits,
-        close: () => new Promise((r) => server.close(() => r())),
-      });
-    });
-  });
-}
-
 describe("MultiSpecParser", () => {
-  let server: TestServer | undefined;
-  after(async () => {
-    await server?.close();
-  });
-
-  it("validates config: exactly one of url/text/spec", () => {
-    assert.throws(() => new MultiSpecParser({ spec: {} as never }), /exactly one of \{url\}, \{text\}, \{spec\}/);
+  it("accepts exactly one URL, object, or text source", async () => {
     assert.throws(
-      () => new MultiSpecParser({ spec: { url: "x", text: "y" } as never }),
+      () => new MultiSpecParser({ spec: {} as never }),
+      /exactly one of \{ url \}, \{ text \}, or \{ spec \}/,
+    );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { text: "x", spec: SPEC } as never }),
       /exactly one/,
     );
-    assert.throws(() => new MultiSpecParser({ spec: { url: 42 } as never }), /spec\.url must be a non-empty string/);
-    assert.throws(() => new MultiSpecParser({ spec: { spec: "nope" } as never }), /spec\.spec must be a plain object/);
-    assert.throws(() => new MultiSpecParser(undefined as never), /config object required/);
+    assert.throws(
+      () => new MultiSpecParser({ spec: { url: "" } }),
+      /non-empty/,
+    );
+    assert.throws(
+      () => new MultiSpecParser({ spec: { text: "" } }),
+      /non-empty/,
+    );
   });
 
-  it("validates empty source strings and options (JS consumers)", () => {
-    assert.throws(() => new MultiSpecParser({ spec: { url: "" } }), /non-empty/);
-    assert.throws(() => new MultiSpecParser({ spec: { text: "" } }), /non-empty/);
+  it("rejects removed and unknown policy options", async () => {
+    for (const options of [
+      { transport: () => undefined },
+      { processors: [] },
+      { extraParameterRules: [] },
+      { transforms: {} },
+      { cache: {} },
+    ] as never[]) {
+      assert.throws(
+        () => new MultiSpecParser({ spec: { spec: SPEC }, options }),
+        /unknown option/,
+      );
+    }
     assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { maxDefsBytes: -1 } }),
-      /maxDefsBytes/,
+      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { lazy: true } }),
+      /lazy supports only \{ url \} sources/,
     );
-    assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { baseUrl: 42 } as never }),
-      /baseUrl/,
-    );
-    assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { headers: "x" } as never }),
-      /headers/,
-    );
-    assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { executeTimeoutMs: 0 } }),
-      /executeTimeoutMs/,
-    );
-    assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { cache: { maxEntries: 0 } } }),
-      /cache\.maxEntries/,
-    );
-    assert.throws(
-      () => new MultiSpecParser({ spec: { spec: SPEC }, options: { lazy: "yes" } as never }),
-      /options\.lazy/,
-    );
-    // Valid options pass.
-    new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: { maxDefsBytes: 1000, baseUrl: "https://x", headers: { a: "b" }, executeTimeoutMs: 1000 },
-    });
   });
 
-  it("parses from a pre-parsed spec object", async () => {
+  it("parses an object source without mutating the caller-owned document", async () => {
+    const before = structuredClone(SPEC);
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    const document = await parser.parse();
-    // parse() returns the RAW document (typed to the input spec) — not the
-    // normalized model. For object sources it is the same object passed in.
-    assert.equal(document, SPEC);
-    assert.equal(document.openapi, "3.0.3");
+    const operations = await parser.parse();
+    assert.equal(operations.length, 3);
+    assert.deepEqual(SPEC, before);
     assert.equal(parser.format, "openapi3");
     assert.equal(parser.baseUrl, "https://api.example.com/v1");
   });
 
-  it("parses YAML text (content-sniffed, not extension-guessed)", async () => {
-    const yaml = `
-openapi: 3.0.3
-info: { title: T, version: "1" }
-paths:
-  /pets:
-    get:
-      operationId: listPets
-      responses:
-        "200": { description: ok }
-`;
-    const parser = new MultiSpecParser({ spec: { text: yaml } });
-    const document = await parser.parse();
-    assert.equal(document.openapi, "3.0.3");
-    assert.equal(parser.tool("listPets")?.name, "listPets");
-  });
-
-  it("fetches a URL once and shares the content cache across instances", async () => {
-    server = await startServer();
-    const specUrl = `${server.url}/spec.json`;
-    const first = new MultiSpecParser({ spec: { url: specUrl } });
-    const second = new MultiSpecParser({ spec: { url: specUrl } });
-    await first.parse();
-    assert.equal(first.tools().length, 3);
-    await second.parse(); // global content-addressed cache → no second fetch
-    assert.equal(server.hits(), 1);
-    await server.close();
-    server = undefined;
-  });
-
-  it("deduplicates concurrent lazy URL loads without retaining a global source cache", async () => {
-    server = await startServer();
-    const specUrl = `${server.url}/spec.yaml`;
-    const first = new MultiSpecParser({ spec: { url: specUrl }, options: { lazy: true } });
-    const second = new MultiSpecParser({ spec: { url: specUrl }, options: { lazy: true } });
-    await Promise.all([first.load(), second.load()]);
-    assert.equal(server.hits(), 1);
-    assert.equal(first.tool("listPets")?.name, second.tool("listPets")?.name);
-    await server.close();
-    server = undefined;
-  });
-
-  it("defers compilation with lazy mode while preserving eager tool results", async () => {
-    let operationTransforms = 0;
-    let requestBodyTransforms = 0;
-    const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        lazy: true,
-        transforms: {
-          operation: (operation) => {
-            operationTransforms += 1;
-            return operation;
-          },
-          schema: (schema, context) => {
-            if (context.kind === "request-body") requestBodyTransforms += 1;
-            return schema;
-          },
-        },
-      },
+  it("loads a URL once per parser instance", async () => {
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(SPEC));
     });
-    await parser.parse();
-    assert.equal(operationTransforms, 3);
-    assert.equal(requestBodyTransforms, 0);
-    const firstTool = parser.tool("getPet");
-    assert.ok(firstTool);
-    assert.equal(operationTransforms, 6);
-    assert.equal(requestBodyTransforms, 0);
-    assert.strictEqual(parser.tool("getPet"), firstTool);
-    assert.equal(parser.tool("does-not-exist"), undefined);
-    assert.equal(requestBodyTransforms, 0);
-    assert.ok(parser.tool("createPet"));
-    assert.equal(requestBodyTransforms, 1);
-
-    const eager = new MultiSpecParser({ spec: { spec: SPEC } });
-    await eager.parse();
-    assert.deepEqual(parser.tools(), eager.tools());
-  });
-
-  it("loads lazy YAML indexes without materializing the raw document", async () => {
-    const yaml = `
-openapi: 3.0.3
-info: { title: T, version: "1" }
-paths:
-  /pets:
-    get:
-      operationId: listPets
-      responses:
-        "200": { description: ok }
-`;
-    const parser = new MultiSpecParser({ spec: { text: yaml }, options: { lazy: true } });
-    await parser.load();
-    assert.equal(parser.format, "openapi3");
-    assert.equal(parser.tool("listPets")?.path, "/pets");
-  });
-
-  it("loads lazy YAML tools from operation and reference fragments", async () => {
-    const yaml = `
-openapi: 3.0.3
-info:
-  title: T
-  version: "1"
-servers:
-  - url: https://api.example.com
-paths:
-  /pets/{petId}:
-    get:
-      operationId: getPet
-      parameters:
-        - name: petId
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Pet"
-components:
-  schemas:
-    Pet:
-      type: object
-      properties:
-        name:
-          type: string
-`;
-    const parser = new MultiSpecParser({ spec: { text: yaml }, options: { lazy: true } });
-    await parser.parse();
-    const tool = parser.tool("getPet");
-    assert.ok(tool);
-    assert.equal(tool.path, "/pets/{petId}");
-    assert.equal((tool.inputSchema.$defs as Record<string, unknown>).Pet !== undefined, true);
-  });
-
-  it("supports compile, request, and response transforms", async () => {
-    const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        transforms: {
-          operation: (operation) => ({ ...operation, description: "transformed" }),
-          schema: (schema, context) => context.kind === "parameter"
-            ? { ...schema, description: "parameter transformed" }
-            : schema,
-          request: (request, context) => ({
-            ...request,
-            headers: {
-              ...request.headers,
-              "X-Transform": context.runtimeContext === undefined ? "yes" : "wrong",
-            },
-          }),
-          response: (result) => ({ ...result, data: { transformed: result.data } }),
-        },
-      },
-    });
-    await parser.parse();
-    const request = parser.buildRequest("getPet", { petId: "one" });
-    assert.equal(request.headers["X-Transform"], "yes");
-    assert.equal(parser.tool("getPet")?.description, "transformed");
-  });
-
-  it("passes execution context through runtime hooks without cross-execution leakage", async () => {
-    const requestContexts: unknown[] = [];
-    const responseContexts: unknown[] = [];
-    const matchContexts: unknown[] = [];
-    const processContexts: unknown[] = [];
-    const attempts: Record<"A" | "B", number> = { A: 0, B: 0 };
-    const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        transforms: {
-          request: (request, context) => {
-            requestContexts.push(context.runtimeContext);
-            return request;
-          },
-          response: (result, context) => {
-            responseContexts.push(context.runtimeContext);
-            return result;
-          },
-        },
-        processors: [
-          {
-            matches: (_tool, context) => {
-              matchContexts.push(context.runtimeContext);
-              return true;
-            },
-            process: (result, context) => {
-              processContexts.push(context.runtimeContext);
-              assert.deepEqual(context.args, {});
-              return result;
-            },
-          },
-        ],
-      },
-    });
-    await parser.parse();
-    const contexts = {
-      A: { userId: "user-a", dependency: "a" },
-      B: { userId: "user-b", dependency: "b" },
-    } as const;
-    const executeForUser = async (user: "A" | "B") =>
-      parser.execute("listPets", {}, {
-        runtimeContext: contexts[user],
-        transport: async (_request: TransportRequest) => {
-          attempts[user] += 1;
-          return new Response(JSON.stringify({ user }), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          });
-        },
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const parser = new MultiSpecParser({
+        spec: { url: `http://127.0.0.1:${port}/openapi.json` },
       });
-    const [resultA, resultB] = await Promise.all([executeForUser("A"), executeForUser("B")]);
-    assert.equal(resultA.status, "success");
-    assert.equal(resultB.status, "success");
-    assert.equal(requestContexts.filter((context) => context === contexts.A).length, 1);
-    assert.equal(requestContexts.filter((context) => context === contexts.B).length, 1);
-    for (const observed of [responseContexts, matchContexts, processContexts]) {
-      assert.equal(observed.filter((context) => context === contexts.A).length, 1);
-      assert.equal(observed.filter((context) => context === contexts.B).length, 1);
+      const first = await parser.parse();
+      const second = await parser.parse();
+      assert.equal(first.length, 3);
+      assert.equal(second.length, 3);
+      assert.equal(requestCount, 1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
-  it("exposes exact binary, JSON, and text bytes only to processors", async () => {
-    const observed: Array<Uint8Array | undefined> = [];
-    const parser = await createProcessorParser((result, context) => {
-      observed.push(context.responseBodyBytes);
-      return result;
-    });
-    const binary = new Uint8Array([0xff, 0xfe, 0x00, 0x80, 0x41]);
-    const binaryResult = await parser.execute("listPets", {}, {
-      transport: async () => new Response(binary, { headers: { "content-type": "application/octet-stream" } }),
-    });
-    const jsonText = JSON.stringify({ ok: true });
-    const jsonResult = await parser.execute("listPets", {}, {
-      transport: async () => new Response(jsonText, { headers: { "content-type": "application/json" } }),
-    });
-    const textResult = await parser.execute("listPets", {}, {
-      transport: async () => new Response("plain text", { headers: { "content-type": "text/plain" } }),
-    });
-    assert.deepEqual(observed[0], binary);
-    assert.deepEqual(observed[1], new TextEncoder().encode(jsonText));
-    assert.deepEqual(observed[2], new TextEncoder().encode("plain text"));
-    assert.deepEqual(jsonResult.data, { ok: true });
-    assert.equal(textResult.data, "plain text");
-    assert.equal(Object.prototype.hasOwnProperty.call(binaryResult, "responseBodyBytes"), false);
-    assert.equal(JSON.stringify(binaryResult).includes("responseBodyBytes"), false);
+  it("rejects non-HTTP source URLs", async () => {
+    const parser = new MultiSpecParser({ spec: { url: "file:///tmp/openapi.json" } });
+    await assert.rejects(parser.parse(), /must use http or https/);
   });
 
-  it("withholds incomplete bodies and exposes fully-read empty bodies", async () => {
-    const observed: Array<Uint8Array | undefined> = [];
-    const parser = await createProcessorParser((result, context) => {
-      observed.push(context.responseBodyBytes);
-      return result;
+  it("indexes a YAML URL on disk and materializes operations on demand", async () => {
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      response.setHeader("content-type", "application/yaml");
+      response.end(LAZY_SPEC_TEXT);
     });
-    const oversized = await parser.execute("listPets", {}, {
-      maxResponseBodyBytes: 2,
-      transport: async () => new Response(new Uint8Array([1, 2, 3])),
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const parser = new MultiSpecParser({
+      spec: { url: `http://127.0.0.1:${port}/openapi.yaml` },
+      options: { lazy: true },
     });
-    const empty = await parser.execute("listPets", {}, {
-      transport: async () => new Response(null, { status: 204 }),
-    });
-    assert.equal(oversized.status, "truncated");
-    assert.equal(observed[0], undefined);
-    assert.equal(empty.status, "success");
-    assert.deepEqual(observed[1], new Uint8Array());
+    try {
+      assert.throws(() => parser.operationNames(), /call parser\.load/);
+      await Promise.all([parser.load(), parser.load()]);
+      assert.equal(requestCount, 1);
+      assert.equal(parser.format, "openapi3");
+      assert.equal(parser.baseUrl, "https://api.example.com/v2");
+      assert.deepEqual(parser.operationNames(), ["getPet", "getPet_1"]);
+
+      const operation = await parser.operation("getPet");
+      assert.ok(operation);
+      assert.equal(operation.path, "/pets/{petId}");
+      assert.ok((operation.inputSchema.$defs as Record<string, unknown>).Pet);
+      assert.ok((operation.inputSchema.$defs as Record<string, unknown>).Named);
+      assert.strictEqual(operation, await parser.operation("getPet"));
+      assert.equal(await parser.operation("missing"), undefined);
+
+      const eager = new MultiSpecParser({ spec: { text: LAZY_SPEC_TEXT } });
+      await eager.parse();
+      assert.deepEqual(operation, await eager.operation("getPet"));
+      assert.deepEqual(await parser.operation("getPet_1"), await eager.operation("getPet_1"));
+      await assert.rejects(parser.parse(), /unavailable in lazy mode/);
+    } finally {
+      await parser.close();
+      await parser.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    await assert.rejects(parser.operation("getPet"), /parser is closed/);
+    assert.throws(() => parser.operationNames(), /parser is closed/);
   });
 
-  it("exposes only the final transport response body", async () => {
-    const observed: Array<Uint8Array | undefined> = [];
-    const parser = await createProcessorParser((result, context) => {
-      observed.push(context.responseBodyBytes);
-      return result;
+  it("indexes JSON URLs for every canonical format with eager parity", async () => {
+    const documents = new Map<string, Record<string, unknown>>([
+      ["/openapi.json", SPEC],
+      ["/openapi-bom.json", SPEC],
+      ["/swagger.json", SWAGGER_SPEC],
+      ["/discovery.json", GOOGLE_SPEC],
+    ]);
+    const server = createServer((request, response) => {
+      const document = documents.get(request.url ?? "");
+      if (!document) {
+        response.statusCode = 404;
+        response.end();
+        return;
+      }
+      response.setHeader("content-type", "application/json");
+      response.end(`${request.url === "/openapi-bom.json" ? "\uFEFF" : ""}${JSON.stringify(document)}`);
     });
-    const expected = new Uint8Array([0xff, 0x00, 0x41]);
-    let attemptCount = 0;
-    const result = await parser.execute("listPets", {}, {
-      transport: async () => {
-        attemptCount += 1;
-        const first = new Response("expired", { status: 401 });
-        if (first.status === 401) {
-          await first.body?.cancel();
-          attemptCount += 1;
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      for (const [path, document] of documents) {
+        const lazy = new MultiSpecParser({
+          spec: { url: `http://127.0.0.1:${port}${path}` },
+          options: { lazy: true },
+        });
+        const eager = new MultiSpecParser({ spec: { spec: document } });
+        try {
+          await lazy.load();
+          await eager.parse();
+          assert.deepEqual(lazy.operationNames(), eager.operationNames());
+          assert.equal(lazy.format, eager.format);
+          assert.equal(lazy.baseUrl, eager.baseUrl);
+          for (const name of lazy.operationNames()) {
+            assert.deepEqual(await lazy.operation(name), await eager.operation(name));
+          }
+        } finally {
+          await lazy.close();
         }
-        return new Response(expected);
-      },
-    });
-    assert.equal(result.status, "success");
-    assert.equal(attemptCount, 2);
-    assert.equal(observed.length, 1);
-    assert.deepEqual(observed[0], expected);
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
-  it("uses the optional custom transport and keeps the default when omitted", async () => {
-    const calls: string[] = [];
+  it("rejects malformed and unsupported JSON without eager fallback", async () => {
+    const sources = new Map([
+      ["/malformed.json", '{"openapi":"3.0.3","paths":'],
+      ["/unsupported.json", '{"name":"not-an-api"}'],
+    ]);
+    const server = createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(sources.get(request.url ?? "") ?? "{}");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      for (const [path] of sources) {
+        const parser = new MultiSpecParser({
+          spec: { url: `http://127.0.0.1:${port}${path}` },
+          options: { lazy: true },
+        });
+        try {
+          await assert.rejects(parser.load(), /invalid JSON lazy source|supports only OpenAPI/);
+        } finally {
+          await parser.close();
+        }
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("parses YAML text by content", async () => {
     const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        transport: async (request) => {
-          calls.push(request.url);
-          return new Response(JSON.stringify({ custom: true }), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          });
-        },
+      spec: {
+        text: `
+openapi: 3.0.3
+info: { title: T, version: "1" }
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200": { description: ok }
+`,
       },
     });
     await parser.parse();
-    const result = await parser.execute("listPets", {});
-    assert.equal(result.status, "success");
-    assert.deepEqual(result.data, { custom: true });
-    assert.deepEqual(calls, ["https://api.example.com/v1/pets"]);
+    assert.equal(parser.format, "openapi3");
+    assert.equal((await parser.operation("listPets"))?.path, "/pets");
   });
 
-  it("supports parser cancellation and cache controls", async () => {
-    const controller = new AbortController();
-    controller.abort();
+  it("projects normalized operations with self-contained JSON Schemas", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    await assert.rejects(parser.parse({ signal: controller.signal }), /parse aborted/);
-    server = await startServer();
-    const specUrl = `${server.url}/spec.json`;
-    const first = new MultiSpecParser({ spec: { url: specUrl }, options: { cache: { enabled: false } } });
-    const second = new MultiSpecParser({ spec: { url: specUrl }, options: { cache: { enabled: false } } });
-    first.clearCache();
-    await first.parse();
-    await second.parse();
-    assert.equal(server.hits(), 2);
-    assert.equal(first.cacheStats().textEntries, 0);
-    first.clearCache();
-    await server.close();
-    server = undefined;
+    const operations = await parser.parse();
+    assert.equal(operations.length, 3);
+    const getPet = await parser.operation("getPet");
+    assert.ok(getPet);
+    assert.equal(getPet.method, "GET");
+    assert.deepEqual(getPet.outputSchema, { $ref: "#/$defs/Pet" });
+    assert.ok((getPet.inputSchema.$defs as Record<string, unknown>).Pet);
   });
 
-  it("throws a helpful error when used before parse()", () => {
+  it("returns a copy of the operation collection", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    assert.throws(() => parser.tools(), /call await parser\.parse\(\)/);
-    assert.throws(() => parser.format, /call await parser\.parse\(\)/);
-    assert.throws(() => parser.buildRequest("getPet", {}), /call await parser\.parse\(\)/);
+    const operations = await parser.parse();
+    operations.length = 0;
+    assert.equal((await parser.parse()).length, 3);
   });
 
-  it("exposes tools, tool lookup, defs, and output schemas", async () => {
+  it("compacts over-budget schemas without changing canonical operations", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    assert.deepEqual(Object.keys(parser.defs).sort(), ["NewPet", "Pet"]);
-    assert.equal(parser.tools().length, 3);
-    assert.equal(parser.tool("getPet")?.method, "GET");
-    assert.equal(parser.tool("nope"), undefined);
-    assert.throws(() => parser.buildRequest("nope", {}), /unknown tool "nope"/);
-    assert.deepEqual(parser.outputSchema("getPet"), { $ref: "#/$defs/Pet" });
-    assert.equal(parser.operation("getPet").path, "/pets/{petId}");
+    const canonical = (await parser.operation("getPet"))!;
+    const compact = (await parser.parse({ compact: true, maxBytes: 20 }))
+      .find((operation) => operation.name === "getPet")!;
+    assert.equal(compact.inputSchema.$defs, undefined);
+    assert.deepEqual(compact.inputSchema.$refs, ["Pet"]);
+    assert.ok(canonical.inputSchema.$defs);
   });
 
-  it("exposes a combined Standard Schema adapter through the parser", async () => {
+  it("memoizes canonical operations while returning collection copies", async () => {
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    const [first, second] = await Promise.all([parser.parse(), parser.parse()]);
+    assert.notStrictEqual(first, second);
+    assert.strictEqual(first[0], second[0]);
+    assert.strictEqual(await parser.operation("getPet"), await parser.operation("getPet"));
+  });
+
+  it("adapts operation schemas to Standard Schema", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const tool = parser.tool("createPet")!;
-    const schema = parser.toStandardSchema(tool);
-    assert.equal(schema, parser.toStandardSchema("createPet"));
-    const valid = await schema["~standard"].validate({ body: { name: "Rex" } });
-    assert.deepEqual(valid, { value: { body: { name: "Rex" } } });
-    const inputSchema = schema["~standard"].jsonSchema.input({ target: "draft-07" });
-    assert.equal(inputSchema.$schema, "http://json-schema.org/draft-07/schema#");
-    assert.ok(inputSchema.definitions);
+    const adapter = parser.toStandardSchema("createPet");
+    assert.strictEqual(adapter, parser.toStandardSchema("createPet"));
+    assert.deepEqual(
+      await adapter.validate({ body: { name: "Rex" } }),
+      { value: { body: { name: "Rex" } } },
+    );
+    const input = adapter.input("draft-07");
+    assert.equal(input.$schema, "http://json-schema.org/draft-07/schema#");
+    assert.ok(input.definitions);
+    const output = parser.toStandardSchema("getPet").output();
+    assert.equal(output.$schema, "https://json-schema.org/draft/2020-12/schema");
   });
 
-  it("applies configured defaults to validation and execution without mutating args", async () => {
-    const spec = {
-      openapi: "3.0.3",
-      info: { title: "T", version: "1" },
-      servers: [{ url: "https://api.example.com" }],
-      paths: {
-        "/users": {
-          get: {
-            operationId: "getUserWithDefault",
-            parameters: [{ name: "userId", in: "query", required: true, schema: { type: "string", default: "me" } }],
-            responses: { "200": { description: "ok" } },
-          },
-        },
-      },
-    };
-    let requestUrl = "";
-    const parser = new MultiSpecParser({
-      spec: { spec },
-      options: {
-        defaultPolicy: "apply",
-        transport: async (request) => {
-          requestUrl = request.url;
-          return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-        },
-      },
-    });
-    await parser.parse();
-    const input: Record<string, unknown> = {};
-    const validation = await parser.validate("getUserWithDefault", input);
-    assert.deepEqual(validation, { valid: true, value: { userId: "me" } });
-    assert.deepEqual(input, {});
-    const standard = parser.toStandardSchema("getUserWithDefault");
-    const standardValidation = await standard["~standard"].validate(input);
-    assert.deepEqual(standardValidation, { value: { userId: "me" } });
-    assert.equal(standard["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, undefined);
-    const result = await parser.execute("getUserWithDefault", input);
-    assert.equal(result.status, "success");
-    assert.equal(requestUrl, "https://api.example.com/users?userId=me");
-  });
-
-  it("applies config baseUrl/headers as buildRequest defaults, per-call wins", async () => {
-    const parser = new MultiSpecParser({
-      spec: { spec: SPEC },
-      options: {
-        baseUrl: "https://override.example.com",
-        headers: { Authorization: "Bearer abc" },
-      },
-    });
-    await parser.parse();
-    const req = parser.buildRequest("listPets", {});
-    assert.equal(req.url, "https://override.example.com/pets");
-    assert.equal(req.headers.Authorization, "Bearer abc");
-    const overridden = parser.buildRequest("listPets", {}, { baseUrl: "https://other.example.com", headers: { "X-Extra": "1" } });
-    assert.equal(overridden.url, "https://other.example.com/pets");
-    assert.equal(overridden.headers.Authorization, "Bearer abc"); // merged, not replaced
-    assert.equal(overridden.headers["X-Extra"], "1");
-  });
-
-  it("tools() returns a copy — mutating it can't corrupt the parser", async () => {
+  it("fails clearly before parse and for unknown operations", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    assert.throws(() => parser.format, /call parser\.parse/);
     await parser.parse();
-    const first = parser.tools();
-    first.length = 0;
-    assert.equal(parser.tools().length, 3);
-  });
-
-  it("executes against a live local server: success and error shapes", async () => {
-    server = await startServer();
-    const parser = new MultiSpecParser({
-      spec: { url: `${server.url}/spec.json` },
-      options: { baseUrl: `${server.url}/v1` }, // matches the spec's /v1 prefix
-    });
-    await parser.parse();
-    const ok = await parser.execute("listPets", {});
-    assert.equal(ok.status, "success");
-    assert.equal(ok.httpStatus, 200);
-    assert.deepEqual(ok.data, [{ id: 1, name: "Rex" }]);
-    const err = await parser.execute("getPet", { petId: "missing" });
-    assert.equal(err.status, "error");
-    assert.equal(err.httpStatus, 404);
-    assert.equal(err.error, "nope"); // server's message is surfaced
-    await server.close();
-    server = undefined;
+    assert.equal(await parser.operation("missing"), undefined);
+    assert.throws(() => parser.toStandardSchema("missing"), /unknown operation/);
   });
 });

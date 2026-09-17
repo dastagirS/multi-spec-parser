@@ -82,9 +82,9 @@ paths:
 for (const [label, raw] of Object.entries(specs)) {
   const source = typeof raw === "string" ? { text: raw } : { spec: raw };
   const parser = new MultiSpecParser({ spec: source });
-  await parser.parse();
+  const operations = await parser.parse();
   console.log(
-    `${label.padEnd(18)} → ${parser.format.padEnd(8)} ${parser.tools().length} tool(s) | ` +
+    `${label.padEnd(18)} → ${parser.format.padEnd(8)} ${operations.length} operation(s) | ` +
       `baseUrl: ${parser.baseUrl || "(none declared)"}`,
   );
 }

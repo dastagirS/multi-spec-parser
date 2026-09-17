@@ -7,10 +7,9 @@
 import { parseYaml } from "./yaml-parser.js";
 
 import { assertValidParsedSpecModel } from "./model-validation.js";
-import { assertValidSpecText, validateSpecUrl } from "./spec-validation.js";
 import { DocResolver, isRef } from "./ref-resolver.js";
 import { setOwn } from "./schema-closure.js";
-import { deriveOperationKey, deriveToolName, sanitizeToolName } from "./tool-names.js";
+import { deriveOperationKey, deriveOperationName, sanitizeOperationName } from "./operation-names.js";
 import type {
   ExtractedOperation,
   GoogleDiscoveryDoc,
@@ -56,8 +55,6 @@ const VALID_SCHEMA_TYPES = new Set([
 /** NDJSON media types: the body is one JSON doc per line (e.g. Vercel logs). */
 const NDJSON_MEDIA_TYPES = new Set(["application/stream+json", "application/x-ndjson", "application/jsonl"]);
 
-/** Guard against hung/failed fetches: parse() must not hang forever (G6). */
-const FETCH_TIMEOUT_MS = 60_000;
 export const MAX_SPEC_BYTES = 200 * 1024 * 1024;
 
 function isNdjsonMediaType(mediaType: string): boolean {
@@ -65,34 +62,14 @@ function isNdjsonMediaType(mediaType: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch + text parsing
+// Text parsing
 // ---------------------------------------------------------------------------
-
-/** Fetch spec text — never res.json(): YAML specs (Booking) fail JSON parsing. */
-export async function fetchSpecText(url: string, signal?: AbortSignal): Promise<string> {
-  validateSpecUrl(url);
-  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(FETCH_TIMEOUT_MS);
-  const res = await fetch(url, {
-    headers: { Accept: "application/json, application/yaml, text/yaml, */*" },
-    signal: requestSignal,
-  });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch spec: ${res.status} ${res.statusText}`);
-  }
-  const contentLength = Number(res.headers.get("content-length") ?? 0);
-  if (contentLength > MAX_SPEC_BYTES) {
-    throw new Error(
-      `Spec too large: content-length ${contentLength} bytes exceeds ${MAX_SPEC_BYTES} byte limit`,
-    );
-  }
-  const text = await readBoundedResponseText(res, MAX_SPEC_BYTES);
-  assertValidSpecText(text, res.headers.get("content-type"));
-  return text;
-}
 
 /** Parse spec text as JSON when it looks like JSON, else YAML. */
 export function parseSpecText(text: string): Record<string, unknown> {
-  assertValidSpecText(text);
+  if (typeof text !== "string") {
+    throw new TypeError("Spec document must be a string");
+  }
   if (new TextEncoder().encode(text).byteLength > MAX_SPEC_BYTES) {
     throw new Error(`Spec too large: text exceeds ${MAX_SPEC_BYTES} byte limit`);
   }
@@ -121,34 +98,6 @@ export function parseSpecText(text: string): Record<string, unknown> {
     throw new Error("Spec document must parse to an object");
   }
   return parsed as Record<string, unknown>;
-}
-
-async function readBoundedResponseText(response: Response, limit: number): Promise<string> {
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      const next = await reader.read();
-      if (next.done) break;
-      size += next.value.byteLength;
-      if (size > limit) {
-        await reader.cancel();
-        throw new Error(`Spec too large: streamed body exceeds ${limit} byte limit`);
-      }
-      chunks.push(next.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +216,7 @@ function openApi3Operation(
   docServers: ServerInfo[],
   pathUnresolved: Set<string>,
 ): ExtractedOperation {
-  const toolName = deriveToolName(op.operationId, method, path);
+  const operationName = deriveOperationName(op.operationId, method, path);
   // Per-op tracking: an op must only report refs IT touched, not refs other
   // ops left dangling (B3). Path-level misses (a $ref path item) carry over.
   const unresolved = new Set<string>(pathUnresolved);
@@ -281,7 +230,7 @@ function openApi3Operation(
 
   return {
     operationKey: deriveOperationKey(method, path),
-    toolName,
+    operationName,
     method: method.toUpperCase() as HttpMethod,
     path,
     summary: op.summary,
@@ -365,7 +314,7 @@ function extractRequestBody(
  * Output schema from success responses: exact 2xx codes (sorted), then 2XX
  * wildcard (Microsoft Graph declares every success this way). `default` is
  * deliberately EXCLUDED — it usually carries the error shape, and advertising
- * that as the output contract misleads LLM callers (G5). The server picks the
+ * that as the output contract misrepresents the operation. The server picks the
  * response media type, so prefer JSON among declared.
  */
 function extractOutputSchema(
@@ -453,7 +402,7 @@ function swagger2Operation(
   r: DocResolver,
   docServers: ServerInfo[],
 ): ExtractedOperation {
-  const toolName = deriveToolName(op.operationId, method, path);
+  const operationName = deriveOperationName(op.operationId, method, path);
   // Per-op unresolved tracking (B3) — same discipline as the OAS3 adapter.
   const unresolved = new Set<string>();
   const bodyParams: Swagger2Parameter[] = [];
@@ -477,7 +426,7 @@ function swagger2Operation(
 
   return {
     operationKey: deriveOperationKey(method, path),
-    toolName,
+    operationName,
     method: method.toUpperCase() as HttpMethod,
     path,
     summary: op.summary,
@@ -687,7 +636,7 @@ function googleMethodToOperation(
   tags: string[],
   doc: GoogleDiscoveryDoc,
 ): ExtractedOperation {
-  const toolName = sanitizeToolName(method.id);
+  const operationName = sanitizeOperationName(method.id);
   const rawPath = method.flatPath ?? method.path;
 
   const parameters: NormalizedParameter[] = [];
@@ -714,7 +663,7 @@ function googleMethodToOperation(
   const normalizedMethod = (method.httpMethod || "GET").toUpperCase();
   return {
     operationKey: deriveOperationKey(normalizedMethod, normalizedPath),
-    toolName,
+    operationName,
     method: normalizedMethod as HttpMethod,
     path: normalizedPath,
     summary: method.description?.split("\n")[0] ?? method.id,

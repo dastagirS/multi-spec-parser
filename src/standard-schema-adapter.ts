@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import type { CompiledTool } from "./factory.js";
+import type { CompiledOperation } from "./operation-compiler.js";
 import { collectReachableDefs } from "./schema-closure.js";
 import type { SchemaObject } from "./types.js";
 
@@ -72,39 +72,58 @@ export interface StandardJSONSchemaV1<Input = unknown, Output = Input> {
 export type StandardSchemaLike<T = unknown> =
   StandardSchemaV1<T> & StandardJSONSchemaV1<T, T>;
 
+export type StandardSchema<T = unknown> = StandardSchemaLike<T> & {
+  readonly validate: StandardSchemaV1<T>["~standard"]["validate"];
+  readonly input: (target?: StandardJsonSchemaTarget) => Record<string, unknown>;
+  readonly output: (target?: StandardJsonSchemaTarget) => Record<string, unknown>;
+};
+
 type StandardSchemaValidator = (
   value: unknown,
   options?: StandardSchemaOptions,
 ) => StandardSchemaResult<unknown> | Promise<StandardSchemaResult<unknown>>;
 
 export function createStandardSchemaAdapter(
-  tool: CompiledTool,
+  operation: CompiledOperation,
   validate: StandardSchemaValidator,
   options: StandardSchemaAdapterOptions = {},
-): StandardSchemaLike {
-  assert(tool !== null && typeof tool === "object", "compiled tool must be an object");
+): StandardSchema {
+  assert(operation !== null && typeof operation === "object", "compiled operation must be an object");
   assert(typeof validate === "function", "standard schema validator must be a function");
   assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
   const defaultPolicy = options.defaultPolicy ?? "preserve";
   assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
   let inputProjection: Record<string, unknown> | undefined;
   let outputProjection: Record<string, unknown> | undefined;
+  const input = (target: StandardJsonSchemaTarget = DRAFT_2020_12) => {
+    assert(typeof target === "string", "input schema target must be a string");
+    assert(target.length > 0, "input schema target must be non-empty");
+    return projectSchema(
+      inputProjection ??= withReachableDefinitions(operation.inputSchema, operation.inputSchema.$defs),
+      target,
+      defaultPolicy,
+    );
+  };
+  const output = (target: StandardJsonSchemaTarget = DRAFT_2020_12) => {
+    assert(typeof target === "string", "output schema target must be a string");
+    assert(target.length > 0, "output schema target must be non-empty");
+    return projectSchema(
+      outputProjection ??= withReachableDefinitions(operation.outputSchema ?? {}, operation.inputSchema.$defs),
+      target,
+      "preserve",
+    );
+  };
   return {
+    validate,
+    input,
+    output,
     "~standard": {
       version: 1,
       vendor: "multi-spec-parser",
       validate,
       jsonSchema: {
-        input: (options) => projectSchema(
-          inputProjection ??= withReachableDefinitions(tool.inputSchema, tool.inputSchema.$defs),
-          options.target,
-          defaultPolicy,
-        ),
-        output: (options) => projectSchema(
-          outputProjection ??= withReachableDefinitions(tool.outputSchema ?? {}, tool.inputSchema.$defs),
-          options.target,
-          "preserve",
-        ),
+        input: (options) => input(options.target),
+        output: (options) => output(options.target),
       },
     },
   };

@@ -1,11 +1,9 @@
 /**
- * Shared-schema hoisting + per-tool reachable-defs closure.
+ * Shared-schema hoisting and per-operation reachable-definition closure.
  *
- * Component schemas are normalized ONCE per spec and referenced (never cloned)
- * by every tool. Each tool then attaches only the transitive $ref closure its
- * own input schema reaches, so per-tool $defs are KBs instead of the full spec.
- * This is the fix for the OOM (embedding all schemas per operation) and for
- * opaque $refs (the LLM finally sees the resolved shape of a $ref parameter).
+ * Component schemas are normalized once per document and referenced, never
+ * cloned, by every operation. Each operation attaches only its transitive
+ * input/output definition closure.
  */
 
 import type { SchemaObject } from "./types.js";
@@ -128,7 +126,7 @@ function applyNullable(node: Record<string, unknown>): Record<string, unknown> {
   }
   if (typeof rest.$ref === "string") {
     // $ref siblings are ignored by draft-07, so wrap: ref-or-null. The $ref
-    // node keeps its description etc. for the LLM.
+    // Preserve sibling annotations while normalizing the reference.
     return { anyOf: [rest, { type: "null" }] };
   }
   if (Array.isArray(rest.enum)) {

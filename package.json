@@ -1,7 +1,7 @@
 {
   "name": "multi-spec-parser",
   "version": "0.4.2",
-  "description": "Parse OpenAPI 3.0/3.1, Swagger 2.0, and Google Discovery specs into one normalized model, with memory-safe per-tool schema compilation for building LLM tool sets.",
+  "description": "Parse OpenAPI 3.x, Swagger 2.0, and Google Discovery documents into normalized operation-level JSON Schemas and Standard Schema adapters.",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -37,7 +37,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json",
     "install": "node native/install.mjs",
     "prepublishOnly": "npm run build && npm run native:prebuild",
     "native:build": "node native/build.mjs",
@@ -46,7 +46,7 @@
     "battle": "npm run build && node dist/test/battle.js",
     "benchmark": "npm run build && node dist/test/benchmark.js",
     "fixtures": "npm run build && node dist/test/scripts/fetch-fixtures.js",
-    "examples": "node examples/basic.mjs && node examples/multi-format.mjs && node examples/requests.mjs && node examples/llm-tools.mjs && node examples/policies.mjs && node examples/consumer-media-upload.mjs && node examples/google-attachment-to-s3.mjs",
+    "examples": "node examples/basic.mjs && node examples/multi-format.mjs",
     "check": "npm run build && node --test \"dist/test/unit/*.test.js\" && node dist/test/battle.js"
   },
   "keywords": [
@@ -55,8 +55,8 @@
     "google-discovery",
     "parser",
     "yaml",
-    "llm",
-    "tools"
+    "json-schema",
+    "standard-schema"
   ],
   "license": "MIT",
   "devDependencies": {

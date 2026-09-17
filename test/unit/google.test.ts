@@ -94,10 +94,10 @@ describe("Google Discovery adapter", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
     assert.equal(parsed.specFormat, "google-discovery");
     assert.equal(parsed.operations.length, 3);
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     assert.deepEqual(list.tags, ["mail", "users"]);
     const attachment = parsed.operations.find(
-      (o) => o.toolName === "mail_users_messages_attachments_get",
+      (o) => o.operationName === "mail_users_messages_attachments_get",
     )!;
     assert.deepEqual(attachment.tags, ["mail", "users", "attachments"]);
   });
@@ -109,7 +109,7 @@ describe("Google Discovery adapter", () => {
 
   it("filters type:any at conversion (no recursive cleanup pass needed)", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     const anything = list.parameters.find((p) => p.name === "anything")!;
     // Bare schema without `type` — Ajv accepts it, and nothing recursively
     // strips `any` anywhere (the O(n²) domany pass is gone).
@@ -120,7 +120,7 @@ describe("Google Discovery adapter", () => {
 
   it("repeated:true params become array schemas with the item type preserved", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     const q = list.parameters.find((p) => p.name === "q")!;
     assert.equal(q.schema.type, "array");
     assert.equal((q.schema.items as { type?: string }).type, "string");
@@ -128,7 +128,7 @@ describe("Google Discovery adapter", () => {
 
   it("coerces string defaults to the param's numeric type", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     const maxResults = list.parameters.find((p) => p.name === "maxResults")!;
     assert.equal(maxResults.schema.default, 100);
   });
@@ -137,11 +137,11 @@ describe("Google Discovery adapter", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
     for (const op of parsed.operations) {
       const names = op.parameters.map((p) => p.name);
-      assert.ok(names.includes("prettyPrint"), `${op.toolName} missing global prettyPrint`);
-      assert.ok(names.includes("alt"), `${op.toolName} missing global alt`);
+      assert.ok(names.includes("prettyPrint"), `${op.operationName} missing global prettyPrint`);
+      assert.ok(names.includes("alt"), `${op.operationName} missing global alt`);
     }
     // Local params are not duplicated.
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     assert.equal(list.parameters.filter((p) => p.name === "userId").length, 1);
   });
 
@@ -150,14 +150,14 @@ describe("Google Discovery adapter", () => {
     const list = doc.resources!.users!.methods!.list as { path: string; flatPath: string };
     list.path = "users/{userId}/messages?legacy=1"; // legacy path with junk
     const parsed = parseSpec(doc as unknown as Record<string, unknown>);
-    const op = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const op = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     // flatPath wins; discovery paths get a leading slash for URL concat.
     assert.equal(op.path, "/users/{userId}/messages");
   });
 
   it("converts bare $ref schema names to component pointers", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
-    const list = parsed.operations.find((o) => o.toolName === "mail_users_messages_list")!;
+    const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     assert.equal(list.outputSchema?.$ref, "#/components/schemas/ListMessagesResponse");
     const payload = parsed.schemas.Message!.properties!.payload as { $ref?: string };
     assert.equal(payload.$ref, "#/components/schemas/MessagePart");

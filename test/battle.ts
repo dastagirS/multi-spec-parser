@@ -32,10 +32,10 @@ interface SpecCase {
   timeoutMs: number;
   /** Ladder tier for the report (best → worst ordering). */
   tier: string;
-  /** Override the per-tool $defs cap inside the probe (fanout case). */
+  /** Override the per-operation $defs cap inside the probe (fanout case). */
   maxDefsBytes?: number;
   /** Bounds asserted on the probe's stats. defsBytesTotal is the JSON-sum of
-   *  per-tool $defs (NOT memory — defs are shared by reference); the memory
+   *  per-operation $defs (NOT memory — defs are shared by reference); the memory
    *  gate is the child heap cap. Optional: undefined skips the check. */
   defsBytesMaxBound: number;
   defsBytesTotalBound: number | undefined;
@@ -111,7 +111,7 @@ const SPECS: SpecCase[] = [
     heapCapMB: 1024,
     timeoutMs: 240_000,
     tier: "worst-case (schema graph)",
-    // ~1MB closure is Stripe's natural anyOf-graph size; over-cap tools fall
+    // ~1MB closure is Stripe's natural anyOf-graph size; over-cap operations fall
     // back to the shared defs map (~1.8MB). Sum is serialization, not memory.
     defsBytesMaxBound: 2_500_000,
     defsBytesTotalBound: undefined,
@@ -671,7 +671,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         heapCapMB: 1024,
         timeoutMs: 240_000,
         tier: "worst-case (scale)",
-        // Each M(i) refs M(i-1), so a tool referencing M(1499) legitimately
+        // Each M(i) refs M(i-1), so a operation referencing M(1499) legitimately
         // closes over the whole 1500-schema chain (~208KB) — same profile as
         // Stripe's graph; the 1MB cap keeps it from falling back.
         defsBytesMaxBound: 300_000,
@@ -694,7 +694,7 @@ interface ProbeStats {
   parseMs?: number;
   compileMs?: number;
   totalMs?: number;
-  tools?: number;
+  operations?: number;
   heapUsedMB?: number;
   heapTotalMB?: number;
   defsBytesMax?: number;
@@ -793,17 +793,17 @@ async function main(): Promise<void> {
       if (stats.fatal) {
         phaseErrors.push(`child failed during ${stats.fatal}: ${stats.error}`);
       }
-      if (stats.tools !== spec.expectedOps) {
-        phaseErrors.push(`tool count ${stats.tools} !== ${spec.expectedOps}`);
+      if (stats.operations !== spec.expectedOps) {
+        phaseErrors.push(`operation count ${stats.operations} !== ${spec.expectedOps}`);
       }
       if ((stats.defsBytesMax ?? 0) > spec.defsBytesMaxBound) {
         phaseErrors.push(
-          `max per-tool $defs ${fmtBytes(stats.defsBytesMax!)} > bound ${fmtBytes(spec.defsBytesMaxBound)}`,
+          `max per-operation $defs ${fmtBytes(stats.defsBytesMax!)} > bound ${fmtBytes(spec.defsBytesMaxBound)}`,
         );
       }
       if ((stats.defsBytesTotal ?? 0) > (spec.defsBytesTotalBound ?? Infinity)) {
         phaseErrors.push(
-          `sum per-tool $defs ${fmtBytes(stats.defsBytesTotal!)} > bound ${
+          `sum per-operation $defs ${fmtBytes(stats.defsBytesTotal!)} > bound ${
             spec.defsBytesTotalBound !== undefined
               ? fmtBytes(spec.defsBytesTotalBound)
               : "unbounded"
@@ -829,13 +829,13 @@ async function main(): Promise<void> {
       const ok = phaseErrors.length === 0;
       if (!ok) failures += 1;
       const outputSchemaPct =
-        stats.tools && stats.outputSchemaCount !== undefined
-          ? Math.round((stats.outputSchemaCount / stats.tools) * 100)
+        stats.operations && stats.outputSchemaCount !== undefined
+          ? Math.round((stats.outputSchemaCount / stats.operations) * 100)
           : 0;
 
       console.log(`\n[${ok ? "PASS" : "FAIL"}] ${spec.name} (${dt}ms)  [${spec.tier}]`);
       console.log(
-        `  ops=${stats.tools}  parse=${fmtMs(stats.parseMs ?? 0)}  compile=${fmtMs(stats.compileMs ?? 0)}` +
+        `  ops=${stats.operations}  parse=${fmtMs(stats.parseMs ?? 0)}  compile=${fmtMs(stats.compileMs ?? 0)}` +
           `  heap=${stats.heapUsedMB ?? "?"}MB/${spec.heapCapMB}MB  outputSchemas=${outputSchemaPct}%`,
       );
       console.log(

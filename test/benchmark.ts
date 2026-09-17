@@ -23,7 +23,7 @@ interface BenchmarkResult {
   medianMs: number;
   p95Ms: number;
   format: string;
-  tools: number;
+  operations: number;
   heapUsedMB: number;
 }
 
@@ -118,12 +118,12 @@ function parseBenchmarkResult(output: string, expectedName: string): BenchmarkRe
 
 function printBenchmarkResult(result: BenchmarkResult): void {
   assert.ok(result.bytes > 0, `${result.name}: bytes must be positive`);
-  assert.ok(result.tools >= 0, `${result.name}: tools cannot be negative`);
+  assert.ok(result.operations >= 0, `${result.name}: operations cannot be negative`);
   console.log(
     `${result.name}\n` +
       `  source:   ${(result.bytes / 1024 / 1024).toFixed(1)} MB\n` +
       `  format:   ${result.format}\n` +
-      `  tools:    ${result.tools}\n` +
+      `  operations:    ${result.operations}\n` +
       `  fetch:    ${Math.round(result.fetchMs)}ms\n` +
       `  parse():  ${result.samplesMs.join(" / ")}ms ` +
       `(median ${result.medianMs}ms, p95 ${result.p95Ms}ms)\n` +

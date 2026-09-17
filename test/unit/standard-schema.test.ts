@@ -1,6 +1,6 @@
 /**
- * Item 6: Standard Schema adapter — the open `~standard` protocol (Mastra,
- * Zod, Valibot, ArkType consumers) wrapped around a compiled tool's schema.
+ * Standard Schema adapter tests for the open `~standard` interoperability
+ * protocol wrapped around a compiled operation's schema.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -30,7 +30,7 @@ const SIDE_SCHEMAS = {
 const FORMAT_PROJECTION_CASES = [
   {
     format: "swagger2",
-    toolName: "swaggerProject",
+    operationName: "swaggerProject",
     spec: {
       swagger: "2.0",
       info: { title: "T", version: "1" },
@@ -48,7 +48,7 @@ const FORMAT_PROJECTION_CASES = [
   },
   {
     format: "google-discovery",
-    toolName: "google_project",
+    operationName: "google_project",
     spec: {
       kind: "discovery#restDescription",
       name: "google",
@@ -99,11 +99,11 @@ const SPEC = {
 };
 
 describe("toStandardSchema (item 6)", () => {
-  it("wraps a tool as the ~standard protocol shape", async () => {
+  it("wraps a operation as the ~standard protocol shape", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const tool = parser.tool("createPet")!;
-    const std = toStandardSchema(tool);
+    const operation = (await parser.operation("createPet"))!;
+    const std = toStandardSchema(operation);
     assert.equal(std["~standard"].version, 1);
     assert.equal(std["~standard"].vendor, "multi-spec-parser");
     assert.equal(typeof std["~standard"].validate, "function");
@@ -139,14 +139,14 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: formatSpec } });
     await parser.parse();
-    const tool = parser.tool("formatCheck")!;
+    const operation = (await parser.operation("formatCheck"))!;
     const warnings: unknown[][] = [];
     const originalWarn = console.warn;
     console.warn = (...args: Parameters<typeof console.warn>): void => {
       warnings.push(args);
     };
     try {
-      const synchronous = toStandardSchema(tool);
+      const synchronous = toStandardSchema(operation);
       const valid = {
         count: 7,
         pageSize: 4_294_967_295,
@@ -168,8 +168,8 @@ describe("toStandardSchema (item 6)", () => {
       };
       const invalid = synchronous["~standard"].validate(invalidValues);
       assert.ok("issues" in invalid && invalid.issues !== undefined && invalid.issues.length >= 6);
-      const asyncInvalid = await parser.validate(tool, invalidValues);
-      assert.equal(asyncInvalid.valid, false);
+      const asyncInvalid = await parser.toStandardSchema(operation)["~standard"].validate(invalidValues);
+      assert.ok("issues" in asyncInvalid);
     } finally {
       console.warn = originalWarn;
     }
@@ -179,13 +179,13 @@ describe("toStandardSchema (item 6)", () => {
   it("applies defaults only when explicitly requested and does not mutate input", async () => {
     const parser = new MultiSpecParser({ spec: { spec: DEFAULT_SPEC } });
     await parser.parse();
-    const tool = parser.tool("getUser")!;
+    const operation = (await parser.operation("getUser"))!;
     const input = {};
-    const applied = toStandardSchema(tool, { defaultPolicy: "apply" });
+    const applied = toStandardSchema(operation, { defaultPolicy: "apply" });
     assert.deepEqual(await applied["~standard"].validate(input), { value: { userId: "me" } });
     assert.deepEqual(input, {});
     assert.equal(applied["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, undefined);
-    const preserved = toStandardSchema(tool);
+    const preserved = toStandardSchema(operation);
     assert.deepEqual(preserved["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["userId"]);
     const result = preserved["~standard"].validate(input) as { issues?: Array<{ message: string }> };
     assert.ok(result.issues?.some((issue) => /userId/.test(issue.message)));
@@ -194,12 +194,12 @@ describe("toStandardSchema (item 6)", () => {
   it("returns { value } for valid input and { issues } with messages for invalid", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const tool = parser.tool("createPet")!;
-    const appliedSchema = toStandardSchema(tool, { defaultPolicy: "apply" });
+    const operation = (await parser.operation("createPet"))!;
+    const appliedSchema = toStandardSchema(operation, { defaultPolicy: "apply" });
     assert.deepEqual(appliedSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["body"]);
-    const { validate } = toStandardSchema(tool)["~standard"];
+    const { validate } = toStandardSchema(operation)["~standard"];
 
-    // The JSON request body nests under `body` in the tool schema.
+    // The JSON request body nests under `body` in the operation schema.
     const ok = validate({ body: { name: "Rex", age: 3 } });
     assert.deepEqual(ok, { value: { body: { name: "Rex", age: 3 } } });
 
@@ -214,13 +214,13 @@ describe("toStandardSchema (item 6)", () => {
     assert.ok(missing.issues!.some((i) => /name/i.test(i.message)));
   });
 
-  it("is stable across repeated calls on the same tool", async () => {
+  it("is stable across repeated calls on the same operation", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const tool = parser.tool("createPet")!;
-    const a = toStandardSchema(tool);
-    const b = toStandardSchema(tool);
-    assert.equal(a, b, "same tool → same wrapped object (memoized)");
+    const operation = (await parser.operation("createPet"))!;
+    const a = toStandardSchema(operation);
+    const b = toStandardSchema(operation);
+    assert.equal(a, b, "same operation → same wrapped object (memoized)");
   });
 
   it("projects independent transitive input and output definition closures", async () => {
@@ -257,10 +257,10 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: projectionSpec } });
     await parser.parse();
-    const tool = parser.tool("projectItem")!;
-    const canonicalDefinitions = tool.inputSchema.$defs as Record<string, unknown>;
+    const operation = (await parser.operation("projectItem"))!;
+    const canonicalDefinitions = operation.inputSchema.$defs as Record<string, unknown>;
     assert.deepEqual(Object.keys(canonicalDefinitions).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
-    const standard = toStandardSchema(tool);
+    const standard = toStandardSchema(operation);
     const input2020 = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
     const output2020 = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
     assert.deepEqual(Object.keys(input2020.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
@@ -272,7 +272,7 @@ describe("toStandardSchema (item 6)", () => {
     assert.deepEqual(Object.keys(input07.definitions as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
     assert.deepEqual(Object.keys(output07.definitions as Record<string, unknown>).sort(), ["Leaf", "OutputOnly", "OutputRoot", "Shared"]);
     assert.equal(output07.$ref, "#/definitions/OutputRoot");
-    assert.deepEqual(Object.keys(tool.inputSchema.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    assert.deepEqual(Object.keys(operation.inputSchema.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
   });
 
   it("projects closures consistently for Swagger and Google Discovery", async () => {
@@ -280,7 +280,7 @@ describe("toStandardSchema (item 6)", () => {
       const parser = new MultiSpecParser({ spec: { spec: projectionCase.spec } });
       await parser.parse();
       assert.equal(parser.format, projectionCase.format);
-      const standard = parser.toStandardSchema(projectionCase.toolName);
+      const standard = parser.toStandardSchema(projectionCase.operationName);
       const input = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
       const output = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
       assert.deepEqual(Object.keys(input.$defs as Record<string, unknown>), ["Input"]);
@@ -306,16 +306,16 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: missingReferenceSpec } });
     await parser.parse();
-    const tool = parser.tool("missingReferences")!;
-    assert.deepEqual([...(tool.unresolvedRefs ?? [])].sort(), ["#/$defs/MissingInput", "#/$defs/MissingOutput"]);
-    const standard = parser.toStandardSchema(tool);
+    const operation = (await parser.operation("missingReferences"))!;
+    assert.deepEqual([...(operation.unresolvedRefs ?? [])].sort(), ["#/$defs/MissingInput", "#/$defs/MissingOutput"]);
+    const standard = parser.toStandardSchema(operation);
     const input = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
     const output = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
     assert.equal(JSON.stringify(input).includes("MissingInput"), false);
     assert.equal(JSON.stringify(output).includes("MissingOutput"), false);
   });
 
-  it("respects per-tool $defs closures (validates against referenced schemas)", async () => {
+  it("respects per-operation $defs closures (validates against referenced schemas)", async () => {
     const specWithRef = {
       openapi: "3.0.3",
       info: { title: "T", version: "1" },
@@ -346,8 +346,8 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: specWithRef } });
     await parser.parse();
-    const tool = parser.tool("updatePet")!;
-    const std = toStandardSchema(tool);
+    const operation = (await parser.operation("updatePet"))!;
+    const std = toStandardSchema(operation);
     const draft07 = std["~standard"].jsonSchema.input({ target: "draft-07" });
     assert.ok(draft07.definitions);
     assert.equal(draft07.$defs, undefined);

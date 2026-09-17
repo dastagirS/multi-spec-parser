@@ -17,14 +17,14 @@ interface BenchmarkResult {
   medianMs: number;
   p95Ms: number;
   format: string;
-  tools: number;
+  operations: number;
   heapUsedMB: number;
 }
 
 interface ParseSample {
   elapsedMs: number;
   format: string;
-  tools: number;
+  operations: number;
   heapUsedMB: number;
 }
 
@@ -62,15 +62,14 @@ async function measureParse(text: string): Promise<ParseSample> {
   if (typeof global.gc === "function") global.gc();
   const started = performance.now();
   const parser = new MultiSpecParser({ spec: { text } });
-  await parser.parse();
+  const operations = (await parser.parse()).length;
   const elapsedMs = performance.now() - started;
-  const tools = parser.tools().length;
   assert.ok(Number.isFinite(elapsedMs), "parse timing must be finite");
-  assert.ok(tools >= 0, "tool count cannot be negative");
+  assert.ok(operations >= 0, "operation count cannot be negative");
   return {
     elapsedMs,
     format: parser.format,
-    tools,
+    operations,
     heapUsedMB: process.memoryUsage().heapUsed / 1024 / 1024,
   };
 }
@@ -114,7 +113,7 @@ async function main(): Promise<void> {
     medianMs: Math.round(percentile(times, 50)),
     p95Ms: Math.round(percentile(times, 95)),
     format: samples[samples.length - 1]!.format,
-    tools: samples[samples.length - 1]!.tools,
+    operations: samples[samples.length - 1]!.operations,
     heapUsedMB: Math.round(samples[samples.length - 1]!.heapUsedMB),
   };
   assert.equal(result.samplesMs.length, iterationCount);

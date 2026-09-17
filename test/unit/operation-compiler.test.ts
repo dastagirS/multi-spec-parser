@@ -1,11 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 
-import { compileSpecToTools, clearSpecCache, loadSpecSource } from "../../src/factory.js";
+import { compileSpecToOperations } from "../../src/operation-compiler.js";
 import { parseSpec } from "../../src/parse-spec.js";
 
 const fixture = (name: string): Record<string, unknown> =>
@@ -21,70 +19,70 @@ const readFixtureFile = (name: string): string => {
   return readFileSync(path, "utf8");
 };
 
-describe("compileSpecToTools", () => {
-  it("compiles petstore3 into 19 tools with per-op $defs closure", () => {
+describe("compileSpecToOperations", () => {
+  it("compiles petstore3 into 19 operations with per-op $defs closure", () => {
     const parsed = parseSpec(fixture("petstore3.json"));
-    const { tools, defs } = compileSpecToTools(parsed);
-    assert.equal(tools.length, 19);
+    const { operations, defs } = compileSpecToOperations(parsed);
+    assert.equal(operations.length, 19);
     assert.ok(Object.keys(defs).length >= 6);
 
-    for (const tool of tools) {
-      assert.equal(tool.inputSchema.type, "object");
-      assert.ok(tool.inputSchema.properties !== undefined);
+    for (const operation of operations) {
+      assert.equal(operation.inputSchema.type, "object");
+      assert.ok(operation.inputSchema.properties !== undefined);
       // Every $ref inside the input schema must resolve within its own $defs.
-      const refs = collectSchemaRefs(tool.inputSchema);
-      const localDefs = (tool.inputSchema.$defs ?? {}) as Record<string, unknown>;
+      const refs = collectSchemaRefs(operation.inputSchema);
+      const localDefs = (operation.inputSchema.$defs ?? {}) as Record<string, unknown>;
       for (const ref of refs) {
         const name = ref.replace(/^#\/\$defs\//, "");
-        assert.ok(name in localDefs, `${tool.name}: $ref ${ref} not in per-tool $defs`);
+        assert.ok(name in localDefs, `${operation.name}: $ref ${ref} not in per-operation $defs`);
       }
     }
   });
 
-  it("keeps per-tool $defs within the cap (Stripe's anyOf web is dense)", () => {
+  it("keeps per-operation $defs within the cap (Stripe's anyOf web is dense)", () => {
     const parsed = parseSpec(fixture("stripe.json"));
-    const { tools } = compileSpecToTools(parsed);
+    const { operations } = compileSpecToOperations(parsed);
     let maxBytes = 0;
-    for (const tool of tools) {
-      const bytes = JSON.stringify(tool.inputSchema.$defs ?? {}).length;
+    for (const operation of operations) {
+      const bytes = JSON.stringify(operation.inputSchema.$defs ?? {}).length;
       maxBytes = Math.max(maxBytes, bytes);
     }
-    // Stripe's 1440-schema anyOf graph reaches ~1MB per tool naturally; the
+    // Stripe's 1440-schema anyOf graph reaches ~1MB per operation naturally; the
     // factory cap (default 1MB) bounds it, falling back to the shared defs map
-    // by reference for pathological tools instead of cloning per op. The
+    // by reference for pathological operations instead of cloning per op. The
     // fallback size is the full spec's defs (~1.8MB), so the bound is the
     // full-defs size, NOT the old bug's 1GB of embedded clones.
-    assert.ok(maxBytes <= 2_500_000, `max per-tool $defs = ${maxBytes} bytes`);
+    assert.ok(maxBytes <= 2_500_000, `max per-operation $defs = ${maxBytes} bytes`);
   });
 
   it("GitHub closure proves per-op defs are tiny vs the 3.2GB-embedded old bug", () => {
     const parsed = parseSpec(fixture("github.json"));
-    const { tools } = compileSpecToTools(parsed);
+    const { operations } = compileSpecToOperations(parsed);
     let maxBytes = 0;
-    for (const tool of tools) {
-      const bytes = JSON.stringify(tool.inputSchema.$defs ?? {}).length;
+    for (const operation of operations) {
+      const bytes = JSON.stringify(operation.inputSchema.$defs ?? {}).length;
       maxBytes = Math.max(maxBytes, bytes);
     }
     // 1220 ops × 969 schemas embedded per op would be ~3.2GB of JSON; the
-    // closure keeps the largest tool at ~90KB (webhook schemas).
-    assert.ok(maxBytes < 200_000, `max per-tool $defs = ${maxBytes} bytes`);
+    // closure keeps the largest operation at ~90KB (webhook schemas).
+    assert.ok(maxBytes < 200_000, `max per-operation $defs = ${maxBytes} bytes`);
   });
 
   it("compiles booking (0 component schemas) with no $defs and no crash", () => {
     const parsed = parseSpec(fixture("booking.json"));
     assert.equal(Object.keys(parsed.schemas).length, 0);
-    const { tools } = compileSpecToTools(parsed);
-    assert.equal(tools.length, 39);
-    for (const tool of tools) {
-      assert.equal(tool.inputSchema.$defs, undefined);
+    const { operations } = compileSpecToOperations(parsed);
+    assert.equal(operations.length, 39);
+    for (const operation of operations) {
+      assert.equal(operation.inputSchema.$defs, undefined);
     }
   });
 
   it("compiles swagger2 petstore with converted request bodies", () => {
     const parsed = parseSpec(fixture("swagger2.json"));
-    const { tools } = compileSpecToTools(parsed);
-    assert.equal(tools.length, 20);
-    const upload = tools.find((t) => t.operation.path.includes("uploadImage"));
+    const { operations } = compileSpecToOperations(parsed);
+    assert.equal(operations.length, 20);
+    const upload = operations.find((t) => t.operation.path.includes("uploadImage"));
     assert.ok(upload, "expected uploadImage op");
     const props = upload.inputSchema.properties as Record<string, unknown>;
     assert.equal(props.bodyBase64, undefined); // multipart, not octet
@@ -95,18 +93,18 @@ describe("compileSpecToTools", () => {
     assert.deepEqual(upload.inputSchema.required, ["petId"]);
   });
 
-  it("flattens Slack's formData bodies to top-level tool properties", () => {
+  it("flattens Slack's formData bodies to top-level operation properties", () => {
     const parsed = parseSpec(fixture("slack.json"));
-    const { tools } = compileSpecToTools(parsed);
-    assert.equal(tools.length, 174);
-    const approve = tools.find((t) => t.name === "admin_apps_approve");
+    const { operations } = compileSpecToOperations(parsed);
+    assert.equal(operations.length, 174);
+    const approve = operations.find((t) => t.name === "admin_apps_approve");
     assert.ok(approve, "expected admin_apps_approve");
     const approveProps = approve.inputSchema.properties as Record<string, unknown>;
     assert.equal(approveProps.body, undefined);
     assert.ok(approveProps.app_id, "formData field at top level");
     assert.ok(approveProps.request_id, "formData field at top level");
     assert.ok(approveProps.token, "header param stays top-level");
-    const upload = tools.find((t) => t.name === "files_upload");
+    const upload = operations.find((t) => t.name === "files_upload");
     assert.ok(upload, "expected files_upload");
     const uploadProps = upload.inputSchema.properties as Record<string, unknown>;
     assert.equal(uploadProps.body, undefined);
@@ -117,7 +115,7 @@ describe("compileSpecToTools", () => {
     assert.ok(uploadProps.filename);
   });
 
-  it("renames duplicate tool names deterministically", () => {
+  it("renames duplicate operation names deterministically", () => {
     const parsed = parseSpec({
       openapi: "3.0.0",
       info: { title: "t", version: "1" },
@@ -126,8 +124,8 @@ describe("compileSpecToTools", () => {
         "/b": { get: { operationId: "dup", responses: { "200": { description: "ok" } } } },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    assert.deepEqual(tools.map((t) => t.name), ["dup", "dup_1"]);
+    const { operations } = compileSpecToOperations(parsed);
+    assert.deepEqual(operations.map((t) => t.name), ["dup", "dup_1"]);
   });
 
   it("bumps duplicate names past real suffixed ids (no shadowing)", () => {
@@ -140,8 +138,8 @@ describe("compileSpecToTools", () => {
         "/c": { get: { operationId: "getPet", responses: { "200": { description: "ok" } } } },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    const names = tools.map((t) => t.name);
+    const { operations } = compileSpecToOperations(parsed);
+    const names = operations.map((t) => t.name);
     assert.deepEqual(names, ["getPet", "getPet_1", "getPet_2"]);
     assert.equal(new Set(names).size, names.length);
   });
@@ -164,16 +162,16 @@ describe("compileSpecToTools", () => {
         },
       },
     });
-    const tool = compileSpecToTools(parsed).tools[0]!;
-    const properties = tool.inputSchema.properties as Record<string, unknown>;
+    const operation = compileSpecToOperations(parsed).operations[0]!;
+    const properties = operation.inputSchema.properties as Record<string, unknown>;
     assert.deepEqual(Object.keys(properties), ["path_id", "query_id", "constructor_2"]);
     assert.deepEqual(
-      tool.operation.parameters.map((parameter) => [parameter.name, parameter.inputName]),
+      operation.operation.parameters.map((parameter) => [parameter.name, parameter.inputName]),
       [["id", "path_id"], ["id", "query_id"], ["constructor", "constructor_2"]],
     );
   });
 
-  it("prunes dangling refs (input + output) and records them on the tool", () => {
+  it("prunes dangling refs (input + output) and records them on the operation", () => {
     const parsed = parseSpec({
       openapi: "3.0.0",
       info: { title: "t", version: "1" },
@@ -203,16 +201,16 @@ describe("compileSpecToTools", () => {
         },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    const input = tools.find((t) => t.name === "danglingInput")!;
-    const output = tools.find((t) => t.name === "danglingOutput")!;
+    const { operations } = compileSpecToOperations(parsed);
+    const input = operations.find((t) => t.name === "danglingInput")!;
+    const output = operations.find((t) => t.name === "danglingOutput")!;
     const inputProps = input.inputSchema.properties as Record<string, unknown>;
     assert.deepEqual(inputProps.x, {}); // dangling ref replaced with unconstrained
     assert.deepEqual(output.outputSchema, {});
     assert.ok(input.unresolvedRefs?.some((r) => r.includes("Missing")));
     assert.ok(output.unresolvedRefs?.some((r) => r.includes("Missing")));
-    // The good tool is untouched and reports nothing.
-    assert.ok(tools.every((t) => t.name !== "danglingInput" || t.inputSchema.$defs === undefined));
+    // The good operation is untouched and reports nothing.
+    assert.ok(operations.every((t) => t.name !== "danglingInput" || t.inputSchema.$defs === undefined));
   });
 
   it("includes OAuth scopes and deprecation in descriptions", () => {
@@ -230,8 +228,8 @@ describe("compileSpecToTools", () => {
         },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    const desc = tools[0]!.description;
+    const { operations } = compileSpecToOperations(parsed);
+    const desc = operations[0]!.description;
     assert.ok(desc.includes("Required OAuth scopes: read"));
     assert.ok(desc.includes("DEPRECATED"));
   });
@@ -247,12 +245,12 @@ describe("compileSpecToTools", () => {
         "parameters": [{ "name": "__proto__", "in": "query", "schema": { "type": "string" } }],
         "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Holder" } } } } } } } }
     }`);
-    const { tools, defs } = compileSpecToTools(parseSpec(spec));
+    const { operations, defs } = compileSpecToOperations(parseSpec(spec));
     assert.ok(
       Object.prototype.hasOwnProperty.call(defs, "__proto__"),
       "defs keeps the __proto__ schema",
     );
-    const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
+    const props = operations[0]!.inputSchema.properties as Record<string, unknown>;
     assert.ok(Object.prototype.hasOwnProperty.call(props, "__proto___2"), "param input was remapped");
     assert.deepEqual(props["__proto___2"], { type: "string" });
     const holderProps = (defs.Holder as { properties?: Record<string, unknown> }).properties!;
@@ -280,8 +278,8 @@ describe("compileSpecToTools", () => {
         },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    const props = tools[0]!.inputSchema.properties as Record<string, unknown>;
+    const { operations } = compileSpecToOperations(parsed);
+    const props = operations[0]!.inputSchema.properties as Record<string, unknown>;
     assert.deepEqual(props.query_body, { type: "string" });
     assert.deepEqual(props.body, {
       type: "object",
@@ -289,7 +287,7 @@ describe("compileSpecToTools", () => {
     });
   });
 
-  it("prunes def-internal dangling refs once and reports them per tool (P1)", () => {
+  it("prunes def-internal dangling refs once and reports them per operation (P1)", () => {
     const parsed = parseSpec({
       openapi: "3.0.0",
       info: { title: "t", version: "1" },
@@ -320,68 +318,25 @@ describe("compileSpecToTools", () => {
         },
       },
     });
-    const { tools } = compileSpecToTools(parsed);
-    const usesA = tools.find((t) => t.name === "usesA")!;
-    const usesNothing = tools.find((t) => t.name === "usesNothing")!;
+    const { operations } = compileSpecToOperations(parsed);
+    const usesA = operations.find((t) => t.name === "usesA")!;
+    const usesNothing = operations.find((t) => t.name === "usesNothing")!;
     assert.ok(!JSON.stringify(usesA.inputSchema).includes("Missing"), "no dangling ref survives");
     assert.ok(
       usesA.unresolvedRefs?.includes("#/$defs/Missing"),
-      "tool that uses A reports the pruned ref",
+      "operation that uses A reports the pruned ref",
     );
-    assert.equal(usesNothing.unresolvedRefs, undefined, "unrelated tool stays clean");
+    assert.equal(usesNothing.unresolvedRefs, undefined, "unrelated operation stays clean");
   });
 
-  it("dedupes concurrent loads of the same URL (PR6)", async () => {
-    clearSpecCache();
-    let hits = 0;
-    const server = createServer((req, res) => {
-      hits += 1;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ openapi: "3.0.0", info: { title: "t", version: "1" }, paths: {} }));
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const { port } = server.address() as AddressInfo;
-    const url = `http://127.0.0.1:${port}/spec`;
-    try {
-      const results = await Promise.all(Array.from({ length: 5 }, () => loadSpecSource(url)));
-      assert.equal(results.length, 5);
-      assert.equal(hits, 1, "concurrent loads share one fetch");
-    } finally {
-      clearSpecCache();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  });
-
-  it("exposes outputSchema per tool for the LLM contract", () => {
+  it("exposes the successful response schema per operation", () => {
     const parsed = parseSpec(fixture("petstore3.json"));
-    const { tools } = compileSpecToTools(parsed);
-    const withOutput = tools.filter((t) => t.outputSchema);
+    const { operations } = compileSpecToOperations(parsed);
+    const withOutput = operations.filter((t) => t.outputSchema);
     assert.ok(withOutput.length > 10);
   });
 
-  it("bounds the text/URL cache (LRU eviction beyond 32 entries)", async () => {
-    clearSpecCache();
-    let hits = 0;
-    const server = createServer((req, res) => {
-      hits += 1;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ openapi: "3.0.0", info: { title: "t", version: "1" }, paths: {} }));
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const { port } = server.address() as AddressInfo;
-    const base = `http://127.0.0.1:${port}/spec`;
-    try {
-      for (let i = 0; i < 33; i += 1) await loadSpecSource(`${base}${i}`);
-      assert.equal(hits, 33);
-      await loadSpecSource(`${base}0`); // oldest entry evicted → refetch
-      assert.equal(hits, 34);
-      await loadSpecSource(`${base}32`); // most recent still cached
-      assert.equal(hits, 34);
-    } finally {
-      clearSpecCache();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  });
+
 });
 
 /** Walk a schema collecting every #/$defs/X ref (nested included). */

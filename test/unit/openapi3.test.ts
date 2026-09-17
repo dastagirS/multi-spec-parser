@@ -210,9 +210,9 @@ describe("OpenAPI 3.x adapter", () => {
     const op = parsed.operations[0]!;
     assert.equal(op.unresolvedRefs, undefined);
     // Compiling must not throw, and the dangling ref must not appear in defs.
-    const { compileSpecToTools } = await import("../../src/factory.js");
-    const { tools } = compileSpecToTools(parsed);
-    const defs = (tools[0]!.inputSchema.$defs ?? {}) as Record<string, unknown>;
+    const { compileSpecToOperations } = await import("../../src/operation-compiler.js");
+    const { operations } = compileSpecToOperations(parsed);
+    const defs = (operations[0]!.inputSchema.$defs ?? {}) as Record<string, unknown>;
     assert.equal(Object.keys(defs).length, 0);
   });
 
@@ -236,8 +236,8 @@ describe("OpenAPI 3.x adapter", () => {
         },
       },
     });
-    const a = parsed.operations.find((o) => o.toolName === "opA")!;
-    const b = parsed.operations.find((o) => o.toolName === "opB")!;
+    const a = parsed.operations.find((o) => o.operationName === "opA")!;
+    const b = parsed.operations.find((o) => o.operationName === "opB")!;
     // Final-segment miss on a $ref must be recorded (not silently dropped).
     assert.deepEqual(a.unresolvedRefs, ["#/components/parameters/Missing"]);
     assert.equal(b.unresolvedRefs, undefined);
@@ -260,7 +260,7 @@ describe("OpenAPI 3.x adapter", () => {
     // The ref target is itself a declared path, so BOTH yield ops: /pets via
     // the $ref, /shared directly. Previously the $ref path yielded ZERO.
     assert.equal(parsed.operations.length, 2);
-    assert.equal(parsed.operations[0]!.toolName, "sharedGet");
+    assert.equal(parsed.operations[0]!.operationName, "sharedGet");
     assert.equal(parsed.operations[0]!.path, "/pets");
     assert.equal(parsed.operations[1]!.path, "/shared");
   });

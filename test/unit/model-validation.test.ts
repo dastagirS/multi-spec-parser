@@ -12,7 +12,7 @@ describe("validateParsedSpecModel", () => {
       specFormat: "unknown",
       operations: [{
         operationKey: "",
-        toolName: "",
+        operationName: "",
         method: "INVALID",
         path: "pets",
         tags: [],

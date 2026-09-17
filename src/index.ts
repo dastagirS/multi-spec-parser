@@ -1,54 +1,21 @@
 /**
- * multi-spec-parser — parse OpenAPI 3.0/3.1, Swagger 2.0, and Google Discovery
- * specs into one normalized model, then compile memory-safe LLM tool schemas.
- *
- * Public surface is a single class (MultiSpecParser); internal functions are
- * unreachable through the exports map.
+ * Parse OpenAPI 3.x, Swagger 2.0, and Google Discovery descriptions into
+ * normalized operation-level JSON Schemas.
  */
 export { MultiSpecParser } from "./multi-spec-parser.js";
 export type {
-  ExecuteProcessor,
-  ProcessorRule,
-  ProcessorMatchContext,
   MultiSpecParserConfig,
   MultiSpecParserOptions,
-  SpecSource,
-  ToolDescription,
-  ValidationOptions,
-  ValidationResult,
-  CacheOptions,
   ParseOptions,
+  SpecSource,
 } from "./multi-spec-parser.js";
-export type {
-  CompileOptions,
-  CompiledTool,
-  CompileResult,
-  ExtraParameter,
-  ExtraParameterRule,
-  TransformOptions,
-  SchemaTransformContext,
-  RequestTransformContext,
-  ResponseTransformContext,
-  SourceCacheOptions,
-  SpecCacheStats,
-} from "./factory.js";
-export type {
-  BuiltRequest,
-  ExecuteOptions,
-  ExecuteErrorCode,
-  ExecuteErrorDetails,
-  ExecuteResponseMetadata,
-  ExecuteRequestOptions,
-  ExecuteResult,
-  RequestBuildOptions,
-  RequestTransport,
-  TransportRequest,
-} from "./request-builder.js";
+export type { CompiledOperation } from "./operation-compiler.js";
 export type {
   DefaultPolicy,
   StandardJSONSchemaV1,
   StandardJsonSchemaOptions,
   StandardJsonSchemaTarget,
+  StandardSchema,
   StandardSchemaAdapterOptions,
   StandardSchemaIssue,
   StandardSchemaLike,
