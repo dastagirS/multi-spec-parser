@@ -44,6 +44,11 @@ const FIXTURES: Array<{ file: string; url: string }> = [
     file: "slack.json",
     url: "https://raw.githubusercontent.com/slackapi/slack-api-specs/refs/heads/master/web-api/slack_web_openapi_v2_without_examples.json",
   },
+  {
+    file: "spotify.yaml",
+    // Pin the exact official snapshot because operation-count and YAML compatibility gates must remain stable.
+    url: "https://raw.githubusercontent.com/sonallux/spotify-web-api/f1d6138cd0b2bcc8dbd8567e28af97bf68eb7d7c/official-spotify-open-api.yml",
+  },
 ];
 
 const force = process.argv.includes("--force");

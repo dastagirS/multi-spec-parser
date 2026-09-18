@@ -20,6 +20,30 @@ describe("parseYaml", () => {
     });
   });
 
+  it("folds indented plain scalars used by Spotify without consuming nested mappings", () => {
+    assert.deepEqual(jsonValue(`
+operation:
+  description:
+    The [Spotify ID](/documentation/web-api/concepts/spotify-uris-ids)
+    for the episode.
+  parameter:
+    description: The id of the device this command is targeting. If
+      not supplied, the user's currently active device is the target.
+  schemas:
+    - type: object
+      properties:
+        id: { type: string }
+`), {
+      operation: {
+        description: "The [Spotify ID](/documentation/web-api/concepts/spotify-uris-ids) for the episode.",
+        parameter: {
+          description: "The id of the device this command is targeting. If not supplied, the user's currently active device is the target.",
+        },
+        schemas: [{ type: "object", properties: { id: { type: "string" } } }],
+      },
+    });
+  });
+
   it("resolves YAML 1.2 core scalar values without YAML 1.1 aliases", () => {
     const parsed = parseYaml(`
       values:

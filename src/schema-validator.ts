@@ -198,11 +198,13 @@ function validateKeywordShapes(
   if (declaredTypes.some((value) => !["null", "boolean", "object", "array", "number", "integer", "string"].includes(value as string))) {
     return unsupported("type", [...path, "type"], "type contains an unsupported JSON Schema type.");
   }
-  const numericKeywords = [
-    "multipleOf", "maximum", "minimum", "maxLength", "minLength", "maxItems", "minItems",
-    "maxContains", "minContains", "maxProperties", "minProperties",
-  ];
-  for (const keyword of numericKeywords) {
+  for (const keyword of ["multipleOf", "maximum", "minimum"]) {
+    const value = schema[keyword];
+    if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+      return unsupported(keyword, [...path, keyword], `${keyword} must be a finite number.`);
+    }
+  }
+  for (const keyword of ["maxLength", "minLength", "maxItems", "minItems", "maxContains", "minContains", "maxProperties", "minProperties"]) {
     const value = schema[keyword];
     if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
       return unsupported(keyword, [...path, keyword], `${keyword} must be a non-negative finite number.`);

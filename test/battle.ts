@@ -96,6 +96,20 @@ const SPECS: SpecCase[] = [
     refFailuresBound: 0,
   },
   {
+    name: "spotify (OAS 3.0.3, indented plain scalars)",
+    file: "spotify.yaml",
+    expectedOps: 96,
+    heapCapMB: 512,
+    timeoutMs: 60_000,
+    tier: "typical (YAML compatibility)",
+    defsBytesMaxBound: 100_000,
+    defsBytesTotalBound: 1_000_000,
+    // The source incorrectly places required:true inside a string schema.
+    // The validator must reject that assertion instead of silently ignoring it.
+    validatorFailuresExpected: 1,
+    refFailuresBound: 0,
+  },
+  {
     name: "slack (Swagger 2.0, 174 ops — official Web API spec)",
     file: "slack.json",
     expectedOps: 174,

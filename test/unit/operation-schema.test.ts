@@ -85,6 +85,16 @@ describe("OperationSchema", () => {
     assert.equal(additional.status, "error");
   });
 
+  it("supports negative numeric bounds", async () => {
+    const schema = createOperationSchema(
+      { type: "number", minimum: -1, maximum: 1 },
+      {},
+    );
+
+    assert.equal((await schema.validate(-1)).status, "ok");
+    assert.equal((await schema.validate(-2)).status, "error");
+  });
+
   it("supports contains bounds and conditional validation", async () => {
     const schema = createOperationSchema(
       {

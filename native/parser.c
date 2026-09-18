@@ -503,6 +503,87 @@ static bool ny_inline(NyParser *parser, const char *source, size_t length, NyNod
   return ny_parse_scalar(parser, source, length, out);
 }
 
+static bool ny_indented_plain_start(NyParser *parser, size_t line_index, size_t parent_indent, size_t *start) {
+  if (parser == NULL || start == NULL || line_index > parser->count) return false;
+  if (!ny_next_content(parser, line_index, start)) return false;
+  NyLine *line = &parser->lines[*start];
+  if (line->indent <= parent_indent || line->length == 0) return false;
+  if (line->text[0] == '-' && (line->length == 1 || isspace((unsigned char)line->text[1]))) return false;
+  if (line->text[0] == '[' || line->text[0] == '{' || line->text[0] == '\'' || line->text[0] == '"') return false;
+  size_t colon = 0;
+  return !ny_find_colon(line->text, line->length, false, &colon);
+}
+
+static bool ny_fold_plain_lines(NyParser *parser, size_t start, size_t parent_indent, const char *prefix, size_t prefix_length, char **out, size_t *out_length, size_t *last) {
+  if (parser == NULL || prefix == NULL || out == NULL || out_length == NULL || last == NULL || start >= parser->count) return false;
+  size_t first = 0;
+  if (!ny_next_content(parser, start, &first) || parser->lines[first].indent <= parent_indent) return ny_fail(parser, "invalid indented plain scalar");
+  size_t capacity = prefix_length + parser->lines[first].length + 2;
+  char *result = malloc(capacity);
+  if (result == NULL) return ny_fail(parser, "out of memory");
+  memcpy(result, prefix, prefix_length);
+  size_t result_length = prefix_length;
+  size_t blank_count = 0;
+  size_t index = start;
+  while (index < parser->count) {
+    NyLine *line = &parser->lines[index];
+    if (!line->blank && line->indent <= parent_indent) break;
+    if (line->blank) {
+      blank_count++;
+      index++;
+      continue;
+    }
+    size_t separator_length = result_length == 0 ? 0 : blank_count > 0 ? blank_count : 1;
+    size_t needed = result_length + separator_length + line->length + 1;
+    if (needed > NY_MAX_INPUT_BYTES) { free(result); return ny_fail(parser, "plain scalar is too large"); }
+    while (capacity < needed) {
+      if (capacity > NY_MAX_INPUT_BYTES / 2) { free(result); return ny_fail(parser, "plain scalar is too large"); }
+      capacity *= 2;
+    }
+    char *grown = realloc(result, capacity);
+    if (grown == NULL) { free(result); return ny_fail(parser, "out of memory"); }
+    result = grown;
+    for (size_t separator = 0; separator < separator_length; separator++) result[result_length++] = blank_count > 0 ? '\n' : ' ';
+    memcpy(result + result_length, line->text, line->length);
+    result_length += line->length;
+    blank_count = 0;
+    index++;
+  }
+  result[result_length] = '\0';
+  *out = result;
+  *out_length = result_length;
+  *last = index - 1;
+  return *out != NULL && *out_length >= prefix_length && *last >= start;
+}
+
+static bool ny_indented_plain(NyParser *parser, size_t start, size_t parent_indent, NyNode **out, size_t *last) {
+  if (parser == NULL || out == NULL || last == NULL || start >= parser->count) return false;
+  char *result = NULL;
+  size_t result_length = 0;
+  if (!ny_fold_plain_lines(parser, start, parent_indent, "", 0, &result, &result_length, last)) return false;
+  NyNode *value = ny_node(parser, NY_STRING);
+  if (value == NULL) { free(result); return false; }
+  value->data.string.value = result;
+  value->data.string.length = result_length;
+  *out = value;
+  return *out != NULL && *last >= start;
+}
+
+static bool ny_join_plain(NyParser *parser, size_t *line_index, size_t parent_indent, const char *source, size_t length, char **joined, size_t *joined_length) {
+  if (parser == NULL || line_index == NULL || source == NULL || joined == NULL || joined_length == NULL || length == 0) return false;
+  *joined = NULL;
+  *joined_length = 0;
+  size_t next = 0;
+  if (!ny_next_content(parser, *line_index + 1, &next) || parser->lines[next].indent <= parent_indent) return true;
+  NyLine *next_line = &parser->lines[next];
+  size_t colon = 0;
+  if (
+    (next_line->text[0] == '-' && (next_line->length == 1 || isspace((unsigned char)next_line->text[1]))) ||
+    ny_find_colon(next_line->text, next_line->length, false, &colon)
+  ) return true;
+  return ny_fold_plain_lines(parser, *line_index + 1, parent_indent, source, length, joined, joined_length, line_index);
+}
+
 static bool ny_choose_child(NyParser *parser, size_t line_index, NyNode **out) {
   size_t next = 0; if (!ny_next_content(parser, line_index, &next)) return false; const char *content = parser->lines[next].text; size_t length = parser->lines[next].length; if (content[0] == '-' && (length == 1 || isspace((unsigned char)content[1]))) *out = ny_node(parser, NY_SEQUENCE); else *out = ny_node(parser, NY_MAP); return *out != NULL;
 }
@@ -586,8 +667,18 @@ static bool ny_block(NyParser *parser, NyNode **out) {
         const char *key_source = rest; size_t key_length = colon; ny_trim(&key_source, &key_length); NyNode *key_node = NULL; if (!ny_parse_scalar(parser, key_source, key_length, &key_node) || key_node->type != NY_STRING) { ny_free_node(key_node); free(frames); ny_free_node(root); return ny_fail(parser, "mapping key must be text"); } char *key = ny_copy(key_node->data.string.value, key_node->data.string.length); ny_free_node(key_node); if (key == NULL) { free(frames); ny_free_node(root); return ny_fail(parser, "out of memory"); }
         const char *value_source = rest + colon + 1; size_t value_length = rest_length - colon - 1; ny_trim(&value_source, &value_length); NyNode *value = NULL;
         if (value_length > 0 && (value_source[0] == '|' || value_source[0] == '>')) { if (!ny_block_scalar(parser, line->indent + 2, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } index = parser->index; }
-        else if (value_length == 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; } if (frame_count + 1 >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){map, line->indent + 2, false}; frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE}; } else value = ny_node(parser, NY_NULL); }
-        else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined != NULL) { value = NULL; if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); ny_free_node(root); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } }
+        else if (value_length == 0) {
+          size_t next = 0;
+          if (ny_indented_plain_start(parser, index + 1, line->indent, &next)) {
+            if (!ny_indented_plain(parser, next, line->indent, &value, &index)) { free(key); free(frames); ny_free_node(root); return false; }
+          } else if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) {
+            if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; }
+            if (frame_count + 1 >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); }
+            frames[frame_count++] = (NyFrame){map, line->indent + 2, false};
+            frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE};
+          } else value = ny_node(parser, NY_NULL);
+        }
+        else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] != '\'' && value_source[0] != '"' && !ny_is_flow(value_source, value_length) && !ny_join_plain(parser, &index, line->indent, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined != NULL) { value = NULL; if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); ny_free_node(root); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } }
         if (value == NULL || !ny_map_add(parser, map, key, value)) { free(key); free(frames); ny_free_node(root); return false; }
         if (value_length != 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (frame_count >= parser->max_depth) { free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){map, parser->lines[next].indent, false}; } }
         index++; continue;
@@ -597,12 +688,28 @@ static bool ny_block(NyParser *parser, NyNode **out) {
       else { char *joined = NULL; size_t joined_length = 0; if (rest_length > 0 && rest[0] == '\'' && !ny_single_quote_complete(rest, rest_length) && !ny_join_single_quoted(parser, &index, rest, rest_length, &joined, &joined_length)) { free(frames); ny_free_node(root); return false; } if (joined == NULL && rest_length > 0 && rest[0] == '"' && !ny_double_quote_complete(rest, rest_length) && !ny_join_double_quoted(parser, &index, rest, rest_length, &joined, &joined_length)) { free(frames); ny_free_node(root); return false; } if (joined != NULL) { bool parsed = ny_inline(parser, joined, joined_length, &value); free(joined); if (!parsed) { free(frames); ny_free_node(root); return false; } } else if (!ny_inline(parser, rest, rest_length, &value)) { free(frames); ny_free_node(root); return false; } }
       if (value == NULL || !ny_sequence_add(parser, frame->node, value)) { free(frames); ny_free_node(root); return false; } index++; continue;
     }
-    size_t colon = 0; if (!ny_find_colon(line->text, line->length, false, &colon)) { free(frames); ny_free_node(root); return ny_fail(parser, "mapping entry expected"); }
+    size_t colon = 0;
+    if (!ny_find_colon(line->text, line->length, false, &colon)) {
+      char detail[256];
+      snprintf(detail, sizeof(detail), "mapping entry expected at line %zu: %.180s", index + 1, line->text);
+      free(frames);
+      ny_free_node(root);
+      return ny_fail(parser, detail);
+    }
     const char *key_source = line->text; size_t key_length = colon; ny_trim(&key_source, &key_length); NyNode *key_node = NULL; if (!ny_parse_scalar(parser, key_source, key_length, &key_node) || key_node->type != NY_STRING) { ny_free_node(key_node); free(frames); ny_free_node(root); return ny_fail(parser, "mapping key must be text"); } char *key = ny_copy(key_node->data.string.value, key_node->data.string.length); ny_free_node(key_node); if (key == NULL) { free(frames); ny_free_node(root); return ny_fail(parser, "out of memory"); }
     const char *value_source = line->text + colon + 1; size_t value_length = line->length - colon - 1; ny_trim(&value_source, &value_length); NyNode *value = NULL;
     if (value_length > 0 && (value_source[0] == '|' || value_source[0] == '>')) { if (!ny_block_scalar(parser, line->indent, value_source, value_length, &value)) { free(key); free(frames); ny_free_node(root); return false; } index = parser->index; }
-    else if (value_length == 0) { size_t next = 0; if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) { if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; } if (frame_count >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); } frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE}; } else value = ny_node(parser, NY_NULL); }
-    else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined != NULL) { if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); return false; } }
+    else if (value_length == 0) {
+      size_t next = 0;
+      if (ny_indented_plain_start(parser, index + 1, line->indent, &next)) {
+        if (!ny_indented_plain(parser, next, line->indent, &value, &index)) { free(key); free(frames); ny_free_node(root); return false; }
+      } else if (ny_next_content(parser, index + 1, &next) && parser->lines[next].indent > line->indent) {
+        if (!ny_choose_child(parser, index + 1, &value)) { free(key); free(frames); ny_free_node(root); return false; }
+        if (frame_count >= parser->max_depth) { free(key); free(frames); ny_free_node(root); return ny_fail(parser, "nesting limit exceeded"); }
+        frames[frame_count++] = (NyFrame){value, parser->lines[next].indent, value->type == NY_SEQUENCE};
+      } else value = ny_node(parser, NY_NULL);
+    }
+    else { char *joined = NULL; size_t joined_length = 0; if (value_length > 0 && value_source[0] == '\'' && !ny_single_quote_complete(value_source, value_length) && !ny_join_single_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && value_length > 0 && value_source[0] == '"' && !ny_double_quote_complete(value_source, value_length) && !ny_join_double_quoted(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined == NULL && value_length > 0 && value_source[0] != '\'' && value_source[0] != '"' && !ny_is_flow(value_source, value_length) && !ny_join_plain(parser, &index, line->indent, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); ny_free_node(root); return false; } if (joined == NULL && ny_is_flow(value_source, value_length) && !ny_join_flow(parser, &index, value_source, value_length, &joined, &joined_length)) { free(key); free(frames); return false; } if (joined != NULL) { if (!ny_inline(parser, joined, joined_length, &value)) { free(joined); free(key); free(frames); return false; } free(joined); } else if (!ny_inline(parser, value_source, value_length, &value)) { free(key); free(frames); return false; } }
     if (value == NULL || !ny_map_add(parser, frame->node, key, value)) { free(key); free(frames); ny_free_node(root); return false; } index++;
   }
   free(frames); parser->index = index; *out = root; return true;
