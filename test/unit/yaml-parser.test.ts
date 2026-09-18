@@ -30,7 +30,10 @@ operation:
     description: The id of the device this command is targeting. If
       not supplied, the user's currently active device is the target.
   schemas:
-    - type: object
+    - description: A schema with a
+        continued description.
+      type: object
+      required: true
       properties:
         id: { type: string }
 `), {
@@ -39,7 +42,12 @@ operation:
         parameter: {
           description: "The id of the device this command is targeting. If not supplied, the user's currently active device is the target.",
         },
-        schemas: [{ type: "object", properties: { id: { type: "string" } } }],
+        schemas: [{
+          description: "A schema with a continued description.",
+          type: "object",
+          required: true,
+          properties: { id: { type: "string" } },
+        }],
       },
     });
   });

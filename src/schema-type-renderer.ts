@@ -76,18 +76,28 @@ function renderNode(schema: Schema, rendered: WeakMap<object, string>, aliases: 
   assert(rendered instanceof WeakMap && aliases instanceof Map, "render caches must be maps");
   if (typeof schema.$ref === "string") {
     const name = parseDefinitionReference(schema.$ref);
-    return name ? aliases.get(name) ?? "unknown" : "unknown";
+    const referencedType = name ? aliases.get(name) ?? "unknown" : "unknown";
+    return referencedType === "unknown"
+      ? referencedType
+      : intersectRendered(referencedType, renderOwnType(schema, rendered, aliases));
   }
   if (Object.prototype.hasOwnProperty.call(schema, "const")) return renderLiteral(schema.const);
   if (Array.isArray(schema.enum) && schema.enum.length > 0) {
     return joinBounded(schema.enum.map(renderLiteral), " | ");
   }
+  const ownType = renderOwnType(schema, rendered, aliases);
   const anyOf = readRenderedChildren(schema.anyOf, rendered);
-  if (anyOf.length > 0) return joinBounded(anyOf, " | ");
+  if (anyOf.length > 0) return intersectRendered(joinBounded(anyOf, " | "), ownType);
   const oneOf = readRenderedChildren(schema.oneOf, rendered);
-  if (oneOf.length > 0) return joinBounded(oneOf, " | ");
+  if (oneOf.length > 0) return intersectRendered(joinBounded(oneOf, " | "), ownType);
   const allOf = readRenderedChildren(schema.allOf, rendered);
-  if (allOf.length > 0) return joinBounded(allOf, " & ");
+  if (allOf.length > 0) return intersectRendered(joinBounded(allOf, " & "), ownType);
+  return ownType;
+}
+
+function renderOwnType(schema: Schema, rendered: WeakMap<object, string>, aliases: ReadonlyMap<string, string>): string {
+  assert(isRecord(schema), "rendered local schema must be an object");
+  assert(rendered instanceof WeakMap && aliases instanceof Map, "local render caches must be maps");
   const declaredTypes = Array.isArray(schema.type)
     ? schema.type.filter((value): value is string => typeof value === "string")
     : typeof schema.type === "string" ? [schema.type] : [];
@@ -96,6 +106,13 @@ function renderNode(schema: Schema, rendered: WeakMap<object, string>, aliases: 
   if (isRecord(schema.properties) || schema.additionalProperties !== undefined) return renderObject(schema, rendered, aliases);
   if (schema.items !== undefined || Array.isArray(schema.prefixItems)) return renderArray(schema, rendered);
   return "unknown";
+}
+
+function intersectRendered(appliedType: string, ownType: string): string {
+  assert(typeof appliedType === "string" && appliedType.length > 0, "applied type must be non-empty");
+  assert(typeof ownType === "string" && ownType.length > 0, "local type must be non-empty");
+  if (ownType === "unknown") return appliedType;
+  return joinBounded([`(${appliedType})`, ownType], " & ");
 }
 
 function renderDeclaredType(type: string, schema: Schema, rendered: WeakMap<object, string>, aliases: ReadonlyMap<string, string>): string {

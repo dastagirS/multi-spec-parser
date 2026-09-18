@@ -28,6 +28,19 @@ describe("OperationSchema", () => {
     assert.deepEqual(schema.definitions, { Pet: "{ name: string; }" });
   });
 
+  it("renders local constraints together with applied schemas", () => {
+    const schema = createOperationSchema(
+      {
+        type: "object",
+        properties: { local: { type: "string" } },
+        allOf: [{ type: "object", properties: { applied: { type: "number" } } }],
+      },
+      {},
+    );
+
+    assert.equal(schema.type, "({ applied?: number; }) & { local?: string; }");
+  });
+
   it("validates references, objects, arrays, and combinators without mutation", async () => {
     const schema = createOperationSchema(
       {
@@ -68,6 +81,21 @@ describe("OperationSchema", () => {
     }
   });
 
+  it("resolves JSON Pointer suffixes beneath definitions", async () => {
+    const schema = createOperationSchema(
+      { $ref: "#/$defs/Container/properties/id" },
+      {
+        Container: {
+          type: "object",
+          properties: { id: { type: "string", minLength: 2 } },
+        },
+      },
+    );
+
+    assert.equal((await schema.validate("ab")).status, "ok");
+    assert.equal((await schema.validate("a")).status, "error");
+  });
+
   it("validates draft-07 tuple items used by Swagger documents", async () => {
     const schema = createOperationSchema(
       {
@@ -93,6 +121,23 @@ describe("OperationSchema", () => {
 
     assert.equal((await schema.validate(-1)).status, "ok");
     assert.equal((await schema.validate(-2)).status, "error");
+  });
+
+  it("rejects invalid numeric assertions and formatted values", async () => {
+    const invalidMultiple = createOperationSchema({ type: "number", multipleOf: -2 }, {});
+    const invalidMultipleResult = await invalidMultiple.validate(4);
+    assert.equal(invalidMultipleResult.status, "error");
+    assert.equal(
+      invalidMultipleResult.status === "error" && invalidMultipleResult.error._tag,
+      "UnsupportedValidationKeyword",
+    );
+
+    for (const [format, value] of [["date", "2023-02-30"], ["date-time", "2023-02-30T12:00:00Z"], ["ipv6", "::::"]]) {
+      assert.equal((await createOperationSchema({ type: "string", format }, {}).validate(value)).status, "error");
+    }
+    for (const [format, value] of [["date", "2024-02-29"], ["date-time", "2024-02-29T12:00:00Z"], ["ipv6", "2001:db8::1"]]) {
+      assert.equal((await createOperationSchema({ type: "string", format }, {}).validate(value)).status, "ok");
+    }
   });
 
   it("supports contains bounds and conditional validation", async () => {

@@ -23,6 +23,21 @@ describe("normalizeSchemaRefs", () => {
     );
   });
 
+  it("preserves JSON Pointer suffixes beneath component schemas", () => {
+    const out = normalizeSchemaRefs({
+      $ref: "#/components/schemas/Foo/properties/id",
+    }) as Record<string, unknown>;
+
+    assert.equal(out.$ref, "#/$defs/Foo/properties/id");
+    assert.deepEqual(
+      Object.keys(collectReachableDefs([out], {
+        Foo: { type: "object", properties: { id: { type: "string" } } },
+      })),
+      ["Foo"],
+    );
+    assert.deepEqual(removeDanglingRefs(out, new Set(["Foo"]), new Set()), out);
+  });
+
   it("returns the same object when nothing changed (no clone)", () => {
     const schema = { type: "object", properties: { a: { type: "string" } } };
     assert.equal(normalizeSchemaRefs(schema), schema);

@@ -158,6 +158,7 @@ function rewriteProjectedSchema(
   walkSchema(projected, (current) => {
     rewriteDefinitions(current, target);
     rewriteReference(current, target);
+    rewriteTupleItems(current, target);
   });
   return projected;
 }
@@ -210,6 +211,16 @@ function rewriteReference(schema: Record<string, unknown>, target: StandardJsonS
   assert(typeof target === "string", "JSON Schema target must be a string");
   if (target !== DRAFT_07 || typeof schema.$ref !== "string") return;
   if (schema.$ref.startsWith("#/$defs/")) schema.$ref = `#/definitions/${schema.$ref.slice("#/$defs/".length)}`;
+}
+
+function rewriteTupleItems(schema: Record<string, unknown>, target: StandardJsonSchemaTarget): void {
+  assert(schema !== null && typeof schema === "object", "schema node must be an object");
+  assert(typeof target === "string", "JSON Schema target must be a string");
+  if (target !== DRAFT_07 || !Array.isArray(schema.prefixItems)) return;
+  const additionalItems = schema.items;
+  schema.items = schema.prefixItems;
+  delete schema.prefixItems;
+  if (additionalItems !== undefined) schema.additionalItems = additionalItems;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

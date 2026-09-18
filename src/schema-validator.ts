@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 
 const VALIDATION_WORK_MAX = 1_000_000;
@@ -7,6 +8,7 @@ const VALIDATION_BRANCH_MAX = 10_000;
 const VALIDATION_ISSUE_MAX = 1_000;
 const VALIDATION_COLLECTION_MAX = 100_000;
 const VALIDATION_PATTERN_LENGTH_MAX = 64 * 1024;
+const VALIDATION_REFERENCE_LENGTH_MAX = 16 * 1024 * 1024;
 const VALIDATION_UNIQUE_COMPARISON_MAX = 1_000_000;
 
 export interface ValidationIssue {
@@ -210,7 +212,9 @@ function validateKeywordShapes(
       return unsupported(keyword, [...path, keyword], `${keyword} must be a non-negative finite number.`);
     }
   }
-  if (schema.multipleOf === 0) return unsupported("multipleOf", [...path, "multipleOf"], "multipleOf must be greater than zero.");
+  if (typeof schema.multipleOf === "number" && schema.multipleOf <= 0) {
+    return unsupported("multipleOf", [...path, "multipleOf"], "multipleOf must be greater than zero.");
+  }
   for (const keyword of ["exclusiveMinimum", "exclusiveMaximum"]) {
     const value = schema[keyword];
     if (value !== undefined && typeof value !== "number" && typeof value !== "boolean") {
@@ -327,11 +331,9 @@ function evaluateDirect(
   if (typeof schema.$ref === "string") {
     const reference = parseDefinitionReference(schema.$ref);
     if (reference === undefined) return unsupported("$ref", ["$ref"], `Unsupported reference: ${schema.$ref}`);
-    const target = Object.prototype.hasOwnProperty.call(plan.definitions, reference)
-      ? plan.definitions[reference]
-      : undefined;
-    if (!target) {
-      addIssue(issues, path, "$ref", `Definition not found: ${reference}`);
+    const target = resolveDefinitionReference(plan.definitions, reference);
+    if (!isRecord(target)) {
+      addIssue(issues, path, "$ref", `Definition reference not found: ${schema.$ref}`);
     } else {
       tasks.push({ ...task, schema: target, depth: task.depth + 1, lineage });
     }
@@ -610,14 +612,14 @@ function matchesFormat(format: string, value: string): boolean {
   assert(typeof format === "string" && format.length > 0, "format must be non-empty");
   assert(typeof value === "string", "formatted value must be a string");
   switch (format) {
-    case "date": return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
-    case "time": return /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-][0-2]\d:[0-5]\d)$/.test(value);
-    case "date-time": return /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(Date.parse(value));
+    case "date": return isRfc3339Date(value);
+    case "time": return /^(?:[01]\d|2[0-3]):[0-5]\d:(?:[0-5]\d|60)(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value);
+    case "date-time": return isRfc3339DateTime(value);
     case "duration": return /^P(?=\d|T\d)(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$/.test(value);
     case "email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
     case "hostname": return value.length <= 253 && /^(?=.{1,253}\.?$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.?$/.test(value);
-    case "ipv4": return isIpv4(value);
-    case "ipv6": return value.includes(":") && /^[0-9a-fA-F:.]+$/.test(value);
+    case "ipv4": return isIP(value) === 4;
+    case "ipv6": return isIP(value) === 6;
     case "uri":
     case "url": try { new URL(value); return true; } catch { return false; }
     case "uri-reference": try { new URL(value, "https://example.invalid"); return true; } catch { return false; }
@@ -625,7 +627,7 @@ function matchesFormat(format: string, value: string): boolean {
     case "uuid": return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
     case "byte": return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
     case "uint64": return /^(?:0|[1-9][0-9]{0,19})$/.test(value) && (value.length < 20 || value <= "18446744073709551615");
-    case "google-datetime": return /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(Date.parse(value));
+    case "google-datetime": return isRfc3339DateTime(value);
     case "google-fieldmask": return true;
     case "YYYY-MM": return /^\d{4}-(?:0[1-9]|1[0-2])$/.test(value);
     case "unix-time": return /^-?\d+$/.test(value);
@@ -670,18 +672,68 @@ function isUriTemplate(value: string): boolean {
   }
 }
 
-function isIpv4(value: string): boolean {
-  assert(typeof value === "string", "IPv4 value must be a string");
-  assert(value.length <= 64, "IPv4 value must be bounded");
-  const parts = value.split(".");
-  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+function isRfc3339Date(value: string): boolean {
+  assert(typeof value === "string", "date value must be a string");
+  assert(value.length <= VALIDATION_PATTERN_LENGTH_MAX, "date value must be bounded");
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= days[month - 1]!;
 }
 
-function parseDefinitionReference(reference: string): string | undefined {
+function isRfc3339DateTime(value: string): boolean {
+  assert(typeof value === "string", "date-time value must be a string");
+  assert(value.length <= VALIDATION_PATTERN_LENGTH_MAX, "date-time value must be bounded");
+  const separator = value.search(/[Tt]/);
+  if (separator === -1 || !isRfc3339Date(value.slice(0, separator))) return false;
+  return /^(?:[01]\d|2[0-3]):[0-5]\d:(?:[0-5]\d|60)(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value.slice(separator + 1));
+}
+
+interface DefinitionReference {
+  readonly name: string;
+  readonly path: readonly string[];
+}
+
+function parseDefinitionReference(reference: string): DefinitionReference | undefined {
   assert(typeof reference === "string", "schema reference must be a string");
-  assert(reference.length <= 16 * 1024 * 1024, "schema reference must be bounded");
+  assert(reference.length <= VALIDATION_REFERENCE_LENGTH_MAX, "schema reference must be bounded");
   if (!reference.startsWith("#/$defs/")) return undefined;
-  return reference.slice("#/$defs/".length).replaceAll("~1", "/").replaceAll("~0", "~");
+  const segments = reference.slice("#/$defs/".length).split("/").map(decodePointerSegment);
+  if (segments.length === 0 || segments[0]!.length === 0) return undefined;
+  return { name: segments[0]!, path: segments.slice(1) };
+}
+
+function resolveDefinitionReference(
+  definitions: Readonly<Record<string, Record<string, unknown>>>,
+  reference: DefinitionReference,
+): unknown {
+  assert(isRecord(definitions), "reference definitions must be an object");
+  assert(reference.name.length > 0 && Array.isArray(reference.path), "definition reference must be valid");
+  let current: unknown = Object.prototype.hasOwnProperty.call(definitions, reference.name)
+    ? definitions[reference.name]
+    : undefined;
+  for (const segment of reference.path) {
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9]\d*)$/.test(segment)) return undefined;
+      current = current[Number(segment)];
+    } else if (isRecord(current) && Object.prototype.hasOwnProperty.call(current, segment)) {
+      current = current[segment];
+    } else {
+      return undefined;
+    }
+  }
+  return current;
+}
+
+function decodePointerSegment(segment: string): string {
+  assert(typeof segment === "string", "JSON Pointer segment must be a string");
+  assert(segment.length <= VALIDATION_REFERENCE_LENGTH_MAX, "JSON Pointer segment must be bounded");
+  return segment.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function addIssue(issues: ValidationIssue[], path: ReadonlyArray<string | number>, keyword: string, message: string): void {

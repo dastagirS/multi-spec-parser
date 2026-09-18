@@ -8,7 +8,7 @@
 
 import type { SchemaObject } from "./types.js";
 
-const SCHEMA_REF_RE = /^#\/(?:components\/schemas|\$defs|definitions)\/(.+)$/;
+const SCHEMA_REF_RE = /^#\/(?:components\/schemas|\$defs|definitions)\/([^/]+)(\/.*)?$/;
 
 /**
  * Own-property write that survives the __proto__ prototype trap: assigning
@@ -87,7 +87,7 @@ export function normalizeSchemaRefs(node: unknown): unknown {
     const reference = typeof source.$ref === "string" ? source.$ref.match(SCHEMA_REF_RE) : null;
     for (const [key, value] of Object.entries(source)) {
       const replacement = key === "$ref"
-        ? reference ? `#/$defs/${reference[1]}` : value
+        ? reference ? `#/$defs/${reference[1]}${reference[2] ?? ""}` : value
         : value !== null && typeof value === "object" ? results.get(value) : value;
       if (replacement !== value) changed = true;
       setOwn(output, key, replacement);
@@ -235,9 +235,10 @@ export function removeDanglingRefs(
       if (visited > MAX_SCHEMA_NODES) throw new Error("Schema exceeds the supported node limit");
       if (!Array.isArray(current)) {
         const reference = (current as Record<string, unknown>).$ref;
-        if (typeof reference === "string" && reference.startsWith("#/$defs/")) {
-          const name = decodeRefSegment(reference.slice("#/$defs/".length));
-          if (!valid.has(name)) {
+        if (typeof reference === "string") {
+          const match = reference.match(SCHEMA_REF_RE);
+          const name = match ? decodeRefSegment(match[1]!) : undefined;
+          if (name !== undefined && !valid.has(name)) {
             pruned.add(reference);
             results.set(current, {});
             states.set(current, 2);

@@ -269,6 +269,43 @@ describe("toStandardSchema", () => {
     assert.deepEqual(Object.keys(operation.input.definitions).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
   });
 
+  it("rewrites 2020-12 tuple keywords for draft-07 consumers", async () => {
+    const parser = new MultiSpecParser({
+      spec: {
+        spec: {
+          openapi: "3.1.0",
+          info: { title: "T", version: "1" },
+          paths: {
+            "/tuple": {
+              post: {
+                operationId: "tuple",
+                requestBody: {
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "array",
+                        prefixItems: [{ type: "string" }, { type: "integer" }],
+                        items: false,
+                      },
+                    },
+                  },
+                },
+                responses: { "204": { description: "ok" } },
+              },
+            },
+          },
+        },
+      },
+    });
+    await parser.parse();
+
+    const draft07 = parser.toStandardSchema("tuple").input("draft-07");
+    const body = (draft07.properties as Record<string, Record<string, unknown>>).body!;
+    assert.deepEqual(body.items, [{ type: "string" }, { type: "integer" }]);
+    assert.equal(body.additionalItems, false);
+    assert.equal(body.prefixItems, undefined);
+  });
+
   it("projects closures consistently for Swagger and Google Discovery", async () => {
     for (const projectionCase of FORMAT_PROJECTION_CASES) {
       const parser = new MultiSpecParser({ spec: { spec: projectionCase.spec } });
