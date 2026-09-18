@@ -31,8 +31,7 @@ export interface NormalizedSecurityRequirement {
 /**
  * A JSON-Schema-ish schema object. `type` may be an array (OpenAPI 3.1 /
  * JSON Schema 2020-12); `exclusiveMinimum/Maximum` may be numeric (3.1) or
- * boolean-modifier style (3.0) — both pass through untouched because Ajv
- * draft-07 accepts type arrays and numeric exclusiveMinimum natively.
+ * boolean-modifier style (3.0). The operation validator handles both forms.
  */
 export interface SchemaObject {
   type?: string | string[];

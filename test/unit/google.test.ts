@@ -111,7 +111,7 @@ describe("Google Discovery adapter", () => {
     const parsed = parseSpec(makeDoc() as unknown as Record<string, unknown>);
     const list = parsed.operations.find((o) => o.operationName === "mail_users_messages_list")!;
     const anything = list.parameters.find((p) => p.name === "anything")!;
-    // Bare schema without `type` — Ajv accepts it, and nothing recursively
+    // Bare schema without `type` remains unconstrained, and nothing recursively
     // strips `any` anywhere (the O(n²) domany pass is gone).
     assert.equal(anything.schema.type, undefined);
     // Every other param keeps its type.

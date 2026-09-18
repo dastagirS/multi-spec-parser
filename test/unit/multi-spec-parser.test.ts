@@ -4,6 +4,19 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { MultiSpecParser } from "../../src/multi-spec-parser.js";
+import type { CompiledOperation } from "../../src/operation-compiler.js";
+import { getCanonicalOperationSchema } from "../../src/operation-schema.js";
+
+function canonicalOperation(operation: CompiledOperation | undefined): unknown {
+  assert(operation !== undefined, "compiled operation must exist");
+  assert(operation.input !== null && typeof operation.input === "object", "compiled operation input must exist");
+  const { input, output, ...metadata } = operation;
+  return {
+    ...metadata,
+    input: getCanonicalOperationSchema(input),
+    output: output ? getCanonicalOperationSchema(output) : undefined,
+  };
+}
 
 const LAZY_SPEC_TEXT = `openapi: 3.0.3
 info:
@@ -276,25 +289,28 @@ describe("MultiSpecParser", () => {
       assert.equal(parser.baseUrl, "https://api.example.com/v2");
       assert.deepEqual(parser.operationNames(), ["getPet", "getPet_1"]);
 
-      const operation = await parser.operation("getPet");
+      const operation = await parser.getOperation("getPet");
       assert.ok(operation);
       assert.equal(operation.path, "/pets/{petId}");
-      assert.ok((operation.inputSchema.$defs as Record<string, unknown>).Pet);
-      assert.ok((operation.inputSchema.$defs as Record<string, unknown>).Named);
-      assert.strictEqual(operation, await parser.operation("getPet"));
-      assert.equal(await parser.operation("missing"), undefined);
+      assert.ok(operation.output?.definitions.Pet);
+      assert.ok(operation.output?.definitions.Named);
+      assert.strictEqual(operation, await parser.getOperation("getPet"));
+      assert.equal(await parser.getOperation("missing"), undefined);
 
       const eager = new MultiSpecParser({ spec: { text: LAZY_SPEC_TEXT } });
       await eager.parse();
-      assert.deepEqual(operation, await eager.operation("getPet"));
-      assert.deepEqual(await parser.operation("getPet_1"), await eager.operation("getPet_1"));
+      assert.deepEqual(canonicalOperation(operation), canonicalOperation(await eager.getOperation("getPet")));
+      assert.deepEqual(
+        canonicalOperation(await parser.getOperation("getPet_1")),
+        canonicalOperation(await eager.getOperation("getPet_1")),
+      );
       await assert.rejects(parser.parse(), /unavailable in lazy mode/);
     } finally {
       await parser.close();
       await parser.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    await assert.rejects(parser.operation("getPet"), /parser is closed/);
+    await assert.rejects(parser.getOperation("getPet"), /parser is closed/);
     assert.throws(() => parser.operationNames(), /parser is closed/);
   });
 
@@ -331,7 +347,10 @@ describe("MultiSpecParser", () => {
           assert.equal(lazy.format, eager.format);
           assert.equal(lazy.baseUrl, eager.baseUrl);
           for (const name of lazy.operationNames()) {
-            assert.deepEqual(await lazy.operation(name), await eager.operation(name));
+            assert.deepEqual(
+              canonicalOperation(await lazy.getOperation(name)),
+              canonicalOperation(await eager.getOperation(name)),
+            );
           }
         } finally {
           await lazy.close();
@@ -387,18 +406,29 @@ paths:
     });
     await parser.parse();
     assert.equal(parser.format, "openapi3");
-    assert.equal((await parser.operation("listPets"))?.path, "/pets");
+    assert.equal((await parser.getOperation("listPets"))?.path, "/pets");
   });
 
-  it("projects normalized operations with self-contained JSON Schemas", async () => {
+  it("projects normalized operations with explicit schema handles", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     const operations = await parser.parse();
     assert.equal(operations.length, 3);
-    const getPet = await parser.operation("getPet");
+    const getPet = await parser.getOperation("getPet");
     assert.ok(getPet);
     assert.equal(getPet.method, "GET");
-    assert.deepEqual(getPet.outputSchema, { $ref: "#/$defs/Pet" });
-    assert.ok((getPet.inputSchema.$defs as Record<string, unknown>).Pet);
+    assert.equal(getPet.output?.type, "Pet");
+    assert.ok(getPet.output?.definitions.Pet);
+    assert.equal("inputSchema" in getPet, false);
+    assert.equal("outputSchema" in getPet, false);
+    assert.equal("operation" in parser, false);
+  });
+
+  it("rejects removed compact projection options", async () => {
+    const parser = new MultiSpecParser({ spec: { spec: SPEC } });
+    await assert.rejects(
+      parser.parse({ compact: true } as never),
+      /unknown key/,
+    );
   });
 
   it("returns a copy of the operation collection", async () => {
@@ -408,15 +438,12 @@ paths:
     assert.equal((await parser.parse()).length, 3);
   });
 
-  it("compacts over-budget schemas without changing canonical operations", async () => {
+  it("exposes bounded TypeScript schema handles", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
-    await parser.parse();
-    const canonical = (await parser.operation("getPet"))!;
-    const compact = (await parser.parse({ compact: true, maxBytes: 20 }))
-      .find((operation) => operation.name === "getPet")!;
-    assert.equal(compact.inputSchema.$defs, undefined);
-    assert.deepEqual(compact.inputSchema.$refs, ["Pet"]);
-    assert.ok(canonical.inputSchema.$defs);
+    const operation = (await parser.parse()).find((candidate) => candidate.name === "getPet")!;
+    assert.match(operation.input.type, /^\{/);
+    assert.equal(operation.output?.type, "Pet");
+    assert.ok(operation.output?.definitions.Pet);
   });
 
   it("memoizes canonical operations while returning collection copies", async () => {
@@ -424,7 +451,7 @@ paths:
     const [first, second] = await Promise.all([parser.parse(), parser.parse()]);
     assert.notStrictEqual(first, second);
     assert.strictEqual(first[0], second[0]);
-    assert.strictEqual(await parser.operation("getPet"), await parser.operation("getPet"));
+    assert.strictEqual(await parser.getOperation("getPet"), await parser.getOperation("getPet"));
   });
 
   it("adapts operation schemas to Standard Schema", async () => {
@@ -447,7 +474,7 @@ paths:
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     assert.throws(() => parser.format, /call parser\.parse/);
     await parser.parse();
-    assert.equal(await parser.operation("missing"), undefined);
+    assert.equal(await parser.getOperation("missing"), undefined);
     assert.throws(() => parser.toStandardSchema("missing"), /unknown operation/);
   });
 });

@@ -98,11 +98,11 @@ const SPEC = {
   },
 };
 
-describe("toStandardSchema (item 6)", () => {
-  it("wraps a operation as the ~standard protocol shape", async () => {
+describe("toStandardSchema", () => {
+  it("wraps an operation as the ~standard protocol shape", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const operation = (await parser.operation("createPet"))!;
+    const operation = (await parser.getOperation("createPet"))!;
     const std = toStandardSchema(operation);
     assert.equal(std["~standard"].version, 1);
     assert.equal(std["~standard"].vendor, "multi-spec-parser");
@@ -115,7 +115,7 @@ describe("toStandardSchema (item 6)", () => {
     assert.equal(draft2020.$schema, "https://json-schema.org/draft/2020-12/schema");
   });
 
-  it("enforces OpenAPI formats consistently without Ajv warnings", async () => {
+  it("enforces OpenAPI formats consistently without runtime warnings", async () => {
     const formatSpec = {
       openapi: "3.0.3",
       info: { title: "T", version: "1" },
@@ -139,7 +139,7 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: formatSpec } });
     await parser.parse();
-    const operation = (await parser.operation("formatCheck"))!;
+    const operation = (await parser.getOperation("formatCheck"))!;
     const warnings: unknown[][] = [];
     const originalWarn = console.warn;
     console.warn = (...args: Parameters<typeof console.warn>): void => {
@@ -156,7 +156,7 @@ describe("toStandardSchema (item 6)", () => {
         refreshTime: "2025-01-01T00:00:00Z",
         fields: "nextPageToken,items.id",
       };
-      assert.deepEqual(synchronous["~standard"].validate(valid), { value: valid });
+      assert.deepEqual(await synchronous["~standard"].validate(valid), { value: valid });
       const invalidValues = {
         count: 2_147_483_648,
         pageSize: 4_294_967_296,
@@ -166,7 +166,7 @@ describe("toStandardSchema (item 6)", () => {
         refreshTime: "not-a-date",
         fields: "items(id)",
       };
-      const invalid = synchronous["~standard"].validate(invalidValues);
+      const invalid = await synchronous["~standard"].validate(invalidValues);
       assert.ok("issues" in invalid && invalid.issues !== undefined && invalid.issues.length >= 6);
       const asyncInvalid = await parser.toStandardSchema(operation)["~standard"].validate(invalidValues);
       assert.ok("issues" in asyncInvalid);
@@ -176,48 +176,42 @@ describe("toStandardSchema (item 6)", () => {
     assert.deepEqual(warnings, []);
   });
 
-  it("applies defaults only when explicitly requested and does not mutate input", async () => {
+  it("preserves defaults as annotations without mutating input", async () => {
     const parser = new MultiSpecParser({ spec: { spec: DEFAULT_SPEC } });
     await parser.parse();
-    const operation = (await parser.operation("getUser"))!;
+    const operation = (await parser.getOperation("getUser"))!;
     const input = {};
-    const applied = toStandardSchema(operation, { defaultPolicy: "apply" });
-    assert.deepEqual(await applied["~standard"].validate(input), { value: { userId: "me" } });
+    const standard = toStandardSchema(operation);
+    assert.deepEqual(standard["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["userId"]);
+    const result = await standard["~standard"].validate(input);
+    assert.ok("issues" in result && result.issues?.some((issue) => /userId/.test(issue.message)));
     assert.deepEqual(input, {});
-    assert.equal(applied["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, undefined);
-    const preserved = toStandardSchema(operation);
-    assert.deepEqual(preserved["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["userId"]);
-    const result = preserved["~standard"].validate(input) as { issues?: Array<{ message: string }> };
-    assert.ok(result.issues?.some((issue) => /userId/.test(issue.message)));
   });
 
   it("returns { value } for valid input and { issues } with messages for invalid", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const operation = (await parser.operation("createPet"))!;
-    const appliedSchema = toStandardSchema(operation, { defaultPolicy: "apply" });
-    assert.deepEqual(appliedSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["body"]);
-    const { validate } = toStandardSchema(operation)["~standard"];
+    const operation = (await parser.getOperation("createPet"))!;
+    const standard = toStandardSchema(operation);
+    assert.deepEqual(standard["~standard"].jsonSchema.input({ target: "draft-2020-12" }).required, ["body"]);
+    const { validate } = standard["~standard"];
 
     // The JSON request body nests under `body` in the operation schema.
-    const ok = validate({ body: { name: "Rex", age: 3 } });
+    const ok = await validate({ body: { name: "Rex", age: 3 } });
     assert.deepEqual(ok, { value: { body: { name: "Rex", age: 3 } } });
 
-    const bad = validate({ body: { age: "not-a-number" } }) as {
-      issues?: Array<{ message: string }>;
-    };
-    assert.ok(Array.isArray(bad.issues));
-    assert.ok(bad.issues!.length > 0);
-    assert.ok(bad.issues!.every((i) => typeof i.message === "string"));
+    const bad = await validate({ body: { age: "not-a-number" } });
+    assert.ok("issues" in bad && bad.issues !== undefined && bad.issues.length > 0);
+    assert.ok("issues" in bad && bad.issues?.every((issue) => typeof issue.message === "string"));
 
-    const missing = validate({ body: {} }) as { issues?: Array<{ message: string }> };
-    assert.ok(missing.issues!.some((i) => /name/i.test(i.message)));
+    const missing = await validate({ body: {} });
+    assert.ok("issues" in missing && missing.issues?.some((issue) => /name/i.test(issue.message)));
   });
 
   it("is stable across repeated calls on the same operation", async () => {
     const parser = new MultiSpecParser({ spec: { spec: SPEC } });
     await parser.parse();
-    const operation = (await parser.operation("createPet"))!;
+    const operation = (await parser.getOperation("createPet"))!;
     const a = toStandardSchema(operation);
     const b = toStandardSchema(operation);
     assert.equal(a, b, "same operation → same wrapped object (memoized)");
@@ -257,9 +251,9 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: projectionSpec } });
     await parser.parse();
-    const operation = (await parser.operation("projectItem"))!;
-    const canonicalDefinitions = operation.inputSchema.$defs as Record<string, unknown>;
-    assert.deepEqual(Object.keys(canonicalDefinitions).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    const operation = (await parser.getOperation("projectItem"))!;
+    assert.deepEqual(Object.keys(operation.input.definitions).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
+    assert.deepEqual(Object.keys(operation.output!.definitions).sort(), ["Leaf", "OutputOnly", "OutputRoot", "Shared"]);
     const standard = toStandardSchema(operation);
     const input2020 = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
     const output2020 = standard["~standard"].jsonSchema.output({ target: "draft-2020-12" });
@@ -272,7 +266,7 @@ describe("toStandardSchema (item 6)", () => {
     assert.deepEqual(Object.keys(input07.definitions as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
     assert.deepEqual(Object.keys(output07.definitions as Record<string, unknown>).sort(), ["Leaf", "OutputOnly", "OutputRoot", "Shared"]);
     assert.equal(output07.$ref, "#/definitions/OutputRoot");
-    assert.deepEqual(Object.keys(operation.inputSchema.$defs as Record<string, unknown>).sort(), ["InputOnly", "InputRoot", "Leaf", "OutputOnly", "OutputRoot", "Shared"]);
+    assert.deepEqual(Object.keys(operation.input.definitions).sort(), ["InputOnly", "InputRoot", "Leaf", "Shared"]);
   });
 
   it("projects closures consistently for Swagger and Google Discovery", async () => {
@@ -306,7 +300,7 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: missingReferenceSpec } });
     await parser.parse();
-    const operation = (await parser.operation("missingReferences"))!;
+    const operation = (await parser.getOperation("missingReferences"))!;
     assert.deepEqual([...(operation.unresolvedRefs ?? [])].sort(), ["#/$defs/MissingInput", "#/$defs/MissingOutput"]);
     const standard = parser.toStandardSchema(operation);
     const input = standard["~standard"].jsonSchema.input({ target: "draft-2020-12" });
@@ -346,7 +340,7 @@ describe("toStandardSchema (item 6)", () => {
     };
     const parser = new MultiSpecParser({ spec: { spec: specWithRef } });
     await parser.parse();
-    const operation = (await parser.operation("updatePet"))!;
+    const operation = (await parser.getOperation("updatePet"))!;
     const std = toStandardSchema(operation);
     const draft07 = std["~standard"].jsonSchema.input({ target: "draft-07" });
     assert.ok(draft07.definitions);
@@ -354,10 +348,10 @@ describe("toStandardSchema (item 6)", () => {
     assert.equal(draft07.$ref, undefined);
     assert.deepEqual(std["~standard"].jsonSchema.output({ target: "draft-07" }).$schema, "http://json-schema.org/draft-07/schema#");
     const { validate } = std["~standard"];
-    assert.deepEqual(validate({ id: "1", body: { name: "ok" } }), {
+    assert.deepEqual(await validate({ id: "1", body: { name: "ok" } }), {
       value: { id: "1", body: { name: "ok" } },
     });
-    const bad = validate({ id: "1", body: {} }) as { issues?: Array<{ message: string }> };
-    assert.ok(bad.issues!.some((i) => /name/i.test(i.message)));
+    const bad = await validate({ id: "1", body: {} });
+    assert.ok("issues" in bad && bad.issues?.some((issue) => /name/i.test(issue.message)));
   });
 });

@@ -1,5 +1,5 @@
 /**
- * Battle suite: parse → compile → Ajv over real-world specs AND a synthetic
+ * Battle suite: parse → compile → validation plans over real-world specs and a synthetic
  * adversarial ladder (best case → worst case), each in a heap-capped child
  * process. Guards the machine: every spec runs under --max-old-space-size (a
  * regression like the old 1220×969 clone OOM dies in the child, not on the
@@ -39,7 +39,7 @@ interface SpecCase {
    *  gate is the child heap cap. Optional: undefined skips the check. */
   defsBytesMaxBound: number;
   defsBytesTotalBound: number | undefined;
-  ajvFailuresBound: number;
+  validatorFailuresExpected: number;
   refFailuresBound: number;
 }
 
@@ -53,7 +53,7 @@ const SPECS: SpecCase[] = [
     tier: "typical (small)",
     defsBytesMaxBound: 200_000,
     defsBytesTotalBound: 2_000_000,
-    ajvFailuresBound: 0,
+    validatorFailuresExpected: 0,
     refFailuresBound: 0,
   },
   {
@@ -65,7 +65,7 @@ const SPECS: SpecCase[] = [
     tier: "typical (2.0)",
     defsBytesMaxBound: 200_000,
     defsBytesTotalBound: 2_000_000,
-    ajvFailuresBound: 0,
+    validatorFailuresExpected: 0,
     refFailuresBound: 0,
   },
   {
@@ -77,7 +77,9 @@ const SPECS: SpecCase[] = [
     tier: "typical (ref-less)",
     defsBytesMaxBound: 100_000,
     defsBytesTotalBound: 1_000_000,
-    ajvFailuresBound: 0,
+    // orders_preview has property schemas directly under an object schema;
+    // rejecting `conditional` is safer than silently treating it as an annotation.
+    validatorFailuresExpected: 1,
     refFailuresBound: 0,
   },
   {
@@ -89,7 +91,8 @@ const SPECS: SpecCase[] = [
     tier: "typical (YAML path)",
     defsBytesMaxBound: 100_000,
     defsBytesTotalBound: 1_000_000,
-    ajvFailuresBound: 0,
+    // Same pinned source as booking.json, exercised through the YAML parser.
+    validatorFailuresExpected: 1,
     refFailuresBound: 0,
   },
   {
@@ -101,7 +104,7 @@ const SPECS: SpecCase[] = [
     tier: "heavy (2.0 formData)",
     defsBytesMaxBound: 100_000,
     defsBytesTotalBound: 1_000_000,
-    ajvFailuresBound: 0,
+    validatorFailuresExpected: 0,
     refFailuresBound: 0,
   },
   {
@@ -115,7 +118,7 @@ const SPECS: SpecCase[] = [
     // back to the shared defs map (~1.8MB). Sum is serialization, not memory.
     defsBytesMaxBound: 2_500_000,
     defsBytesTotalBound: undefined,
-    ajvFailuresBound: 0,
+    validatorFailuresExpected: 0,
     refFailuresBound: 0,
   },
   {
@@ -127,7 +130,7 @@ const SPECS: SpecCase[] = [
     tier: "worst-case (scale)",
     defsBytesMaxBound: 200_000,
     defsBytesTotalBound: undefined,
-    ajvFailuresBound: 0,
+    validatorFailuresExpected: 0,
     refFailuresBound: 0,
   },
 ];
@@ -490,7 +493,7 @@ function syntheticMassive(): Record<string, unknown> {
   return { ...baseSpec("Massive"), components: { schemas }, paths };
 }
 
-/** Google Discovery with media uploads — item 9 surface + Ajv gate (4 of 12
+/** Google Discovery with media uploads — item 9 surface + validation gate (4 of 12
  *  ops are media-capable POSTs with simplePath, accept types, schema refs). */
 function syntheticGoogleMedia(): Record<string, unknown> {
   const METHOD_COUNT = 12;
@@ -551,7 +554,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "best-case (floor)",
         defsBytesMaxBound: 1_000,
         defsBytesTotalBound: 1_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -566,7 +569,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "typical",
         defsBytesMaxBound: 100_000,
         defsBytesTotalBound: 1_000_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -581,7 +584,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "format torture",
         defsBytesMaxBound: 10_000,
         defsBytesTotalBound: 50_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -596,7 +599,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "dangling refs",
         defsBytesMaxBound: 10_000,
         defsBytesTotalBound: 30_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -611,7 +614,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "cyclic refs",
         defsBytesMaxBound: 100_000,
         defsBytesTotalBound: 500_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -626,7 +629,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "google media (Discovery)",
         defsBytesMaxBound: 50_000,
         defsBytesTotalBound: 150_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -643,7 +646,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         // Whole-defs fallback is ~400KB of shared schemas.
         defsBytesMaxBound: 1_000_000,
         defsBytesTotalBound: undefined,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -658,7 +661,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         tier: "deep nesting",
         defsBytesMaxBound: 100_000,
         defsBytesTotalBound: 100_000,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -676,7 +679,7 @@ function buildSyntheticSpecs(): SpecCase[] {
         // Stripe's graph; the 1MB cap keeps it from falling back.
         defsBytesMaxBound: 300_000,
         defsBytesTotalBound: undefined,
-        ajvFailuresBound: 0,
+        validatorFailuresExpected: 0,
         refFailuresBound: 0,
       },
     },
@@ -701,11 +704,12 @@ interface ProbeStats {
   defsBytesTotal?: number;
   defsCountTotal?: number;
   outputSchemaCount?: number;
-  ajvCompileFailures?: number;
+  validatorPlanFailures?: number;
   refResolutionFailures?: number;
   refRewriteFailures?: number;
   unresolvedRefsTotal?: number;
   failures?: string[];
+  validatorFailureDetails?: string[];
   fatal?: string;
   error?: string;
   expected?: number;
@@ -810,8 +814,13 @@ async function main(): Promise<void> {
           }`,
         );
       }
-      if ((stats.ajvCompileFailures ?? 0) > spec.ajvFailuresBound) {
-        phaseErrors.push(`ajv compile failures: ${stats.ajvCompileFailures}`);
+      if ((stats.validatorPlanFailures ?? 0) !== spec.validatorFailuresExpected) {
+        phaseErrors.push(
+          `validator plan failures: expected ${spec.validatorFailuresExpected}, got ${stats.validatorPlanFailures ?? 0}` +
+            (stats.validatorFailureDetails?.length
+              ? ` (${stats.validatorFailureDetails.join("; ")})`
+              : ""),
+        );
       }
       if ((stats.refResolutionFailures ?? 0) > spec.refFailuresBound) {
         phaseErrors.push(`dangling $refs: ${stats.refResolutionFailures}`);
@@ -843,7 +852,7 @@ async function main(): Promise<void> {
           `  count=${stats.defsCountTotal ?? 0}  unresolvedRefs=${stats.unresolvedRefsTotal ?? 0}`,
       );
       console.log(
-        `  ajvCompileFailures=${stats.ajvCompileFailures ?? 0}  danglingRefs=${stats.refResolutionFailures ?? 0}`,
+        `  validatorPlanFailures=${stats.validatorPlanFailures ?? 0}  danglingRefs=${stats.refResolutionFailures ?? 0}`,
       );
       if (phaseErrors.length > 0) {
         for (const e of phaseErrors) console.log(`  ✗ ${e}`);

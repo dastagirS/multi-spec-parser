@@ -21,6 +21,9 @@
 - Sources are caller-provided URLs, JSON/YAML text, or parsed objects. URL
   loading is a bounded parser convenience with cancellation; authentication,
   retries, custom transports, and source caches remain caller-owned.
+- Do not add parser-owned service inference or an `operationSummaries()` filter
+  API. Callers reduce source scope by supplying a narrower upstream description,
+  then use `operationNames()` and `getOperation()` for lazy access.
 - Low-memory loading means indexing a large source document without
   materializing its complete parsed or normalized model, then materializing
   requested operations and transitive schema references on demand. Object
@@ -34,22 +37,26 @@
   YAML also remains supported. Support may ship incrementally, and any encoding
   or layout not yet indexed must reject. `options.lazy: true` selects this mode;
   omitted or false remains eager.
-- Canonical operation schemas retain their combined input/output definition
-  closure; Standard JSON Schema projections independently expose only
-  definitions reachable from their respective input or output root.
-- `parse({ compact: true, maxBytes })` creates bounded copies without mutating
-  canonical operations. Budgets use serialized UTF-8 bytes.
+- Input and output schema handles independently retain only definitions
+  reachable from their root. Standard JSON Schema projections preserve the same
+  boundary.
+- Use `getOperation(name)` without a deprecated `operation(name)` alias. Do not
+  add `parser.validate()`: each compiled operation exposes explicit
+  `input` and optional `output` schema handles, and validation lives on those
+  handles as `operation.input.validate(value)` and
+  `operation.output?.validate(value)`. The entire public schema-handle surface is
+  `type`, `definitions`, and `validate()`; canonical JSON Schema remains private.
 - Standard Schema adapters expose ergonomic `validate()`, `input()`, and
   `output()` methods; `~standard` remains only for ecosystem interoperability.
-- Canonical schemas remain private normalized JSON Schema. Public operation
-  schemas expose bounded compact TypeScript preview strings, separate referenced
-  type definitions, and lazy memoized validation against the canonical schema.
-  Preview rendering degrades to `unknown` beyond safety limits. Do not introduce
-  a second validation model or custom type AST.
-- Runtime validation must remain Ajv-free and dependency-free. Build a bounded
-  targeted validator available only through parser-produced operation input and
-  output handles; never expose arbitrary-schema validation, claim support for
-  arbitrary JSON Schema, or silently ignore unsupported assertion keywords.
+- Canonical JSON Schema is private. Schema handles expose bounded compact
+  TypeScript previews, separate referenced definitions, and lazy memoized
+  non-mutating validation. There is no `defaultPolicy`; applying defaults is
+  consumer-owned transformation. Preview rendering degrades to `unknown` beyond
+  safety limits. Do not introduce a second validation model or custom type AST.
+- Runtime validation is Ajv-free and dependency-free. Keep the bounded targeted
+  validator available only through parser-produced operation input and output
+  handles; never expose arbitrary-schema validation, claim
+  support for arbitrary JSON Schema, or silently ignore unsupported assertions.
 - Zod is out of scope and must not be shipped or exposed. Prioritize bounded
   low-memory source loading before adding further schema adapters.
 - Object sources remain caller-owned and are never mutated. Arbitrary compile

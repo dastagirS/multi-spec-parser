@@ -25,15 +25,34 @@ they never fall back to eager parsing. Caller-owned text and object sources
 remain eager. Consumers opt into low-memory loading with `options.lazy: true`;
 omitted or false retains eager loading.
 
-## Schema Presentation
+## Source Partitioning
 
-Canonical normalization remains JSON-Schema-based internally. Consumers receive
-compact TypeScript preview strings for operation input and output, with referenced
-type definitions kept separately rather than repeatedly inlined. Validation is
-lazy and memoized against the private canonical JSON Schema; TypeScript previews
-are presentation, not the validation model. Rendering is bounded and degrades to
-`unknown` when a schema exceeds its safety limits. Validation is dependency-free
-and is available only through operation input/output handles produced by this
-parser; there is no arbitrary-schema validation API. Unsupported assertion
-keywords reject explicitly rather than being ignored. The package does not expose
-a custom type AST, Ajv, or Zod schemas.
+Reducing source transfer is different from lazy operation materialization. The
+parser does not infer provider-specific services or expose semantic operation
+selectors. Callers that need a smaller workload provide a narrower upstream API
+description, such as Microsoft Graph's workload-specific OpenAPI documents.
+Within that source, `operationNames()` and `getOperation()` remain the lazy
+access boundary.
+
+## Operation Schema Handles
+
+Canonical normalization remains JSON-Schema-based, but canonical JSON Schema is
+private. Standard JSON Schema projections independently include only definitions
+reachable from their input or output root.
+
+`getOperation(name)` returns a compiled operation with an `input` schema handle
+and optional `output` schema handle. Validation belongs to the selected handle,
+not to the parser: consumers call `operation.input.validate(value)` or
+`operation.output?.validate(value)`. There is no ambiguous `parser.validate()`
+and no `defaultPolicy`; validation observes values without applying defaults or
+other consumer-owned transformations.
+
+The complete public handle surface is `type`, `definitions`, and `validate()`.
+`type` is a bounded compact TypeScript preview; `definitions` keeps referenced
+TypeScript declarations separate; and `validate()` lazily compiles and memoizes
+validation against private canonical JSON Schema. TypeScript remains
+presentation rather than the validation model.
+Rendering degrades to `unknown` beyond safety limits. The dependency-free
+validator is available only through parser-produced handles and rejects
+unsupported assertion keywords rather than silently ignoring them. No custom
+type AST or Zod schema API is planned.

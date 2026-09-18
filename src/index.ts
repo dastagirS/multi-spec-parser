@@ -11,12 +11,19 @@ export type {
 } from "./multi-spec-parser.js";
 export type { CompiledOperation } from "./operation-compiler.js";
 export type {
-  DefaultPolicy,
+  OperationSchema,
+  UnsupportedValidationKeyword,
+  ValidationError,
+  ValidationFailed,
+  ValidationIssue,
+  ValidationLimitExceeded,
+  ValidationResult,
+} from "./operation-schema.js";
+export type {
   StandardJSONSchemaV1,
   StandardJsonSchemaOptions,
   StandardJsonSchemaTarget,
   StandardSchema,
-  StandardSchemaAdapterOptions,
   StandardSchemaIssue,
   StandardSchemaLike,
   StandardSchemaOptions,

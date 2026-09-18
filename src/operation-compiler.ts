@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 
 import { assertValidParsedSpecModel } from "./model-validation.js";
+import { createOperationSchema, type OperationSchema } from "./operation-schema.js";
 import { collectReachableDefs, normalizeDefs, normalizeSchemaRefs, removeDanglingRefs, setOwn } from "./schema-closure.js";
 import {
   assignUniqueOperationName,
@@ -27,10 +28,10 @@ export interface CompiledOperation {
   description: string;
   method: ExtractedOperation["method"];
   path: string;
-  /** JSON Schema (draft-07-compatible) with an operation-level $defs closure. */
-  inputSchema: Record<string, unknown>;
-  /** Success-response schema; $refs resolve against inputSchema.$defs. */
-  outputSchema: Record<string, unknown> | undefined;
+  /** Compiled operation input presentation and validation handle. */
+  input: OperationSchema;
+  /** Compiled success-response presentation and validation handle. */
+  output: OperationSchema | undefined;
   operation: ExtractedOperation;
   /** Refs that could not be resolved: top-level refs dropped at parse time
    *  (original form, e.g. #/components/parameters/X) + schema refs pruned at
@@ -180,14 +181,31 @@ function compilePreparedOperation(
       for (const ref of refs) unresolvedRefs.add(ref);
     }
   }
+  const { $defs: _inputDefinitions, ...inputRoot } = prunedInput;
+  const inputDefinitions = prunedOutput
+    ? collectReachableDefs(
+        [inputRoot],
+        reachable as Record<string, SchemaObject>,
+      ) as Record<string, Record<string, unknown>>
+    : reachable as Record<string, Record<string, unknown>>;
+  const outputDefinitions = prunedOutput
+    ? Object.keys(inputDefinitions).length === 0
+      ? reachable as Record<string, Record<string, unknown>>
+      : collectReachableDefs(
+          [prunedOutput],
+          reachable as Record<string, SchemaObject>,
+        ) as Record<string, Record<string, unknown>>
+    : undefined;
   return {
     name: prepared.name,
     operationKey: operation.operationKey,
     description: buildDescription(operation),
     method: operation.method,
     path: operation.path,
-    inputSchema: prunedInput,
-    outputSchema: prunedOutput,
+    input: createOperationSchema(prunedInput, inputDefinitions),
+    output: prunedOutput && outputDefinitions
+      ? createOperationSchema(prunedOutput, outputDefinitions)
+      : undefined,
     operation,
     ...(unresolvedRefs.size > 0 ? { unresolvedRefs: [...unresolvedRefs] } : {}),
   };

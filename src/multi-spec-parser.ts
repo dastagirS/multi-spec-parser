@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 
-import type { ValidateFunction } from "ajv";
 import {
   compileSpecToOperations,
   type CompiledOperation,
   type OperationCompileResult,
 } from "./operation-compiler.js";
-import { registerOpenApiFormats, resolveAjvFormatsPlugin } from "./openapi-formats.js";
 import {
   createLazySourceIndex,
   type LazyOperationIndex,
@@ -19,18 +17,12 @@ import {
   type TemporarySpecFile,
 } from "./source-loader.js";
 import {
-  cloneForDefaultApplication,
   createStandardSchemaAdapter,
-  type DefaultPolicy,
   type StandardSchema,
-  type StandardSchemaAdapterOptions,
 } from "./standard-schema-adapter.js";
 import type { SpecFormat } from "./types.js";
 
-const DEFAULT_COMPACT_MAX_BYTES = 64 * 1024;
 const NOT_PARSED = "MultiSpecParser: call parser.parse() first.";
-const UTF8_ENCODER = new TextEncoder();
-const validators = new WeakMap<CompiledOperation, Map<DefaultPolicy, ValidateFunction>>();
 
 export type SpecSource =
   | { url: string }
@@ -45,10 +37,6 @@ export interface MultiSpecParserOptions {
 }
 
 export interface ParseOptions {
-  /** Replace over-budget definition closures with their reachable reference names. */
-  compact?: boolean;
-  /** Serialized UTF-8 budget used when compact is true. */
-  maxBytes?: number;
   /** Cancel URL loading. Parsing caller-owned text and objects is synchronous work. */
   signal?: AbortSignal;
 }
@@ -71,7 +59,7 @@ export class MultiSpecParser {
   private closed = false;
   private readonly standardSchemas = new WeakMap<
     CompiledOperation,
-    Map<DefaultPolicy, StandardSchema>
+    StandardSchema
   >();
 
   constructor(config: MultiSpecParserConfig) {
@@ -101,11 +89,11 @@ export class MultiSpecParser {
   /** Parse an eager source into operation-level JSON Schema projections. */
   async parse(options: ParseOptions = {}): Promise<CompiledOperation[]> {
     assert(options !== null && typeof options === "object" && !Array.isArray(options), "parse options must be an object");
-    assert(options.compact === undefined || typeof options.compact === "boolean", "compact must be a boolean");
+    assert(Object.keys(options).every((key) => key === "signal"), "parse options contain an unknown key");
     assert(options.signal === undefined || options.signal instanceof AbortSignal, "signal must be an AbortSignal");
     this.requireOpen();
     if (this.options.lazy) {
-      throw new Error("MultiSpecParser: parse() is unavailable in lazy mode; use load(), operationNames(), and operation().");
+      throw new Error("MultiSpecParser: parse() is unavailable in lazy mode; use load(), operationNames(), and getOperation().");
     }
     if (!this.compiled) {
       this.loading ??= this.compile(options.signal);
@@ -115,17 +103,8 @@ export class MultiSpecParser {
         this.loading = undefined;
       }
     }
-    if (!options.compact) return [...this.compiled.operations];
-    const maxBytes = options.maxBytes ?? DEFAULT_COMPACT_MAX_BYTES;
-    assert(Number.isFinite(maxBytes) && maxBytes > 0, "maxBytes must be positive");
     assert(this.compiled.operations.length <= 1_000_000, "operation count exceeds the projection limit");
-    return this.compiled.operations.map((operation) => ({
-      ...operation,
-      inputSchema: boundedSchema(operation.inputSchema, maxBytes),
-      ...(operation.outputSchema
-        ? { outputSchema: boundedSchema(operation.outputSchema, maxBytes) }
-        : {}),
-    }));
+    return [...this.compiled.operations];
   }
 
   private async loadLazy(signal?: AbortSignal): Promise<void> {
@@ -188,7 +167,7 @@ export class MultiSpecParser {
   }
 
   /** Materialize one operation by its generated unique name. */
-  async operation(name: string): Promise<CompiledOperation | undefined> {
+  async getOperation(name: string): Promise<CompiledOperation | undefined> {
     assert(typeof name === "string", "operation name must be a string");
     assert(name.length > 0, "operation name must be non-empty");
     this.requireOpen();
@@ -231,38 +210,14 @@ export class MultiSpecParser {
   }
 
   /** Adapt an operation input/output pair to Standard Schema. */
-  toStandardSchema(
-    operation: string | CompiledOperation,
-    options: StandardSchemaAdapterOptions = {},
-  ): StandardSchema {
-    assert(options !== null && typeof options === "object" && !Array.isArray(options), "adapter options must be an object");
-    const defaultPolicy = options.defaultPolicy ?? "preserve";
-    assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+  toStandardSchema(operation: string | CompiledOperation): StandardSchema {
+    assert(typeof operation === "string" || (operation !== null && typeof operation === "object"), "operation must be a name or projection");
+    assert(typeof operation !== "string" || operation.length > 0, "operation name must be non-empty");
     const resolved = this.resolveOperation(operation);
-    let cached = this.standardSchemas.get(resolved);
-    if (!cached) {
-      cached = new Map();
-      this.standardSchemas.set(resolved, cached);
-    }
-    const existing = cached.get(defaultPolicy);
+    const existing = this.standardSchemas.get(resolved);
     if (existing) return existing;
-    const adapter = createStandardSchemaAdapter(
-      resolved,
-      async (value) => {
-        const validate = await getValidator(resolved, defaultPolicy);
-        const candidate = defaultPolicy === "apply"
-          ? cloneForDefaultApplication(value)
-          : value;
-        if (validate(candidate)) return { value: candidate };
-        return {
-          issues: validate.errors?.map((error) => ({
-            message: error.message ?? "invalid",
-          })) ?? [],
-        };
-      },
-      options,
-    );
-    cached.set(defaultPolicy, adapter);
+    const adapter = createStandardSchemaAdapter(resolved);
+    this.standardSchemas.set(resolved, adapter);
     return adapter;
   }
 
@@ -317,51 +272,6 @@ export class MultiSpecParser {
     if (!resolved) throw new Error(`MultiSpecParser: unknown operation "${operation}".`);
     return resolved;
   }
-}
-
-async function getValidator(
-  operation: CompiledOperation,
-  defaultPolicy: DefaultPolicy,
-): Promise<ValidateFunction> {
-  assert(operation !== null && typeof operation === "object", "operation must be an object");
-  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
-  let cached = validators.get(operation);
-  if (!cached) {
-    cached = new Map();
-    validators.set(operation, cached);
-  }
-  const existing = cached.get(defaultPolicy);
-  if (existing) return existing;
-  const [{ Ajv }, formatsModule] = await Promise.all([
-    import("ajv"),
-    import("ajv-formats"),
-  ]);
-  const instance = new Ajv({
-    strict: false,
-    allErrors: true,
-    ...(defaultPolicy === "apply" ? { useDefaults: true } : {}),
-  });
-  resolveAjvFormatsPlugin(formatsModule)(instance);
-  registerOpenApiFormats(instance);
-  const validate = instance.compile(operation.inputSchema as object);
-  cached.set(defaultPolicy, validate);
-  assert(typeof validate === "function", "Ajv must return a validator");
-  assert(cached.get(defaultPolicy) === validate, "validator must be cached");
-  return validate;
-}
-
-function boundedSchema(
-  schema: Record<string, unknown>,
-  maxBytes: number,
-): Record<string, unknown> {
-  assert(schema !== null && typeof schema === "object" && !Array.isArray(schema), "schema must be an object");
-  assert(Number.isFinite(maxBytes) && maxBytes > 0, "maxBytes must be positive");
-  if (UTF8_ENCODER.encode(JSON.stringify(schema)).byteLength <= maxBytes) return schema;
-  const { $defs, ...rest } = schema;
-  return {
-    ...rest,
-    ...($defs && typeof $defs === "object" ? { $refs: Object.keys($defs) } : {}),
-  };
 }
 
 function validateConfig(config: MultiSpecParserConfig): void {

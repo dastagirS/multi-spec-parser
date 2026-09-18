@@ -70,7 +70,7 @@ function runSmoke(consumerDir) {
     const parser = new MultiSpecParser({ spec: { text: ${JSON.stringify(SMOKE_TEXT)} } });
     const operations = await parser.parse();
     if (operations.length !== 1) throw new Error("package YAML smoke test failed");
-    const operation = await parser.operation("health");
+    const operation = await parser.getOperation("health");
     if (!operation) throw new Error("package operation projection smoke test failed");
     const directSchema = toStandardSchema(operation);
     if (typeof directSchema.input !== "function") throw new Error("package Standard JSON Schema smoke test failed");

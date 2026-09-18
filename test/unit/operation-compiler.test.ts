@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { compileSpecToOperations } from "../../src/operation-compiler.js";
+import { getCanonicalOperationSchema, type OperationSchema } from "../../src/operation-schema.js";
 import { parseSpec } from "../../src/parse-spec.js";
 
 const fixture = (name: string): Record<string, unknown> =>
@@ -19,6 +20,13 @@ const readFixtureFile = (name: string): string => {
   return readFileSync(path, "utf8");
 };
 
+function canonical(schema: OperationSchema): Record<string, unknown> {
+  assert(schema !== null && typeof schema === "object", "operation schema must be an object");
+  assert(typeof schema.validate === "function", "operation schema must validate");
+  const value = getCanonicalOperationSchema(schema);
+  return { ...value.root, ...(Object.keys(value.definitions).length > 0 ? { $defs: value.definitions } : {}) };
+}
+
 describe("compileSpecToOperations", () => {
   it("compiles petstore3 into 19 operations with per-op $defs closure", () => {
     const parsed = parseSpec(fixture("petstore3.json"));
@@ -27,11 +35,11 @@ describe("compileSpecToOperations", () => {
     assert.ok(Object.keys(defs).length >= 6);
 
     for (const operation of operations) {
-      assert.equal(operation.inputSchema.type, "object");
-      assert.ok(operation.inputSchema.properties !== undefined);
+      assert.equal(canonical(operation.input).type, "object");
+      assert.ok(canonical(operation.input).properties !== undefined);
       // Every $ref inside the input schema must resolve within its own $defs.
-      const refs = collectSchemaRefs(operation.inputSchema);
-      const localDefs = (operation.inputSchema.$defs ?? {}) as Record<string, unknown>;
+      const refs = collectSchemaRefs(canonical(operation.input));
+      const localDefs = (canonical(operation.input).$defs ?? {}) as Record<string, unknown>;
       for (const ref of refs) {
         const name = ref.replace(/^#\/\$defs\//, "");
         assert.ok(name in localDefs, `${operation.name}: $ref ${ref} not in per-operation $defs`);
@@ -44,7 +52,7 @@ describe("compileSpecToOperations", () => {
     const { operations } = compileSpecToOperations(parsed);
     let maxBytes = 0;
     for (const operation of operations) {
-      const bytes = JSON.stringify(operation.inputSchema.$defs ?? {}).length;
+      const bytes = JSON.stringify(canonical(operation.input).$defs ?? {}).length;
       maxBytes = Math.max(maxBytes, bytes);
     }
     // Stripe's 1440-schema anyOf graph reaches ~1MB per operation naturally; the
@@ -60,7 +68,7 @@ describe("compileSpecToOperations", () => {
     const { operations } = compileSpecToOperations(parsed);
     let maxBytes = 0;
     for (const operation of operations) {
-      const bytes = JSON.stringify(operation.inputSchema.$defs ?? {}).length;
+      const bytes = JSON.stringify(canonical(operation.input).$defs ?? {}).length;
       maxBytes = Math.max(maxBytes, bytes);
     }
     // 1220 ops × 969 schemas embedded per op would be ~3.2GB of JSON; the
@@ -74,7 +82,7 @@ describe("compileSpecToOperations", () => {
     const { operations } = compileSpecToOperations(parsed);
     assert.equal(operations.length, 39);
     for (const operation of operations) {
-      assert.equal(operation.inputSchema.$defs, undefined);
+      assert.equal(canonical(operation.input).$defs, undefined);
     }
   });
 
@@ -84,13 +92,13 @@ describe("compileSpecToOperations", () => {
     assert.equal(operations.length, 20);
     const upload = operations.find((t) => t.operation.path.includes("uploadImage"));
     assert.ok(upload, "expected uploadImage op");
-    const props = upload.inputSchema.properties as Record<string, unknown>;
+    const props = canonical(upload.input).properties as Record<string, unknown>;
     assert.equal(props.bodyBase64, undefined); // multipart, not octet
     assert.equal(props.body, undefined); // form fields flattened, not nested
     assert.equal((props.file as { format?: string }).format, "binary");
     assert.ok(props.additionalMetadata, "form field flattened to top level");
     // file is optional in the fixture — only petId is required.
-    assert.deepEqual(upload.inputSchema.required, ["petId"]);
+    assert.deepEqual(canonical(upload.input).required, ["petId"]);
   });
 
   it("flattens Slack's formData bodies to top-level operation properties", () => {
@@ -99,14 +107,14 @@ describe("compileSpecToOperations", () => {
     assert.equal(operations.length, 174);
     const approve = operations.find((t) => t.name === "admin_apps_approve");
     assert.ok(approve, "expected admin_apps_approve");
-    const approveProps = approve.inputSchema.properties as Record<string, unknown>;
+    const approveProps = canonical(approve.input).properties as Record<string, unknown>;
     assert.equal(approveProps.body, undefined);
     assert.ok(approveProps.app_id, "formData field at top level");
     assert.ok(approveProps.request_id, "formData field at top level");
     assert.ok(approveProps.token, "header param stays top-level");
     const upload = operations.find((t) => t.name === "files_upload");
     assert.ok(upload, "expected files_upload");
-    const uploadProps = upload.inputSchema.properties as Record<string, unknown>;
+    const uploadProps = canonical(upload.input).properties as Record<string, unknown>;
     assert.equal(uploadProps.body, undefined);
     // Slack declares `file` as a plain string (no type:file anywhere in the
     // spec) — assert the source's own typing, not an assumed binary format.
@@ -163,7 +171,7 @@ describe("compileSpecToOperations", () => {
       },
     });
     const operation = compileSpecToOperations(parsed).operations[0]!;
-    const properties = operation.inputSchema.properties as Record<string, unknown>;
+    const properties = canonical(operation.input).properties as Record<string, unknown>;
     assert.deepEqual(Object.keys(properties), ["path_id", "query_id", "constructor_2"]);
     assert.deepEqual(
       operation.operation.parameters.map((parameter) => [parameter.name, parameter.inputName]),
@@ -204,13 +212,13 @@ describe("compileSpecToOperations", () => {
     const { operations } = compileSpecToOperations(parsed);
     const input = operations.find((t) => t.name === "danglingInput")!;
     const output = operations.find((t) => t.name === "danglingOutput")!;
-    const inputProps = input.inputSchema.properties as Record<string, unknown>;
+    const inputProps = canonical(input.input).properties as Record<string, unknown>;
     assert.deepEqual(inputProps.x, {}); // dangling ref replaced with unconstrained
-    assert.deepEqual(output.outputSchema, {});
+    assert.deepEqual(output.output ? canonical(output.output) : undefined, {});
     assert.ok(input.unresolvedRefs?.some((r) => r.includes("Missing")));
     assert.ok(output.unresolvedRefs?.some((r) => r.includes("Missing")));
     // The good operation is untouched and reports nothing.
-    assert.ok(operations.every((t) => t.name !== "danglingInput" || t.inputSchema.$defs === undefined));
+    assert.ok(operations.every((t) => t.name !== "danglingInput" || canonical(t.input).$defs === undefined));
   });
 
   it("includes OAuth scopes and deprecation in descriptions", () => {
@@ -250,7 +258,7 @@ describe("compileSpecToOperations", () => {
       Object.prototype.hasOwnProperty.call(defs, "__proto__"),
       "defs keeps the __proto__ schema",
     );
-    const props = operations[0]!.inputSchema.properties as Record<string, unknown>;
+    const props = canonical(operations[0]!.input).properties as Record<string, unknown>;
     assert.ok(Object.prototype.hasOwnProperty.call(props, "__proto___2"), "param input was remapped");
     assert.deepEqual(props["__proto___2"], { type: "string" });
     const holderProps = (defs.Holder as { properties?: Record<string, unknown> }).properties!;
@@ -279,7 +287,7 @@ describe("compileSpecToOperations", () => {
       },
     });
     const { operations } = compileSpecToOperations(parsed);
-    const props = operations[0]!.inputSchema.properties as Record<string, unknown>;
+    const props = canonical(operations[0]!.input).properties as Record<string, unknown>;
     assert.deepEqual(props.query_body, { type: "string" });
     assert.deepEqual(props.body, {
       type: "object",
@@ -321,7 +329,7 @@ describe("compileSpecToOperations", () => {
     const { operations } = compileSpecToOperations(parsed);
     const usesA = operations.find((t) => t.name === "usesA")!;
     const usesNothing = operations.find((t) => t.name === "usesNothing")!;
-    assert.ok(!JSON.stringify(usesA.inputSchema).includes("Missing"), "no dangling ref survives");
+    assert.ok(!JSON.stringify(canonical(usesA.input)).includes("Missing"), "no dangling ref survives");
     assert.ok(
       usesA.unresolvedRefs?.includes("#/$defs/Missing"),
       "operation that uses A reports the pruned ref",
@@ -332,7 +340,7 @@ describe("compileSpecToOperations", () => {
   it("exposes the successful response schema per operation", () => {
     const parsed = parseSpec(fixture("petstore3.json"));
     const { operations } = compileSpecToOperations(parsed);
-    const withOutput = operations.filter((t) => t.outputSchema);
+    const withOutput = operations.filter((t) => t.output ? canonical(t.output) : undefined);
     assert.ok(withOutput.length > 10);
   });
 

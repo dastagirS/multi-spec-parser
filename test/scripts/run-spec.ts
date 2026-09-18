@@ -10,9 +10,8 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Ajv } from "ajv";
-
 import { compileSpecToOperations } from "../../src/operation-compiler.js";
+import { getCanonicalOperationSchema } from "../../src/operation-schema.js";
 import { parseSpec, parseSpecText } from "../../src/parse-spec.js";
 
 const fixturePath = (name: string): string =>
@@ -70,8 +69,7 @@ try {
 stats.compileMs = Math.round(performance.now() - t1);
 
 // Phase 3: per-operation schema stats + ref integrity
-const ajv = new Ajv({ strict: false, validateFormats: false, validateSchema: false });
-let ajvCompileFailures = 0;
+let validatorPlanFailures = 0;
 let refResolutionFailures = 0;
 let refRewriteFailures = 0;
 let outputSchemaCount = 0;
@@ -82,34 +80,48 @@ let defsBytesMax = 0;
 let defsCountTotal = 0;
 let unresolvedRefsTotal = 0;
 const failures: string[] = [];
+const validatorFailureDetails: string[] = [];
 
 for (const operation of compiled.operations) {
-  const inputBytes = JSON.stringify(operation.inputSchema).length;
+  const inputCanonical = getCanonicalOperationSchema(operation.input);
+  const outputCanonical = operation.output
+    ? getCanonicalOperationSchema(operation.output)
+    : undefined;
+  const defs = { ...inputCanonical.definitions, ...outputCanonical?.definitions };
+  const inputSchema = { ...inputCanonical.root, $defs: defs };
+  const outputSchema = outputCanonical?.root;
+  const inputBytes = JSON.stringify(inputSchema).length;
   inputSchemaBytesTotal += inputBytes;
   inputSchemaBytesMax = Math.max(inputSchemaBytesMax, inputBytes);
 
-  const defs = (operation.inputSchema.$defs ?? {}) as Record<string, unknown>;
   const defsBytes = JSON.stringify(defs).length;
   defsBytesTotal += defsBytes;
   defsBytesMax = Math.max(defsBytesMax, defsBytes);
   defsCountTotal += Object.keys(defs).length;
 
-  if (operation.outputSchema) outputSchemaCount += 1;
+  if (outputSchema) outputSchemaCount += 1;
   unresolvedRefsTotal += operation.unresolvedRefs?.length ?? 0;
 
   // Every #/ ref in input + output + defs must be a #/$defs/X that exists locally.
-  const schema = { ...operation.inputSchema, ...(operation.outputSchema ? { out: operation.outputSchema } : {}) };
+  const schema = { ...inputSchema, ...(outputSchema ? { out: outputSchema } : {}) };
   refResolutionFailures += checkRefs(schema, defs, operation.name, failures, "resolution");
-  refRewriteFailures += checkRefRewrite(operation.inputSchema, operation.name, failures);
+  refRewriteFailures += checkRefRewrite(inputSchema, operation.name, failures);
 
-  try {
-    // Belt-and-braces: the library converts OAS `nullable` to type-arrays /
-    // anyOf at compile time (PR4), so nothing should remain — but if a schema
-    // slips one through, strip it so the Ajv gate measures real failures.
-    ajv.compile(stripNullable(operation.inputSchema) as object);
-  } catch (err) {
-    ajvCompileFailures += 1;
-    if (failures.length < 10) failures.push(`${operation.name}: ajv ${String(err)}`);
+  const validationHandles = [
+    ["input", operation.input],
+    ...(operation.output ? [["output", operation.output] as const] : []),
+  ] as const;
+  for (const [kind, handle] of validationHandles) {
+    const validation = await handle.validate(undefined);
+    if (
+      validation.status === "error" &&
+      validation.error._tag !== "ValidationFailed"
+    ) {
+      validatorPlanFailures += 1;
+      if (validatorFailureDetails.length < 10) {
+        validatorFailureDetails.push(`${operation.name} ${kind}: ${validation.error.message}`);
+      }
+    }
   }
 }
 
@@ -120,7 +132,7 @@ stats.defsBytesTotal = defsBytesTotal;
 stats.defsBytesMax = defsBytesMax;
 stats.defsCountTotal = defsCountTotal;
 stats.outputSchemaCount = outputSchemaCount;
-stats.ajvCompileFailures = ajvCompileFailures;
+stats.validatorPlanFailures = validatorPlanFailures;
 stats.refResolutionFailures = refResolutionFailures;
 stats.refRewriteFailures = refRewriteFailures;
 stats.unresolvedRefsTotal = unresolvedRefsTotal;
@@ -128,28 +140,8 @@ stats.heapUsedMB = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
 stats.heapTotalMB = Math.round(process.memoryUsage().heapTotal / 1024 / 1024);
 stats.totalMs = Math.round(performance.now() - t0);
 
-console.log(`RESULT_JSON: ${JSON.stringify({ ...stats, failures })}`);
+console.log(`RESULT_JSON: ${JSON.stringify({ ...stats, failures, validatorFailureDetails })}`);
 process.exit(0);
-
-/** Remove OAS-only `nullable` keys (Ajv treats it as a JSON-Schema keyword).
- *  Mutates in place — the probe's schemas are throwaway, and a deep copy per
- *  operation would spike heap (Stripe: 60MB → 520MB on 589 operations). */
-function stripNullable(node: unknown): unknown {
-  if (Array.isArray(node)) {
-    for (const item of node) stripNullable(item);
-    return node;
-  }
-  if (node === null || typeof node !== "object") return node;
-  const obj = node as Record<string, unknown>;
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === "nullable") {
-      delete obj[k];
-      continue;
-    }
-    stripNullable(v);
-  }
-  return node;
-}
 
 /** Verify every $ref resolves within the operation's own $defs (transitively). */
 function checkRefs(

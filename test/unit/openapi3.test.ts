@@ -211,8 +211,9 @@ describe("OpenAPI 3.x adapter", () => {
     assert.equal(op.unresolvedRefs, undefined);
     // Compiling must not throw, and the dangling ref must not appear in defs.
     const { compileSpecToOperations } = await import("../../src/operation-compiler.js");
+    const { getCanonicalOperationSchema } = await import("../../src/operation-schema.js");
     const { operations } = compileSpecToOperations(parsed);
-    const defs = (operations[0]!.inputSchema.$defs ?? {}) as Record<string, unknown>;
+    const defs = getCanonicalOperationSchema(operations[0]!.input).definitions;
     assert.equal(Object.keys(defs).length, 0);
   });
 

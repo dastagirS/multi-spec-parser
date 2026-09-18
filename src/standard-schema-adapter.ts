@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import type { CompiledOperation } from "./operation-compiler.js";
+import { getCanonicalOperationSchema } from "./operation-schema.js";
 import { collectReachableDefs } from "./schema-closure.js";
 import type { SchemaObject } from "./types.js";
 
@@ -11,8 +12,6 @@ const DEFINITIONS_KEY = "definitions";
 const DEFS_KEY = "$defs";
 const DRAFT_07_SCHEMA_URI = "http://json-schema.org/draft-07/schema#";
 const DRAFT_2020_12_SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema";
-
-export type DefaultPolicy = "preserve" | "apply";
 
 export type StandardJsonSchemaTarget =
   | typeof DRAFT_07
@@ -35,16 +34,6 @@ export type StandardSchemaResult<T> =
 
 export interface StandardSchemaOptions {
   readonly libraryOptions?: Record<string, unknown>;
-}
-
-export interface StandardSchemaAdapterOptions {
-  readonly defaultPolicy?: DefaultPolicy;
-}
-
-export function cloneForDefaultApplication<T>(value: T): T {
-  assert(typeof value !== "function", "default input must not be a function");
-  assert(typeof value !== "symbol", "default input must not be a symbol");
-  return structuredClone(value);
 }
 
 export interface StandardSchemaV1<T = unknown> {
@@ -78,39 +67,37 @@ export type StandardSchema<T = unknown> = StandardSchemaLike<T> & {
   readonly output: (target?: StandardJsonSchemaTarget) => Record<string, unknown>;
 };
 
-type StandardSchemaValidator = (
-  value: unknown,
-  options?: StandardSchemaOptions,
-) => StandardSchemaResult<unknown> | Promise<StandardSchemaResult<unknown>>;
-
-export function createStandardSchemaAdapter(
-  operation: CompiledOperation,
-  validate: StandardSchemaValidator,
-  options: StandardSchemaAdapterOptions = {},
-): StandardSchema {
+export function createStandardSchemaAdapter(operation: CompiledOperation): StandardSchema {
   assert(operation !== null && typeof operation === "object", "compiled operation must be an object");
-  assert(typeof validate === "function", "standard schema validator must be a function");
-  assert(options !== null && typeof options === "object" && !Array.isArray(options), "standard schema options must be an object");
-  const defaultPolicy = options.defaultPolicy ?? "preserve";
-  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
+  assert(operation.input !== null && typeof operation.input === "object", "compiled operation must contain input");
   let inputProjection: Record<string, unknown> | undefined;
   let outputProjection: Record<string, unknown> | undefined;
+  const inputCanonical = getCanonicalOperationSchema(operation.input);
+  const outputCanonical = operation.output ? getCanonicalOperationSchema(operation.output) : undefined;
+  const validate: StandardSchemaV1["~standard"]["validate"] = async (value) => {
+    const result = await operation.input.validate(value);
+    if (result.status === "ok") return { value: result.value };
+    if (result.error._tag === "ValidationFailed") {
+      return { issues: result.error.issues.map((issue) => ({ message: issue.message, path: issue.path })) };
+    }
+    return { issues: [{ message: result.error.message }] };
+  };
   const input = (target: StandardJsonSchemaTarget = DRAFT_2020_12) => {
     assert(typeof target === "string", "input schema target must be a string");
     assert(target.length > 0, "input schema target must be non-empty");
     return projectSchema(
-      inputProjection ??= withReachableDefinitions(operation.inputSchema, operation.inputSchema.$defs),
+      inputProjection ??= withReachableDefinitions(inputCanonical.root, inputCanonical.definitions),
       target,
-      defaultPolicy,
     );
   };
   const output = (target: StandardJsonSchemaTarget = DRAFT_2020_12) => {
     assert(typeof target === "string", "output schema target must be a string");
     assert(target.length > 0, "output schema target must be non-empty");
     return projectSchema(
-      outputProjection ??= withReachableDefinitions(operation.outputSchema ?? {}, operation.inputSchema.$defs),
+      outputProjection ??= outputCanonical
+        ? withReachableDefinitions(outputCanonical.root, outputCanonical.definitions)
+        : {},
       target,
-      "preserve",
     );
   };
   return {
@@ -151,46 +138,15 @@ function withReachableDefinitions(
 function projectSchema(
   source: Record<string, unknown>,
   target: StandardJsonSchemaTarget,
-  defaultPolicy: DefaultPolicy,
 ): Record<string, unknown> {
   assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
   assert(typeof target === "string", "JSON Schema target must be a string");
-  assert(defaultPolicy === "preserve" || defaultPolicy === "apply", "defaultPolicy must be preserve or apply");
   assertSupportedTarget(target);
-  if (defaultPolicy === "apply") {
-    const projected = optionalizeDefaultedRequired(source);
-    projected.$schema = target === DRAFT_07 ? DRAFT_07_SCHEMA_URI : DRAFT_2020_12_SCHEMA_URI;
-    if (target === DRAFT_2020_12) return projected;
-    return rewriteProjectedSchema(projected, target);
-  }
-  // The internal schema already uses 2020-12-compatible $defs; a shallow
-  // copy avoids duplicating large shared closures just to add the dialect URI.
   if (target === DRAFT_2020_12) return { ...source, $schema: DRAFT_2020_12_SCHEMA_URI };
   assertSchemaWithinLimit(source);
   const projected = structuredClone(source) as Record<string, unknown>;
-  projected.$schema = target === DRAFT_07 ? DRAFT_07_SCHEMA_URI : DRAFT_2020_12_SCHEMA_URI;
+  projected.$schema = DRAFT_07_SCHEMA_URI;
   return rewriteProjectedSchema(projected, target);
-}
-
-function optionalizeDefaultedRequired(source: Record<string, unknown>): Record<string, unknown> {
-  assert(source !== null && typeof source === "object" && !Array.isArray(source), "schema must be an object");
-  assertSchemaWithinLimit(source);
-  const projected = structuredClone(source) as Record<string, unknown>;
-  walkSchema(projected, (current) => {
-    const required = current.required;
-    const properties = current.properties;
-    if (!Array.isArray(required) || !isRecord(properties)) return;
-    const remaining = required.filter((name): boolean => {
-      const property =
-        typeof name === "string" && Object.prototype.hasOwnProperty.call(properties, name)
-          ? properties[name]
-          : undefined;
-      return !(isRecord(property) && Object.prototype.hasOwnProperty.call(property, "default"));
-    });
-    if (remaining.length === 0) delete current.required;
-    else if (remaining.length !== required.length) current.required = remaining;
-  });
-  return projected;
 }
 
 function rewriteProjectedSchema(

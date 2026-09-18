@@ -64,15 +64,15 @@ const operations = await parser.parse();
 console.log("format:", parser.format);
 console.log("operations:", operations.length, "| baseUrl:", parser.baseUrl);
 
-// Each operation carries only the definitions reachable from its input and
-// output schemas. Compact projections replace over-budget closures with names.
-for (const operation of await parser.parse({ compact: true, maxBytes: 4_000 })) {
-  const inputBytes = new TextEncoder().encode(JSON.stringify(operation.inputSchema)).byteLength;
+// Each operation exposes a compact TypeScript presentation and only the
+// definitions reachable from that input or output root.
+for (const operation of operations) {
   console.log(
     `  ${operation.name.padEnd(10)} ${operation.method.padEnd(5)} ${operation.path} ` +
-      `input=${inputBytes}B`,
+      `input=${operation.input.type}`,
   );
 }
 
-const getPet = await parser.operation("getPet");
-console.log("getPet schema:", JSON.stringify(getPet?.inputSchema));
+const getPet = await parser.getOperation("getPet");
+console.log("getPet input:", getPet?.input.type);
+console.log("getPet output:", getPet?.output?.type);
